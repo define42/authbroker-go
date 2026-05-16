@@ -13,14 +13,14 @@ It provides modern application-facing protocols and security mechanisms:
 - Token revocation endpoint
 - TOTP MFA enrollment and validation
 - Minimal WebAuthn/passkey registration and login support for ES256 credentials
-- LDAP/AD simple-bind backend, or local dev users for testing
+- LDAP/AD simple-bind backend with optional profile lookup, or local dev users for testing
 
-The code uses only the Go standard library so it can compile without fetching external modules. It is intentionally small enough to study and extend.
+The broker is intentionally small enough to study and extend. LDAP connectivity uses `github.com/go-ldap/ldap/v3`.
 
 ## Run
 
 ```bash
-go run ./cmd/broker -config config.example.json -data data.json
+go run . -config config.example.json -data data.json
 ```
 
 Open the OIDC discovery document:
@@ -40,7 +40,7 @@ curl http://localhost:8080/oauth2/jwks
 By default the server generates an ephemeral RSA key on startup. For real use, generate a stable key:
 
 ```bash
-go run ./cmd/broker -generate-key > signing-key.pem
+go run . -generate-key > signing-key.pem
 ```
 
 Then paste the PEM content into `signing_key_pem` in your JSON config, escaping newlines as `\n`, or extend `loadConfig` to read the key from a secret-mounted file.
@@ -90,6 +90,10 @@ For Active Directory UPN bind:
 "ldap": {
   "url": "ldaps://dc01.example.com:636",
   "domain_suffix": "@example.com",
+  "base_dn": "dc=example,dc=com",
+  "user_filter": "(userPrincipalName={login})",
+  "email_attribute": "mail",
+  "name_attribute": "displayName",
   "timeout_seconds": 5
 }
 ```
@@ -100,17 +104,23 @@ The broker will bind as:
 <username>@example.com
 ```
 
+It then searches below `base_dn`, escapes the `{login}` value, and copies the configured LDAP attributes into OIDC `email` and `name` claims.
+
 For OpenLDAP DN-template bind:
 
 ```json
 "ldap": {
   "url": "ldaps://ldap.example.com:636",
   "user_dn_template": "uid={username},ou=people,dc=example,dc=com",
+  "base_dn": "dc=example,dc=com",
+  "user_filter": "(uid={username})",
+  "email_attribute": "mail",
+  "name_attribute": "cn",
   "timeout_seconds": 5
 }
 ```
 
-This starter does not implement LDAP search, group sync, nested AD groups, or Kerberos/SPNEGO. Add those as separate federation modules.
+Profile lookup is optional. If `base_dn` and `user_filter` are omitted, the broker only performs the bind and falls back to the submitted username plus `domain_suffix` for profile claims. Use `"start_tls": true` only with `ldap://` URLs; `ldaps://` starts TLS during dial. This starter does not implement LDAP group sync, nested AD groups, or Kerberos/SPNEGO. Add those as separate federation modules.
 
 ## TOTP MFA
 
@@ -210,7 +220,7 @@ Before production, add at least:
 - audit logs
 - CSRF protection for browser form endpoints
 - stricter Content-Security-Policy
-- LDAP search, group mapping and nested AD group support
+- LDAP group mapping and nested AD group support
 - OpenID Foundation conformance testing
 - WebAuthn conformance testing and broader attestation support
 - refresh-token reuse detection

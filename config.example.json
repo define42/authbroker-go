@@ -13,6 +13,11 @@
     "url": "ldaps://dc01.example.com:636",
     "domain_suffix": "@example.com",
     "user_dn_template": "",
+    "base_dn": "dc=example,dc=com",
+    "user_filter": "(userPrincipalName={login})",
+    "email_attribute": "mail",
+    "name_attribute": "displayName",
+    "start_tls": false,
     "insecure_skip_verify": false,
     "timeout_seconds": 5
   },

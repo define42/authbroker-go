@@ -32,10 +32,11 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	ldap "github.com/go-ldap/ldap/v3"
 )
 
 const (
@@ -44,8 +45,7 @@ const (
 )
 
 // Config is intentionally small. It is enough to run a modern LDAP-backed
-// OAuth2/OIDC broker without external Go dependencies. Use this as a baseline,
-// not as a complete enterprise IdP.
+// OAuth2/OIDC broker. Use this as a baseline, not as a complete enterprise IdP.
 type Config struct {
 	Issuer        string `json:"issuer"`
 	Listen        string `json:"listen"`
@@ -70,6 +70,11 @@ type LDAPConfig struct {
 	URL                string `json:"url"`
 	UserDNTemplate     string `json:"user_dn_template,omitempty"` // e.g. "uid={username},ou=people,dc=example,dc=com"
 	DomainSuffix       string `json:"domain_suffix,omitempty"`    // e.g. "@example.com" for AD UPN bind
+	BaseDN             string `json:"base_dn,omitempty"`
+	UserFilter         string `json:"user_filter,omitempty"`
+	EmailAttribute     string `json:"email_attribute,omitempty"`
+	NameAttribute      string `json:"name_attribute,omitempty"`
+	StartTLS           bool   `json:"start_tls,omitempty"`
 	InsecureSkipVerify bool   `json:"insecure_skip_verify,omitempty"`
 	TimeoutSeconds     int    `json:"timeout_seconds"`
 }
@@ -293,23 +298,109 @@ type LDAPAuthenticator struct {
 }
 
 func (a *LDAPAuthenticator) Authenticate(ctx context.Context, username, password string) (UserProfile, error) {
-	if strings.TrimSpace(username) == "" || password == "" {
+	username = strings.TrimSpace(username)
+	if username == "" || password == "" {
 		return UserProfile{}, fmt.Errorf("invalid username or password")
 	}
 	if a.cfg.URL == "" {
 		return UserProfile{}, fmt.Errorf("ldap url is not configured")
 	}
 	bindName := a.bindName(username)
-	if err := ldapSimpleBind(ctx, a.cfg, bindName, password); err != nil {
+
+	conn, err := dialLDAP(ctx, a.cfg)
+	if err != nil {
 		return UserProfile{}, err
 	}
+	defer conn.Close()
+
+	if err := conn.Bind(bindName, password); err != nil {
+		return UserProfile{}, fmt.Errorf("ldap bind failed: %w", err)
+	}
+
+	profile := a.fallbackProfile(username)
+	enabled, err := a.profileSearchEnabled()
+	if err != nil {
+		return UserProfile{}, err
+	}
+	if !enabled {
+		return profile, nil
+	}
+	profile, err = a.searchProfile(conn, username, bindName, profile)
+	if err != nil {
+		return UserProfile{}, err
+	}
+	return profile, nil
+}
+
+func (a *LDAPAuthenticator) fallbackProfile(username string) UserProfile {
 	email := ""
 	if strings.Contains(username, "@") {
 		email = username
 	} else if a.cfg.DomainSuffix != "" && strings.HasPrefix(a.cfg.DomainSuffix, "@") {
 		email = username + a.cfg.DomainSuffix
 	}
-	return UserProfile{Subject: username, Email: email, Name: username}, nil
+	return UserProfile{Subject: username, Email: email, Name: username}
+}
+
+func (a *LDAPAuthenticator) profileSearchEnabled() (bool, error) {
+	baseDN := strings.TrimSpace(a.cfg.BaseDN)
+	filter := strings.TrimSpace(a.cfg.UserFilter)
+	if baseDN == "" && filter == "" {
+		return false, nil
+	}
+	if baseDN == "" || filter == "" {
+		return false, fmt.Errorf("ldap base_dn and user_filter must be configured together")
+	}
+	return true, nil
+}
+
+func (a *LDAPAuthenticator) searchProfile(conn *ldap.Conn, username, bindName string, profile UserProfile) (UserProfile, error) {
+	emailAttr := ldapAttribute(a.cfg.EmailAttribute, "mail")
+	nameAttr := ldapAttribute(a.cfg.NameAttribute, "cn")
+	searchReq := ldap.NewSearchRequest(
+		a.cfg.BaseDN,
+		ldap.ScopeWholeSubtree,
+		ldap.NeverDerefAliases,
+		2,
+		a.cfg.TimeoutSeconds,
+		false,
+		a.userFilter(username, bindName),
+		uniqueNonEmpty(emailAttr, nameAttr),
+		nil,
+	)
+	result, err := conn.Search(searchReq)
+	if err != nil {
+		return UserProfile{}, fmt.Errorf("ldap profile search failed: %w", err)
+	}
+	if len(result.Entries) != 1 {
+		return UserProfile{}, fmt.Errorf("ldap profile search returned %d entries", len(result.Entries))
+	}
+	entry := result.Entries[0]
+	if email := strings.TrimSpace(entry.GetAttributeValue(emailAttr)); email != "" {
+		profile.Email = email
+	}
+	if name := strings.TrimSpace(entry.GetAttributeValue(nameAttr)); name != "" {
+		profile.Name = name
+	}
+	return profile, nil
+}
+
+func (a *LDAPAuthenticator) userFilter(username, bindName string) string {
+	login := a.loginName(username)
+	replacer := strings.NewReplacer(
+		"{username}", ldap.EscapeFilter(username),
+		"{login}", ldap.EscapeFilter(login),
+		"{bind}", ldap.EscapeFilter(bindName),
+		"%s", ldap.EscapeFilter(login),
+	)
+	return replacer.Replace(a.cfg.UserFilter)
+}
+
+func (a *LDAPAuthenticator) loginName(username string) string {
+	if a.cfg.DomainSuffix != "" && !strings.Contains(username, "@") && !strings.Contains(username, "\\") {
+		return username + a.cfg.DomainSuffix
+	}
+	return username
 }
 
 func (a *LDAPAuthenticator) bindName(username string) string {
@@ -323,10 +414,7 @@ func (a *LDAPAuthenticator) bindName(username string) string {
 		}
 		return a.cfg.UserDNTemplate
 	}
-	if a.cfg.DomainSuffix != "" && !strings.Contains(username, "@") && !strings.Contains(username, "\\") {
-		return username + a.cfg.DomainSuffix
-	}
-	return username
+	return a.loginName(username)
 }
 
 func escapeLDAPDN(s string) string {
@@ -1849,254 +1937,58 @@ func normalizeChallenge(ch string) string {
 	return base64RawURL(b)
 }
 
-// Minimal LDAP simple bind over LDAP/LDAPS. This intentionally does not perform
-// LDAP search. For AD, use DomainSuffix and bind as user@domain. For OpenLDAP,
-// use UserDNTemplate.
-func ldapSimpleBind(ctx context.Context, cfg LDAPConfig, bindDN, password string) error {
+func dialLDAP(ctx context.Context, cfg LDAPConfig) (*ldap.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	u, err := url.Parse(cfg.URL)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	host := u.Host
-	if !strings.Contains(host, ":") {
-		if u.Scheme == "ldaps" {
-			host += ":636"
-		} else {
-			host += ":389"
-		}
+	if cfg.StartTLS && strings.EqualFold(u.Scheme, "ldaps") {
+		return nil, fmt.Errorf("ldap start_tls cannot be used with ldaps URL")
 	}
 	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
 	if timeout == 0 {
 		timeout = 5 * time.Second
 	}
 	dialer := &net.Dialer{Timeout: timeout}
-	var conn net.Conn
-	if u.Scheme == "ldaps" {
-		conn, err = tls.DialWithDialer(dialer, "tcp", host, &tls.Config{ServerName: u.Hostname(), InsecureSkipVerify: cfg.InsecureSkipVerify}) //nolint:gosec -- configurable for labs
-	} else {
-		conn, err = dialer.DialContext(ctx, "tcp", host)
-	}
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(timeout))
-
-	msg := ldapBindRequest(1, bindDN, password)
-	if _, err := conn.Write(msg); err != nil {
-		return err
-	}
-	resp, err := readLDAPMessage(conn)
-	if err != nil {
-		return err
-	}
-	code, diag, err := parseLDAPBindResponse(resp)
-	if err != nil {
-		return err
-	}
-	if code != 0 {
-		if diag == "" {
-			diag = ldapResultText(code)
-		}
-		return fmt.Errorf("ldap bind failed: %s", diag)
-	}
-	return nil
-}
-
-func ldapBindRequest(messageID int, bindDN, password string) []byte {
-	bindSeq := concat(
-		berInt(messageID),
-		berTLV(0x60, concat( // [APPLICATION 0] BindRequest
-			berInt(3),
-			berString(bindDN),
-			berTLV(0x80, []byte(password)), // [0] simple auth
-		)),
-	)
-	return berTLV(0x30, bindSeq)
-}
-
-func readLDAPMessage(r io.Reader) ([]byte, error) {
-	head := make([]byte, 2)
-	if _, err := io.ReadFull(r, head); err != nil {
-		return nil, err
-	}
-	if head[0] != 0x30 {
-		return nil, fmt.Errorf("ldap response is not a sequence")
-	}
-	l, lenBytes, err := berDecodeLength(head[1], r)
+	tlsConfig := &tls.Config{ServerName: u.Hostname(), InsecureSkipVerify: cfg.InsecureSkipVerify} //nolint:gosec -- configurable for labs
+	conn, err := ldap.DialURL(cfg.URL, ldap.DialWithDialer(dialer), ldap.DialWithTLSConfig(tlsConfig))
 	if err != nil {
 		return nil, err
 	}
-	body := make([]byte, l)
-	if _, err := io.ReadFull(r, body); err != nil {
-		return nil, err
-	}
-	out := []byte{head[0]}
-	out = append(out, lenBytes...)
-	out = append(out, body...)
-	return out, nil
-}
-
-func parseLDAPBindResponse(data []byte) (int, string, error) {
-	node, rest, err := parseBER(data)
-	if err != nil || len(rest) != 0 {
-		return 0, "", fmt.Errorf("bad ldap response")
-	}
-	if node.tag != 0x30 || len(node.children) < 2 {
-		return 0, "", fmt.Errorf("bad ldap response structure")
-	}
-	resp := node.children[1]
-	if resp.tag != 0x61 || len(resp.children) < 3 { // [APPLICATION 1] BindResponse
-		return 0, "", fmt.Errorf("not a bind response")
-	}
-	code := berInteger(resp.children[0].value)
-	diag := string(resp.children[2].value)
-	return code, diag, nil
-}
-
-func ldapResultText(code int) string {
-	switch code {
-	case 49:
-		return "invalid credentials"
-	case 50:
-		return "insufficient access rights"
-	case 52:
-		return "unavailable"
-	default:
-		return "ldap result " + strconv.Itoa(code)
-	}
-}
-
-type berNode struct {
-	tag      byte
-	value    []byte
-	children []berNode
-}
-
-func parseBER(data []byte) (berNode, []byte, error) {
-	if len(data) < 2 {
-		return berNode{}, nil, io.ErrUnexpectedEOF
-	}
-	tag := data[0]
-	length, lenLen, err := berLengthFromBytes(data[1:])
-	if err != nil {
-		return berNode{}, nil, err
-	}
-	start := 1 + lenLen
-	if len(data) < start+length {
-		return berNode{}, nil, io.ErrUnexpectedEOF
-	}
-	val := data[start : start+length]
-	rest := data[start+length:]
-	node := berNode{tag: tag, value: append([]byte{}, val...)}
-	if tag&0x20 != 0 || tag == 0x30 || tag == 0x60 || tag == 0x61 {
-		cur := val
-		for len(cur) > 0 {
-			child, r, err := parseBER(cur)
-			if err != nil {
-				return berNode{}, nil, err
-			}
-			node.children = append(node.children, child)
-			cur = r
+	conn.SetTimeout(timeout)
+	if cfg.StartTLS {
+		if err := conn.StartTLS(tlsConfig); err != nil {
+			conn.Close()
+			return nil, err
 		}
 	}
-	return node, rest, nil
+	if err := ctx.Err(); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return conn, nil
 }
 
-func berLengthFromBytes(data []byte) (length int, lenLen int, err error) {
-	if len(data) == 0 {
-		return 0, 0, io.ErrUnexpectedEOF
+func ldapAttribute(configured, fallback string) string {
+	if v := strings.TrimSpace(configured); v != "" {
+		return v
 	}
-	b := data[0]
-	if b&0x80 == 0 {
-		return int(b), 1, nil
-	}
-	n := int(b & 0x7f)
-	if n == 0 || n > 4 || len(data) < 1+n {
-		return 0, 0, fmt.Errorf("bad BER length")
-	}
-	l := 0
-	for _, x := range data[1 : 1+n] {
-		l = (l << 8) | int(x)
-	}
-	return l, 1 + n, nil
+	return fallback
 }
 
-func berDecodeLength(first byte, r io.Reader) (int, []byte, error) {
-	if first&0x80 == 0 {
-		return int(first), []byte{first}, nil
-	}
-	n := int(first & 0x7f)
-	if n == 0 || n > 4 {
-		return 0, nil, fmt.Errorf("bad BER length")
-	}
-	buf := make([]byte, n)
-	if _, err := io.ReadFull(r, buf); err != nil {
-		return 0, nil, err
-	}
-	l := 0
-	for _, b := range buf {
-		l = (l << 8) | int(b)
-	}
-	return l, append([]byte{first}, buf...), nil
-}
-
-func berInteger(b []byte) int {
-	n := 0
-	for _, x := range b {
-		n = (n << 8) | int(x)
-	}
-	return n
-}
-
-func berInt(n int) []byte {
-	if n == 0 {
-		return berTLV(0x02, []byte{0})
-	}
-	var tmp [8]byte
-	i := len(tmp)
-	for n > 0 {
-		i--
-		tmp[i] = byte(n)
-		n >>= 8
-	}
-	val := tmp[i:]
-	if val[0]&0x80 != 0 {
-		val = append([]byte{0}, val...)
-	}
-	return berTLV(0x02, val)
-}
-
-func berString(s string) []byte {
-	return berTLV(0x04, []byte(s))
-}
-
-func berTLV(tag byte, value []byte) []byte {
-	out := []byte{tag}
-	out = append(out, berLength(len(value))...)
-	out = append(out, value...)
-	return out
-}
-
-func berLength(n int) []byte {
-	if n < 128 {
-		return []byte{byte(n)}
-	}
-	var tmp [4]byte
-	i := len(tmp)
-	for n > 0 {
-		i--
-		tmp[i] = byte(n)
-		n >>= 8
-	}
-	out := []byte{0x80 | byte(len(tmp)-i)}
-	return append(out, tmp[i:]...)
-}
-
-func concat(parts ...[]byte) []byte {
-	var out []byte
-	for _, p := range parts {
-		out = append(out, p...)
+func uniqueNonEmpty(values ...string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
 	}
 	return out
 }
