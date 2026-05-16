@@ -363,14 +363,14 @@ func (a *LDAPAuthenticator) searchProfile(conn *ldap.Conn, username, bindName st
 		return UserProfile{}, fmt.Errorf("ldap profile search returned %d entries", len(result.Entries))
 	}
 	entry := result.Entries[0]
-	if email := strings.TrimSpace(entry.GetAttributeValue(emailAttr)); email != "" {
+	if email := strings.TrimSpace(ldapEntryAttributeValue(entry, emailAttr)); email != "" {
 		profile.Email = email
 	}
-	if name := strings.TrimSpace(entry.GetAttributeValue(nameAttr)); name != "" {
+	if name := strings.TrimSpace(ldapEntryAttributeValue(entry, nameAttr)); name != "" {
 		profile.Name = name
 	}
 	if groupsAttr != "" {
-		profile.Groups = ldapGroupNames(entry.GetAttributeValues(groupsAttr))
+		profile.Groups = ldapGroupIdentifiers(ldapEntryAttributeValues(entry, groupsAttr))
 	}
 	if a.cfg.NestedGroups {
 		nestedGroups, err := a.searchNestedADGroups(conn, entry.DN)
@@ -410,13 +410,14 @@ func (a *LDAPAuthenticator) searchNestedADGroups(conn *ldap.Conn, userDN string)
 
 	groups := make([]string, 0, len(result.Entries))
 	for _, entry := range result.Entries {
-		group := strings.TrimSpace(entry.GetAttributeValue(nameAttr))
-		if group == "" {
-			group = ldapGroupName(entry.DN)
+		if group := strings.TrimSpace(entry.DN); group != "" {
+			groups = append(groups, group)
 		}
-		groups = append(groups, group)
+		if group := strings.TrimSpace(ldapEntryAttributeValue(entry, nameAttr)); group != "" {
+			groups = append(groups, group)
+		}
 	}
-	return ldapGroupNames(groups), nil
+	return ldapGroupIdentifiers(groups), nil
 }
 
 func (a *LDAPAuthenticator) nestedADGroupFilter(userDN string) string {
@@ -469,6 +470,25 @@ func ldapGroupNames(values []string) []string {
 			continue
 		}
 		seen[value] = true
+		groups = append(groups, value)
+	}
+	sort.Strings(groups)
+	return groups
+}
+
+func ldapGroupIdentifiers(values []string) []string {
+	seen := map[string]bool{}
+	groups := []string{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 		groups = append(groups, value)
 	}
 	sort.Strings(groups)
@@ -538,21 +558,43 @@ func mergeStrings(values ...[]string) []string {
 	return out
 }
 
+type scopedGroupMapping struct {
+	Source string
+	Target string
+	BaseDN *ldap.DN
+}
+
 func normalizeClientGroupMappings(in map[string]string) (map[string]string, error) {
 	if len(in) == 0 {
 		return nil, nil
 	}
 	out := map[string]string{}
 	seenSources := map[string]string{}
+	seenScoped := map[string]string{}
 	for source, target := range in {
-		normalizedSource := ldapGroupName(source)
-		sourceKey := strings.ToLower(normalizedSource)
+		source = strings.TrimSpace(source)
 		target = strings.TrimSpace(target)
-		if sourceKey == "" {
+		if source == "" {
 			return nil, fmt.Errorf("group_mappings source cannot be blank")
 		}
 		if target == "" {
 			return nil, fmt.Errorf("group_mappings target for %q cannot be blank", source)
+		}
+		if scoped, ok, err := parseScopedGroupMapping(source, target); err != nil {
+			return nil, err
+		} else if ok {
+			sourceKey := strings.ToLower(scoped.BaseDN.String())
+			if existing, ok := seenScoped[sourceKey]; ok && existing != target {
+				return nil, fmt.Errorf("group_mappings has duplicate scoped source %q with different targets", scoped.BaseDN.String())
+			}
+			seenScoped[sourceKey] = target
+			out[scoped.Source] = target
+			continue
+		}
+		normalizedSource := ldapGroupName(source)
+		sourceKey := strings.ToLower(normalizedSource)
+		if sourceKey == "" {
+			return nil, fmt.Errorf("group_mappings source cannot be blank")
 		}
 		if existing, ok := seenSources[sourceKey]; ok && existing != target {
 			return nil, fmt.Errorf("group_mappings has duplicate source %q with different targets", normalizedSource)
@@ -568,7 +610,12 @@ func mappedClientGroups(client Client, userGroups []string) []string {
 		return nil
 	}
 	mappings := map[string]string{}
+	scopedMappings := []scopedGroupMapping{}
 	for source, target := range client.GroupMappings {
+		if scoped, ok, err := parseScopedGroupMapping(source, target); err == nil && ok {
+			scopedMappings = append(scopedMappings, scoped)
+			continue
+		}
 		sourceName := ldapGroupName(source)
 		if sourceName == "" || strings.TrimSpace(target) == "" {
 			continue
@@ -578,15 +625,116 @@ func mappedClientGroups(client Client, userGroups []string) []string {
 	seen := map[string]bool{}
 	groups := []string{}
 	for _, group := range userGroups {
-		target := mappings[strings.ToLower(ldapGroupName(group))]
-		if target == "" || seen[target] {
-			continue
+		groupName := ldapGroupName(group)
+		if target := mappings[strings.ToLower(groupName)]; target != "" {
+			mapped := renderGroupMappingTarget(target, groupName, group)
+			if mapped != "" && !seen[mapped] {
+				seen[mapped] = true
+				groups = append(groups, mapped)
+			}
 		}
-		seen[target] = true
-		groups = append(groups, target)
+		for _, scoped := range scopedMappings {
+			cn, dn, ok := scopedGroupMatch(scoped, group)
+			if !ok {
+				continue
+			}
+			mapped := renderGroupMappingTarget(scoped.Target, cn, dn)
+			if mapped == "" || seen[mapped] {
+				continue
+			}
+			seen[mapped] = true
+			groups = append(groups, mapped)
+		}
 	}
 	sort.Strings(groups)
 	return groups
+}
+
+func parseScopedGroupMapping(source, target string) (scopedGroupMapping, bool, error) {
+	source = strings.TrimSpace(source)
+	target = strings.TrimSpace(target)
+	dn, err := ldap.ParseDN(source)
+	if err != nil {
+		if strings.Contains(source, "*") || groupMappingTargetHasPlaceholder(target) {
+			return scopedGroupMapping{}, false, fmt.Errorf("invalid scoped group_mappings DN %q: %w", source, err)
+		}
+		return scopedGroupMapping{}, false, nil
+	}
+	if baseDN, ok := cnWildcardBaseDN(dn); ok {
+		return scopedGroupMapping{
+			Source: "CN=*," + baseDN.String(),
+			Target: target,
+			BaseDN: baseDN,
+		}, true, nil
+	}
+	if strings.Contains(source, "*") {
+		return scopedGroupMapping{}, false, fmt.Errorf("wildcard group_mappings source %q must use CN=*,<base_dn>", source)
+	}
+	if groupMappingTargetHasPlaceholder(target) && !firstRDNHasAttribute(dn, "cn") {
+		return scopedGroupMapping{
+			Source: dn.String(),
+			Target: target,
+			BaseDN: dn,
+		}, true, nil
+	}
+	return scopedGroupMapping{}, false, nil
+}
+
+func cnWildcardBaseDN(dn *ldap.DN) (*ldap.DN, bool) {
+	if dn == nil || len(dn.RDNs) < 2 || len(dn.RDNs[0].Attributes) != 1 {
+		return nil, false
+	}
+	attr := dn.RDNs[0].Attributes[0]
+	if !strings.EqualFold(attr.Type, "cn") || attr.Value != "*" {
+		return nil, false
+	}
+	return &ldap.DN{RDNs: dn.RDNs[1:]}, true
+}
+
+func scopedGroupMatch(mapping scopedGroupMapping, group string) (string, string, bool) {
+	groupDN, err := ldap.ParseDN(strings.TrimSpace(group))
+	if err != nil || mapping.BaseDN == nil || !mapping.BaseDN.AncestorOfFold(groupDN) {
+		return "", "", false
+	}
+	cn, ok := firstRDNAttribute(groupDN, "cn")
+	if !ok || strings.TrimSpace(cn) == "" {
+		return "", "", false
+	}
+	return strings.TrimSpace(cn), groupDN.String(), true
+}
+
+func firstRDNHasAttribute(dn *ldap.DN, attrType string) bool {
+	_, ok := firstRDNAttribute(dn, attrType)
+	return ok
+}
+
+func firstRDNAttribute(dn *ldap.DN, attrType string) (string, bool) {
+	if dn == nil || len(dn.RDNs) == 0 {
+		return "", false
+	}
+	for _, attr := range dn.RDNs[0].Attributes {
+		if strings.EqualFold(attr.Type, attrType) {
+			return attr.Value, true
+		}
+	}
+	return "", false
+}
+
+func groupMappingTargetHasPlaceholder(target string) bool {
+	return target == "*" || strings.Contains(target, "{cn}") || strings.Contains(target, "{group}") || strings.Contains(target, "{dn}")
+}
+
+func renderGroupMappingTarget(target, groupName, groupDN string) string {
+	target = strings.TrimSpace(target)
+	if target == "*" {
+		target = "{cn}"
+	}
+	replacer := strings.NewReplacer(
+		"{cn}", strings.TrimSpace(groupName),
+		"{group}", strings.TrimSpace(groupName),
+		"{dn}", strings.TrimSpace(groupDN),
+	)
+	return strings.TrimSpace(replacer.Replace(target))
 }
 
 func scopeIncludes(scope, wanted string) bool {
@@ -2198,6 +2346,27 @@ func ldapAttribute(configured, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func ldapEntryAttributeValue(entry *ldap.Entry, attribute string) string {
+	values := ldapEntryAttributeValues(entry, attribute)
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
+}
+
+func ldapEntryAttributeValues(entry *ldap.Entry, attribute string) []string {
+	if entry == nil {
+		return nil
+	}
+	values := []string{}
+	for _, attr := range entry.Attributes {
+		if strings.EqualFold(attr.Name, attribute) {
+			values = append(values, attr.Values...)
+		}
+	}
+	return values
 }
 
 func uniqueNonEmpty(values ...string) []string {

@@ -40,7 +40,8 @@
       "public": false,
       "require_pkce": true,
       "group_mappings": {
-        "app_elk_team10_ingest": "elk-ingest"
+        "app_elk_team10_ingest": "elk-ingest",
+        "OU=Demo,DC=glauth,DC=com": "{cn}"
       }
     }
   ]

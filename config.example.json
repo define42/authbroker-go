@@ -45,8 +45,8 @@
       "public": false,
       "require_pkce": true,
       "group_mappings": {
-        "CN=Demo App Users,OU=Groups,DC=example,DC=com": "demo-user",
-        "CN=Demo App Admins,OU=Groups,DC=example,DC=com": "demo-admin"
+        "CN=Demo App Admins,OU=Groups,DC=example,DC=com": "demo-admin",
+        "OU=Demo,DC=example,DC=com": "{cn}"
       }
     },
     {
@@ -55,7 +55,7 @@
       "public": true,
       "require_pkce": true,
       "group_mappings": {
-        "CN=Demo App Users,OU=Groups,DC=example,DC=com": "demo-user"
+        "OU=Demo,DC=example,DC=com": "{cn}"
       }
     }
   ]

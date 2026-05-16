@@ -15,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	ldap "github.com/go-ldap/ldap/v3"
 )
 
 func TestLDAPBindName(t *testing.T) {
@@ -104,6 +106,19 @@ func TestLDAPProfileSearchConfigValidation(t *testing.T) {
 	}
 }
 
+func TestLDAPEntryAttributeValuesMergeCaseVariants(t *testing.T) {
+	entry := &ldap.Entry{Attributes: []*ldap.EntryAttribute{
+		{Name: "memberOf", Values: []string{"ou=app_elk_team10_user,ou=groups,dc=glauth,dc=com"}},
+		{Name: "memberof", Values: []string{"CN=demo_reports,OU=Demo,DC=glauth,DC=com"}},
+	}}
+	got := ldapEntryAttributeValues(entry, "memberOf")
+	want := []string{
+		"ou=app_elk_team10_user,ou=groups,dc=glauth,dc=com",
+		"CN=demo_reports,OU=Demo,DC=glauth,DC=com",
+	}
+	assertStringSlicesEqual(t, got, want)
+}
+
 func TestLDAPGroupNames(t *testing.T) {
 	got := ldapGroupNames([]string{
 		"cn=app_elk_team10_ingest,ou=groups,dc=glauth,dc=com",
@@ -121,6 +136,17 @@ func TestLDAPGroupNames(t *testing.T) {
 			t.Fatalf("ldapGroupNames() = %#v, want %#v", got, want)
 		}
 	}
+}
+
+func TestLDAPGroupIdentifiers(t *testing.T) {
+	got := ldapGroupIdentifiers([]string{
+		"cn=app_elk_team10_ingest,ou=groups,dc=glauth,dc=com",
+		"CN=app_elk_team10_ingest,OU=groups,DC=glauth,DC=com",
+		"plain-group",
+		"",
+	})
+	want := []string{"cn=app_elk_team10_ingest,ou=groups,dc=glauth,dc=com", "plain-group"}
+	assertStringSlicesEqual(t, got, want)
 }
 
 func TestLDAPNestedADGroupFilter(t *testing.T) {
@@ -174,6 +200,45 @@ func TestMappedClientGroups(t *testing.T) {
 	}
 }
 
+func TestMappedClientGroupsScopedOU(t *testing.T) {
+	client := Client{GroupMappings: map[string]string{
+		"OU=Demo,DC=example,DC=com": "{cn}",
+	}}
+	groupMappings, err := normalizeClientGroupMappings(client.GroupMappings)
+	if err != nil {
+		t.Fatalf("normalizeClientGroupMappings(): %v", err)
+	}
+	client.GroupMappings = groupMappings
+
+	got := mappedClientGroups(client, []string{
+		"CN=Reports,OU=Demo,DC=example,DC=com",
+		"CN=Nested Reports,OU=Child,OU=Demo,DC=example,DC=com",
+		"CN=Outside,OU=Other,DC=example,DC=com",
+		"OU=Demo,DC=example,DC=com",
+		"plain-group",
+	})
+	want := []string{"Nested Reports", "Reports"}
+	assertStringSlicesEqual(t, got, want)
+}
+
+func TestMappedClientGroupsCNWildcardSource(t *testing.T) {
+	client := Client{GroupMappings: map[string]string{
+		"CN=*,OU=Demo,DC=example,DC=com": "demo-{cn}",
+	}}
+	groupMappings, err := normalizeClientGroupMappings(client.GroupMappings)
+	if err != nil {
+		t.Fatalf("normalizeClientGroupMappings(): %v", err)
+	}
+	client.GroupMappings = groupMappings
+
+	got := mappedClientGroups(client, []string{
+		"CN=Reports,OU=Demo,DC=example,DC=com",
+		"CN=Outside,OU=Other,DC=example,DC=com",
+	})
+	want := []string{"demo-Reports"}
+	assertStringSlicesEqual(t, got, want)
+}
+
 func TestNormalizeClientGroupMappingsValidation(t *testing.T) {
 	if _, err := normalizeClientGroupMappings(map[string]string{"": "app-user"}); err == nil {
 		t.Fatalf("blank group mapping source should fail")
@@ -186,6 +251,17 @@ func TestNormalizeClientGroupMappingsValidation(t *testing.T) {
 		"ops":                                "other-ops",
 	}); err == nil {
 		t.Fatalf("duplicate normalized group mapping source should fail")
+	}
+	if _, err := normalizeClientGroupMappings(map[string]string{
+		"OU=*,DC=example,DC=com": "demo-{cn}",
+	}); err == nil {
+		t.Fatalf("wildcard outside CN should fail")
+	}
+	if _, err := normalizeClientGroupMappings(map[string]string{
+		"OU=Demo,DC=example,DC=com":      "{cn}",
+		"CN=*,OU=Demo,DC=example,DC=com": "demo-{cn}",
+	}); err == nil {
+		t.Fatalf("duplicate scoped group mapping source should fail")
 	}
 }
 
@@ -291,6 +367,46 @@ func TestLDAPBrokerOAuthIntegration(t *testing.T) {
 		assertStringClaim(t, userinfo, "name", "ingestuser")
 		assertStringSliceClaimContains(t, userinfo, "groups", "elk-ingest")
 		assertStringSliceClaimNotContains(t, userinfo, "groups", "app_elk_team10_ingest")
+	})
+
+	t.Run("scoped demo ou group mapping forwards johndoe demo group", func(t *testing.T) {
+		tokens := performAuthCodeFlow(ctx, t, client, baseURL, "johndoe", "dogood")
+
+		accessClaims, err := broker.verifyJWT(tokens.AccessToken)
+		if err != nil {
+			t.Fatalf("verify access token: %v", err)
+		}
+		assertStringClaim(t, accessClaims, "sub", "johndoe")
+		assertStringClaim(t, accessClaims, "email", "johndoe@example.com")
+		assertStringSliceClaimContains(t, accessClaims, "groups", "demo_reports")
+
+		idClaims, err := broker.verifyJWT(tokens.IDToken)
+		if err != nil {
+			t.Fatalf("verify id token: %v", err)
+		}
+		assertStringClaim(t, idClaims, "sub", "johndoe")
+		assertStringSliceClaimContains(t, idClaims, "groups", "demo_reports")
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/oauth2/userinfo", nil)
+		if err != nil {
+			t.Fatalf("build userinfo request: %v", err)
+		}
+		req.Header.Set("Authorization", bearerPrefix+tokens.AccessToken)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("send userinfo request: %v", err)
+		}
+		defer resp.Body.Close()
+		body := readBody(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected userinfo status 200, got %d: %s", resp.StatusCode, body)
+		}
+		var userinfo map[string]any
+		if err := json.Unmarshal([]byte(body), &userinfo); err != nil {
+			t.Fatalf("decode userinfo: %v", err)
+		}
+		assertStringClaim(t, userinfo, "sub", "johndoe")
+		assertStringSliceClaimContains(t, userinfo, "groups", "demo_reports")
 	})
 
 	t.Run("wrong password is unauthorized and issues no auth code", func(t *testing.T) {
@@ -474,7 +590,8 @@ func startTestBroker(ctx context.Context, t *testing.T, ldapCfg LDAPConfig) (str
 				},
 				RequirePKCE: true,
 				GroupMappings: map[string]string{
-					"app_elk_team10_ingest": "elk-ingest",
+					"app_elk_team10_ingest":    "elk-ingest",
+					"OU=Demo,DC=glauth,DC=com": "{cn}",
 				},
 			},
 		},

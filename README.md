@@ -56,6 +56,7 @@ serviceuser / mysecret
 ```
 
 The compose broker config lives in `compose/authbroker.config.json`. The test UI uses `http://localhost:8080` for browser redirects and `http://authbroker:8080` for server-side token and UserInfo calls inside the Docker network, then displays the LDAP-backed profile and client-mapped groups.
+In the GLAUTH fixture, `johndoe` also has a Demo OU-style group membership, `CN=demo_reports,OU=Demo,DC=glauth,DC=com`, which the compose client maps to `demo_reports`.
 
 ## Generate a persistent signing key
 
@@ -119,13 +120,13 @@ Groups are also configured per client. LDAP/AD may return a large `memberOf` lis
   "redirect_uris": ["http://localhost:3000/callback"],
   "require_pkce": true,
   "group_mappings": {
-    "CN=Demo App Users,OU=Groups,DC=example,DC=com": "demo-user",
-    "CN=Demo App Admins,OU=Groups,DC=example,DC=com": "demo-admin"
+    "CN=Demo App Admins,OU=Groups,DC=example,DC=com": "demo-admin",
+    "OU=Demo,DC=example,DC=com": "{cn}"
   }
 }
 ```
 
-Mapping keys can be raw LDAP DNs or the normalized group names returned by the broker. Only mapped groups are included in access tokens, ID tokens, and UserInfo, and only when the authorization request includes the `groups` scope.
+Mapping keys can be raw LDAP DNs or normalized group names. A mapping whose key is a base DN and whose value contains `{cn}` forwards every group with a `CN` below that base, so `"OU=Demo,DC=example,DC=com": "{cn}"` forwards `CN=Reports,OU=Demo,DC=example,DC=com` as `Reports`. The wildcard spelling `"CN=*,OU=Demo,DC=example,DC=com": "{cn}"` is also accepted. Only mapped groups are included in access tokens, ID tokens, and UserInfo, and only when the authorization request includes the `groups` scope.
 
 ## LDAP/AD backend
 
