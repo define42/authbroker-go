@@ -54,7 +54,6 @@ type Config struct {
 	CookieSecure  *bool  `json:"cookie_secure,omitempty"`
 
 	LDAP     LDAPConfig     `json:"ldap"`
-	DevUsers []DevUser      `json:"dev_users,omitempty"`
 	Clients  []Client       `json:"clients"`
 	MFA      MFAConfig      `json:"mfa"`
 	WebAuthn WebAuthnConfig `json:"webauthn"`
@@ -77,13 +76,6 @@ type LDAPConfig struct {
 	StartTLS           bool   `json:"start_tls,omitempty"`
 	InsecureSkipVerify bool   `json:"insecure_skip_verify,omitempty"`
 	TimeoutSeconds     int    `json:"timeout_seconds"`
-}
-
-type DevUser struct {
-	Username string `json:"username"`
-	Password string `json:"password"` // DEV ONLY. Do not use this in production.
-	Email    string `json:"email,omitempty"`
-	Name     string `json:"name,omitempty"`
 }
 
 type Client struct {
@@ -270,27 +262,6 @@ type UserProfile struct {
 
 type Authenticator interface {
 	Authenticate(ctx context.Context, username, password string) (UserProfile, error)
-}
-
-type DevAuthenticator struct {
-	users map[string]DevUser
-}
-
-func NewDevAuthenticator(users []DevUser) *DevAuthenticator {
-	m := map[string]DevUser{}
-	for _, u := range users {
-		m[u.Username] = u
-	}
-	return &DevAuthenticator{users: m}
-}
-
-func (a *DevAuthenticator) Authenticate(ctx context.Context, username, password string) (UserProfile, error) {
-	_ = ctx
-	u, ok := a.users[username]
-	if !ok || subtle.ConstantTimeCompare([]byte(u.Password), []byte(password)) != 1 {
-		return UserProfile{}, fmt.Errorf("invalid username or password")
-	}
-	return UserProfile{Subject: u.Username, Email: u.Email, Name: u.Name}, nil
 }
 
 type LDAPAuthenticator struct {
@@ -524,18 +495,10 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 		clientMap[c.ClientID] = c
 	}
 
-	var authn Authenticator
-	if len(cfg.DevUsers) > 0 {
-		log.Printf("WARNING: dev_users enabled. Do not use plaintext dev users in production.")
-		authn = NewDevAuthenticator(cfg.DevUsers)
-	} else {
-		authn = &LDAPAuthenticator{cfg: cfg.LDAP}
-	}
-
 	b := &Broker{
 		cfg:          cfg,
 		store:        store,
-		authn:        authn,
+		authn:        &LDAPAuthenticator{cfg: cfg.LDAP},
 		privateKey:   key,
 		clients:      clientMap,
 		sessions:     map[string]Session{},

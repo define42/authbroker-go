@@ -22,15 +22,6 @@
     "timeout_seconds": 5
   },
 
-  "dev_users": [
-    {
-      "username": "devuser",
-      "password": "dev-password",
-      "email": "devuser@example.com",
-      "name": "devuser"
-    }
-  ],
-
   "mfa": {
     "totp_required": false
   },

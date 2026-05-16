@@ -13,7 +13,7 @@ It provides modern application-facing protocols and security mechanisms:
 - Token revocation endpoint
 - TOTP MFA enrollment and validation
 - Minimal WebAuthn/passkey registration and login support for ES256 credentials
-- LDAP/AD simple-bind backend with optional profile lookup, or local dev users for testing
+- LDAP/AD simple-bind backend with optional profile lookup
 
 The broker is intentionally small enough to study and extend. LDAP connectivity uses `github.com/go-ldap/ldap/v3`.
 
@@ -84,11 +84,11 @@ Visit:
 http://localhost:8080/oauth2/authorize?response_type=code&client_id=demo-web&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&scope=openid%20profile%20email&state=abc&nonce=n1&code_challenge=<CHALLENGE>&code_challenge_method=S256
 ```
 
-Login with the dev user from `config.example.json`:
+Login with an LDAP/AD user configured in your directory:
 
 ```text
-username: devuser
-password: dev-password
+username: <directory user>
+password: <directory password>
 ```
 
 Exchange the returned code:
@@ -104,7 +104,7 @@ curl -u demo-web:demo-secret \
 
 ## LDAP/AD backend
 
-Remove `dev_users` from the config and configure LDAP/AD.
+Configure LDAP/AD as the authentication backend.
 
 For Active Directory UPN bind:
 
@@ -160,7 +160,7 @@ The server exposes JSON endpoints:
 
 - `POST /webauthn/register/begin` — requires an existing broker session
 - `POST /webauthn/register/finish`
-- `POST /webauthn/login/begin` — body: `{ "username": "devuser" }`
+- `POST /webauthn/login/begin` — body: `{ "username": "ingestuser" }`
 - `POST /webauthn/login/finish` — sets the broker session cookie
 
 Browser helper functions for base64url conversion:
@@ -207,7 +207,7 @@ Login outline:
 const opts = await fetch('/webauthn/login/begin', {
   method: 'POST',
   headers: {'Content-Type': 'application/json'},
-  body: JSON.stringify({username: 'devuser'})
+  body: JSON.stringify({username: 'ingestuser'})
 }).then(r => r.json());
 opts.publicKey.challenge = b64urlToBuf(opts.publicKey.challenge);
 opts.publicKey.allowCredentials = opts.publicKey.allowCredentials.map(c => ({...c, id: b64urlToBuf(c.id)}));
