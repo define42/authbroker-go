@@ -46,7 +46,9 @@ const (
 	bearerPrefix      = "Bearer "
 
 	defaultConfigPath = "config.json"
-	defaultDataPath   = "data.json"
+	defaultDataDir    = "data"
+	defaultDataFile   = "data.json"
+	defaultKeyPath    = "signing-key.pem"
 	envConfigPath     = "AUTHBROKER_CONFIG"
 	envDataPath       = "AUTHBROKER_DATA"
 )
@@ -2789,6 +2791,14 @@ func parseRSAPrivateKeyPEM(b []byte) (*rsa.PrivateKey, error) {
 	return rsaKey, nil
 }
 
+func marshalRSAPrivateKeyPEM(key *rsa.PrivateKey) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := pem.Encode(&buf, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 func verifyPKCE(expectedChallenge, method, verifier string) bool {
 	if method != "S256" || verifier == "" || expectedChallenge == "" {
 		return false
@@ -3081,6 +3091,102 @@ func loadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
+func resolveDataDir(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", nil
+	}
+	if info, statErr := os.Stat(path); statErr == nil {
+		if !info.IsDir() {
+			return "", fmt.Errorf("%s must be a directory", path)
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return "", statErr
+	}
+	return filepath.Clean(path), nil
+}
+
+func prepareSigningKeyPEM(cfg *Config, dataDir string) error {
+	if strings.TrimSpace(cfg.SigningKeyPEM) != "" || dataDir == "" {
+		return nil
+	}
+
+	keyPath := filepath.Join(dataDir, defaultKeyPath)
+	keyPEM, created, err := loadOrCreateRSASigningKeyPEM(keyPath)
+	if err != nil {
+		return err
+	}
+	cfg.SigningKeyPEM = string(keyPEM)
+	if created {
+		log.Printf("generated RSA signing key at %s", keyPath)
+	} else {
+		log.Printf("loaded RSA signing key from %s", keyPath)
+	}
+	return nil
+}
+
+func loadOrCreateRSASigningKeyPEM(path string) ([]byte, bool, error) {
+	keyPEM, err := readRSASigningKeyPEM(path)
+	if err == nil {
+		return keyPEM, false, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, false, err
+	}
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, false, err
+	}
+	keyPEM, err = marshalRSAPrivateKeyPEM(key)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, false, err
+	}
+	if err := writeNewFile(path, keyPEM, 0o600); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			keyPEM, readErr := readRSASigningKeyPEM(path)
+			return keyPEM, false, readErr
+		}
+		return nil, false, err
+	}
+	return keyPEM, true, nil
+}
+
+func readRSASigningKeyPEM(path string) ([]byte, error) {
+	keyPEM, err := os.ReadFile(path) //nolint:gosec // key path is derived from operator-supplied data path.
+	if err != nil {
+		return nil, err
+	}
+	if _, err := parseRSAPrivateKeyPEM(keyPEM); err != nil {
+		return nil, fmt.Errorf("parse signing key file %s: %w", path, err)
+	}
+	return keyPEM, nil
+}
+
+func writeNewFile(path string, b []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm) //nolint:gosec // key path is derived from operator-supplied data path.
+	if err != nil {
+		return err
+	}
+	n, writeErr := f.Write(b)
+	closeErr := f.Close()
+	if writeErr == nil && n != len(b) {
+		writeErr = io.ErrShortWrite
+	}
+	if writeErr != nil {
+		_ = os.Remove(path)
+		return writeErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(path)
+		return closeErr
+	}
+	return nil
+}
+
 func envOrDefault(name, fallback string) string {
 	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
 		return value
@@ -3090,7 +3196,7 @@ func envOrDefault(name, fallback string) string {
 
 func main() {
 	configPath := flag.String("config", envOrDefault(envConfigPath, defaultConfigPath), "Path to JSON config")
-	dataPath := flag.String("data", envOrDefault(envDataPath, defaultDataPath), "Path to persistent user/MFA/WebAuthn data")
+	dataPath := flag.String("data", envOrDefault(envDataPath, defaultDataDir), "Path to persistent authbroker data directory")
 	printKey := flag.Bool("generate-key", false, "Generate a PEM RSA key and exit")
 	flag.Parse()
 
@@ -3099,7 +3205,11 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		if err := pem.Encode(os.Stdout, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}); err != nil {
+		keyPEM, err := marshalRSAPrivateKeyPEM(key)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if _, err := os.Stdout.Write(keyPEM); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -3109,7 +3219,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
-	store, err := NewStore(*dataPath)
+	dataDir, err := resolveDataDir(*dataPath)
+	if err != nil {
+		log.Fatalf("resolve data path: %v", err)
+	}
+	if err := prepareSigningKeyPEM(&cfg, dataDir); err != nil {
+		log.Fatalf("prepare signing key: %v", err)
+	}
+	store, err := NewStore(filepath.Join(dataDir, defaultDataFile))
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}

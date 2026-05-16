@@ -25,14 +25,16 @@ The broker is intentionally small enough to study and extend. LDAP connectivity 
 ## Run
 
 ```bash
-go run . -config config.example.json -data data.json
+go run . -config config.example.json -data data
 ```
 
 The same paths can be supplied through environment variables:
 
 ```bash
-AUTHBROKER_CONFIG=config.example.json AUTHBROKER_DATA=data.json go run .
+AUTHBROKER_CONFIG=config.example.json AUTHBROKER_DATA=data go run .
 ```
+
+`AUTHBROKER_DATA` points at a data directory. The broker stores user/MFA/WebAuthn data in `data.json` inside that directory.
 
 Open the OIDC discovery document:
 
@@ -133,13 +135,15 @@ App tokens include `sub`, `preferred_username`, `email`, `name`, `client_id`, `a
 
 ## Generate a persistent signing key
 
-By default the server generates an ephemeral RSA key on startup. For real use, generate a stable key:
+When `signing_key_pem` is omitted, startup automatically creates an RSA signing key as `signing-key.pem` in the `AUTHBROKER_DATA` directory and reuses it on later starts.
+
+You can still generate a config-managed key yourself:
 
 ```bash
 go run . -generate-key > signing-key.pem
 ```
 
-Then paste the PEM content into `signing_key_pem` in your JSON config, escaping newlines as `\n`, or extend `loadConfig` to read the key from a secret-mounted file.
+Then paste the PEM content into `signing_key_pem` in your JSON config, escaping newlines as `\n`, or mount the generated `signing-key.pem` alongside the broker data.
 
 ## OAuth/OIDC authorization-code flow with PKCE
 

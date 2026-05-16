@@ -24,6 +24,8 @@ profile.cov
 go.work
 go.work.sum
 
+authbroker-go
+.claude/
 # env file
 .env
 
