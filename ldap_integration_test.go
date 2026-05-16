@@ -150,6 +150,25 @@ func TestMergeStrings(t *testing.T) {
 	}
 }
 
+func TestClientSecretMatchesSHA256(t *testing.T) {
+	client := Client{
+		ClientID:           "demo-web",
+		ClientSecretSHA256: "cd577fe2561ebff23505db0bb006300c7cdecbd46bc0e03c449afafaca2c25bf",
+	}
+	if !clientSecretMatches(client, "demo-secret") {
+		t.Fatalf("expected hashed client secret to match")
+	}
+	if clientSecretMatches(client, "wrong-secret") {
+		t.Fatalf("wrong client secret should not match")
+	}
+	if clientSecretMatches(Client{ClientSecretSHA256: "not-hex"}, "demo-secret") {
+		t.Fatalf("invalid hash config should not match")
+	}
+	if clientSecretMatches(Client{}, "demo-secret") {
+		t.Fatalf("missing hash config should not match")
+	}
+}
+
 func TestLDAPBrokerOAuthIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Docker-backed LDAP integration test in short mode")
@@ -397,8 +416,8 @@ func startTestBroker(ctx context.Context, t *testing.T, ldapCfg LDAPConfig) (str
 		CookieSecure: boolPtr(false),
 		Clients: []Client{
 			{
-				ClientID:     "demo-web",
-				ClientSecret: "demo-secret",
+				ClientID:           "demo-web",
+				ClientSecretSHA256: "cd577fe2561ebff23505db0bb006300c7cdecbd46bc0e03c449afafaca2c25bf",
 				RedirectURIs: []string{
 					baseURL + "/callback",
 				},

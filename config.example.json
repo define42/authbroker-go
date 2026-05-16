@@ -40,7 +40,7 @@
   "clients": [
     {
       "client_id": "demo-web",
-      "client_secret": "demo-secret",
+      "client_secret_sha256": "cd577fe2561ebff23505db0bb006300c7cdecbd46bc0e03c449afafaca2c25bf",
       "redirect_uris": ["http://localhost:3000/callback"],
       "public": false,
       "require_pkce": true

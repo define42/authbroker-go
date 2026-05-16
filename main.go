@@ -17,6 +17,7 @@ import (
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -84,11 +85,11 @@ type LDAPConfig struct {
 }
 
 type Client struct {
-	ClientID     string   `json:"client_id"`
-	ClientSecret string   `json:"client_secret,omitempty"`
-	RedirectURIs []string `json:"redirect_uris"`
-	Public       bool     `json:"public"`
-	RequirePKCE  bool     `json:"require_pkce"`
+	ClientID           string   `json:"client_id"`
+	ClientSecretSHA256 string   `json:"client_secret_sha256,omitempty"`
+	RedirectURIs       []string `json:"redirect_uris"`
+	Public             bool     `json:"public"`
+	RequirePKCE        bool     `json:"require_pkce"`
 }
 
 type MFAConfig struct {
@@ -997,10 +998,22 @@ func (b *Broker) authenticateClient(r *http.Request) (Client, error) {
 	if client.Public {
 		return client, nil
 	}
-	if secret == "" || subtle.ConstantTimeCompare([]byte(client.ClientSecret), []byte(secret)) != 1 {
+	if !clientSecretMatches(client, secret) {
 		return Client{}, fmt.Errorf("bad client credentials")
 	}
 	return client, nil
+}
+
+func clientSecretMatches(client Client, secret string) bool {
+	if secret == "" {
+		return false
+	}
+	expected, err := hex.DecodeString(strings.TrimSpace(client.ClientSecretSHA256))
+	if err != nil || len(expected) != sha256.Size {
+		return false
+	}
+	actual := sha256.Sum256([]byte(secret))
+	return subtle.ConstantTimeCompare(expected, actual[:]) == 1
 }
 
 func (b *Broker) tokenAuthorizationCode(w http.ResponseWriter, r *http.Request, client Client) {

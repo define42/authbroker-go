@@ -102,6 +102,14 @@ curl -u demo-web:demo-secret \
   http://localhost:8080/oauth2/token
 ```
 
+The server config stores confidential client secrets as SHA-256 hex, not plaintext:
+
+```bash
+printf '%s' 'demo-secret' | sha256sum
+```
+
+Use the resulting first field as `client_secret_sha256`. The client still sends the original secret (`demo-secret`) to `/oauth2/token`; the broker hashes it and compares it with the configured digest.
+
 ## LDAP/AD backend
 
 Configure LDAP/AD as the authentication backend.
