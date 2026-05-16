@@ -44,6 +44,11 @@ import (
 const (
 	sessionCookieName = "broker_session"
 	bearerPrefix      = "Bearer "
+
+	defaultConfigPath = "config.json"
+	defaultDataPath   = "data.json"
+	envConfigPath     = "AUTHBROKER_CONFIG"
+	envDataPath       = "AUTHBROKER_DATA"
 )
 
 // Config is intentionally small. It is enough to run a modern LDAP-backed
@@ -3076,9 +3081,16 @@ func loadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
+func envOrDefault(name, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value
+	}
+	return fallback
+}
+
 func main() {
-	configPath := flag.String("config", "config.json", "Path to JSON config")
-	dataPath := flag.String("data", "data.json", "Path to persistent user/MFA/WebAuthn data")
+	configPath := flag.String("config", envOrDefault(envConfigPath, defaultConfigPath), "Path to JSON config")
+	dataPath := flag.String("data", envOrDefault(envDataPath, defaultDataPath), "Path to persistent user/MFA/WebAuthn data")
 	printKey := flag.Bool("generate-key", false, "Generate a PEM RSA key and exit")
 	flag.Parse()
 

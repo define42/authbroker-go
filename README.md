@@ -28,6 +28,12 @@ The broker is intentionally small enough to study and extend. LDAP connectivity 
 go run . -config config.example.json -data data.json
 ```
 
+The same paths can be supplied through environment variables:
+
+```bash
+AUTHBROKER_CONFIG=config.example.json AUTHBROKER_DATA=data.json go run .
+```
+
 Open the OIDC discovery document:
 
 ```bash

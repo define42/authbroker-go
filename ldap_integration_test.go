@@ -179,6 +179,24 @@ func TestMergeStrings(t *testing.T) {
 	}
 }
 
+func TestEnvOrDefault(t *testing.T) {
+	const envName = "AUTHBROKER_TEST_PATH"
+
+	if got := envOrDefault(envName, "fallback.json"); got != "fallback.json" {
+		t.Fatalf("envOrDefault() without env = %q, want fallback.json", got)
+	}
+
+	t.Setenv(envName, "/etc/authbroker/config.json")
+	if got := envOrDefault(envName, "fallback.json"); got != "/etc/authbroker/config.json" {
+		t.Fatalf("envOrDefault() with env = %q, want /etc/authbroker/config.json", got)
+	}
+
+	t.Setenv(envName, "  ")
+	if got := envOrDefault(envName, "fallback.json"); got != "fallback.json" {
+		t.Fatalf("envOrDefault() with blank env = %q, want fallback.json", got)
+	}
+}
+
 func TestMappedClientGroups(t *testing.T) {
 	client := Client{GroupMappings: map[string]string{
 		"app_elk_team10_ingest":                         "elk-ingest",

@@ -14,11 +14,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command:
-      - -config
-      - /etc/authbroker/config.json
-      - -data
-      - /tmp/authbroker-data/data.json
+    environment:
+      AUTHBROKER_CONFIG: /etc/authbroker/config.json
+      AUTHBROKER_DATA: /tmp/authbroker-data/data.json
     depends_on:
       - glauth
     volumes:
