@@ -34,7 +34,7 @@ The same paths can be supplied through environment variables:
 AUTHBROKER_CONFIG=config.example.json AUTHBROKER_DATA=data go run .
 ```
 
-`AUTHBROKER_DATA` points at a data directory. The broker stores user/MFA/WebAuthn data in `data.json` inside that directory.
+`AUTHBROKER_DATA` points at a data directory. The broker stores user/MFA/WebAuthn data in `data.json` and managed signing keys in `signing-keys.json` inside that directory.
 
 Open the OIDC discovery document:
 
@@ -133,17 +133,19 @@ export JWT_AUDIENCE="litellm"
 
 App tokens include `sub`, `preferred_username`, `email`, `name`, `client_id`, `app_token_id`, `scope`, and mapped `groups` when the selected profile has `group_mappings` and the profile scope includes `groups`. LiteLLM's JWT auth docs are at <https://docs.litellm.ai/docs/proxy/token_auth>.
 
-## Generate a persistent signing key
+## Signing keys and rotation
 
-When `signing_key_pem` is omitted, startup automatically creates an RSA signing key as `signing-key.pem` in the `AUTHBROKER_DATA` directory and reuses it on later starts.
+When `signing_key_pem` and `signing_keys` are omitted, startup automatically manages RSA signing keys in `AUTHBROKER_DATA/signing-keys.json`. New JWTs are signed with the active key, and retained old keys remain in `/oauth2/jwks` so existing tokens can validate after rotation.
+
+Managed keys rotate every `signing_key_rotation_days` days, defaulting to 90. Retired keys are kept for `signing_key_retention_days`, defaulting to 30. Set either value to `-1` to disable automatic rotation or pruning, and run with `-rotate-key` to force a managed-key rotation on startup.
 
 You can still generate a config-managed key yourself:
 
 ```bash
-go run . -generate-key > signing-key.pem
+go run . -generate-key > config-key.pem
 ```
 
-Then paste the PEM content into `signing_key_pem` in your JSON config, escaping newlines as `\n`, or mount the generated `signing-key.pem` alongside the broker data.
+Then paste the PEM content into `signing_key_pem` in your JSON config, escaping newlines as `\n`. For config-managed multi-key rotation, use `signing_keys` with exactly one entry marked `"active": true`.
 
 ## OAuth/OIDC authorization-code flow with PKCE
 
@@ -367,7 +369,7 @@ Before production, the remaining hardening work is:
 - TLS-only deployment behind a trusted ingress/proxy
 - durable transactional storage for sessions, authorization codes, refresh tokens, revoked token IDs, users, MFA secrets, and WebAuthn credentials; the current broker uses in-memory runtime maps plus a single JSON user store
 - encrypted secret storage for signing keys, TLS trust material, and deployment secrets
-- key rotation and multiple JWKS keys
+- operational key rotation policy review for each deployment
 - consent screens, client administration, and app-token profile administration
 - app-token issuance audit, revocation strategy, per-app TTL review, and policy for who may generate each token profile
 - rate limiting and brute-force protection

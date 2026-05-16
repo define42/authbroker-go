@@ -48,9 +48,12 @@ const (
 	defaultConfigPath = "config.json"
 	defaultDataDir    = "data"
 	defaultDataFile   = "data.json"
-	defaultKeyPath    = "signing-key.pem"
+	defaultKeysPath   = "signing-keys.json"
 	envConfigPath     = "AUTHBROKER_CONFIG"
 	envDataPath       = "AUTHBROKER_DATA"
+
+	defaultSigningKeyRotationDays  = 90
+	defaultSigningKeyRetentionDays = 30
 )
 
 // Config is intentionally small. It is enough to run a modern LDAP-backed
@@ -63,6 +66,10 @@ type Config struct {
 	KeyID         string `json:"key_id"`
 	CookieSecure  *bool  `json:"cookie_secure,omitempty"`
 
+	SigningKeys             []SigningKeyConfig `json:"signing_keys,omitempty"`
+	SigningKeyRotationDays  int                `json:"signing_key_rotation_days,omitempty"`
+	SigningKeyRetentionDays int                `json:"signing_key_retention_days,omitempty"`
+
 	LDAP      LDAPConfig       `json:"ldap"`
 	Clients   []Client         `json:"clients"`
 	MFA       MFAConfig        `json:"mfa"`
@@ -74,6 +81,12 @@ type Config struct {
 	RefreshTokenTTLDays   int `json:"refresh_token_ttl_days"`
 	AuthCodeTTLSeconds    int `json:"auth_code_ttl_seconds"`
 	SessionTTLHrs         int `json:"session_ttl_hours"`
+}
+
+type SigningKeyConfig struct {
+	KeyID         string `json:"key_id"`
+	SigningKeyPEM string `json:"signing_key_pem"`
+	Active        bool   `json:"active,omitempty"`
 }
 
 type LDAPConfig struct {
@@ -867,8 +880,9 @@ type Broker struct {
 	cfg        Config
 	store      *Store
 	authn      Authenticator
-	privateKey *rsa.PrivateKey
-	publicJWK  map[string]any
+	activeKey  signingKey
+	verifyKeys map[string]*rsa.PublicKey
+	publicJWKs []any
 
 	clients   map[string]Client
 	appTokens map[string]AppTokenConfig
@@ -881,6 +895,69 @@ type Broker struct {
 	revokedJTIs  map[string]time.Time
 	webauthnReg  map[string]ChallengeRecord
 	webauthnLog  map[string]ChallengeRecord
+}
+
+type signingKey struct {
+	keyID      string
+	privateKey *rsa.PrivateKey
+	publicJWK  map[string]any
+}
+
+func buildSigningKeySet(cfg Config) (signingKey, map[string]*rsa.PublicKey, []any, error) {
+	keyConfigs := cfg.SigningKeys
+	if len(keyConfigs) == 0 && strings.TrimSpace(cfg.SigningKeyPEM) != "" {
+		keyConfigs = []SigningKeyConfig{{
+			KeyID:         cfg.KeyID,
+			SigningKeyPEM: cfg.SigningKeyPEM,
+			Active:        true,
+		}}
+	}
+	if len(keyConfigs) == 0 {
+		return signingKey{}, nil, nil, nil
+	}
+
+	verifyKeys := make(map[string]*rsa.PublicKey, len(keyConfigs))
+	publicJWKs := make([]any, 0, len(keyConfigs))
+	var active signingKey
+	activeCount := 0
+	activeFlags := 0
+	for _, keyCfg := range keyConfigs {
+		if keyCfg.Active {
+			activeFlags++
+		}
+	}
+	for i, keyCfg := range keyConfigs {
+		keyID := strings.TrimSpace(keyCfg.KeyID)
+		if keyID == "" {
+			return signingKey{}, nil, nil, fmt.Errorf("signing_keys[%d].key_id is required", i)
+		}
+		if _, exists := verifyKeys[keyID]; exists {
+			return signingKey{}, nil, nil, fmt.Errorf("duplicate signing key id %q", keyID)
+		}
+		keyPEM := strings.TrimSpace(keyCfg.SigningKeyPEM)
+		if keyPEM == "" {
+			return signingKey{}, nil, nil, fmt.Errorf("signing key %q: signing_key_pem is required", keyID)
+		}
+		key, err := parseRSAPrivateKeyPEM([]byte(keyPEM))
+		if err != nil {
+			return signingKey{}, nil, nil, fmt.Errorf("parse signing key %q: %w", keyID, err)
+		}
+		verifyKeys[keyID] = &key.PublicKey
+		publicJWK := makePublicJWK(keyID, &key.PublicKey)
+		publicJWKs = append(publicJWKs, publicJWK)
+		isActive := keyCfg.Active
+		if activeFlags == 0 {
+			isActive = len(keyConfigs) == 1 || (cfg.KeyID != "" && keyID == cfg.KeyID)
+		}
+		if isActive {
+			activeCount++
+			active = signingKey{keyID: keyID, privateKey: key, publicJWK: publicJWK}
+		}
+	}
+	if activeCount != 1 {
+		return signingKey{}, nil, nil, fmt.Errorf("exactly one signing key must be active")
+	}
+	return active, verifyKeys, publicJWKs, nil
 }
 
 type Session struct {
@@ -934,20 +1011,22 @@ type ChallengeRecord struct {
 func NewBroker(cfg Config, store *Store) (*Broker, error) {
 	normalizeConfig(&cfg)
 
-	var key *rsa.PrivateKey
-	var err error
-	if cfg.SigningKeyPEM != "" {
-		key, err = parseRSAPrivateKeyPEM([]byte(cfg.SigningKeyPEM))
-		if err != nil {
-			return nil, fmt.Errorf("parse signing key: %w", err)
-		}
-	} else {
-		key, err = rsa.GenerateKey(rand.Reader, 2048)
+	activeKey, verifyKeys, publicJWKs, err := buildSigningKeySet(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if activeKey.privateKey == nil {
+		activeKey.privateKey, err = rsa.GenerateKey(rand.Reader, 2048)
 		if err != nil {
 			return nil, err
 		}
-		log.Printf("WARNING: generated ephemeral RSA signing key. Configure signing_key_pem for stable tokens.")
+		activeKey.keyID = cfg.KeyID
+		activeKey.publicJWK = makePublicJWK(activeKey.keyID, &activeKey.privateKey.PublicKey)
+		verifyKeys = map[string]*rsa.PublicKey{activeKey.keyID: &activeKey.privateKey.PublicKey}
+		publicJWKs = []any{activeKey.publicJWK}
+		log.Printf("WARNING: generated ephemeral RSA signing key. Configure signing_key_pem or AUTHBROKER_DATA for stable tokens.")
 	}
+	cfg.KeyID = activeKey.keyID
 
 	clientMap := map[string]Client{}
 	for _, c := range cfg.Clients {
@@ -985,7 +1064,9 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 		cfg:          cfg,
 		store:        store,
 		authn:        &LDAPAuthenticator{cfg: cfg.LDAP},
-		privateKey:   key,
+		activeKey:    activeKey,
+		verifyKeys:   verifyKeys,
+		publicJWKs:   publicJWKs,
 		clients:      clientMap,
 		appTokens:    appTokenMap,
 		sessions:     map[string]Session{},
@@ -996,7 +1077,6 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 		webauthnReg:  map[string]ChallengeRecord{},
 		webauthnLog:  map[string]ChallengeRecord{},
 	}
-	b.publicJWK = b.makePublicJWK()
 	return b, nil
 }
 
@@ -1011,6 +1091,12 @@ func normalizeConfig(cfg *Config) {
 	}
 	if cfg.KeyID == "" {
 		cfg.KeyID = "broker-key-1"
+	}
+	if cfg.SigningKeyRotationDays == 0 {
+		cfg.SigningKeyRotationDays = defaultSigningKeyRotationDays
+	}
+	if cfg.SigningKeyRetentionDays == 0 {
+		cfg.SigningKeyRetentionDays = defaultSigningKeyRetentionDays
 	}
 	if cfg.LDAP.TimeoutSeconds == 0 {
 		cfg.LDAP.TimeoutSeconds = 5
@@ -1203,7 +1289,7 @@ func (b *Broker) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 
 func (b *Broker) handleJWKS(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Cache-Control", "public, max-age=300, must-revalidate")
-	writeJSON(w, http.StatusOK, map[string]any{"keys": []any{b.publicJWK}})
+	writeJSON(w, http.StatusOK, map[string]any{"keys": b.publicJWKs})
 }
 
 func (b *Broker) handleHome(w http.ResponseWriter, r *http.Request) {
@@ -2665,14 +2751,13 @@ func cborGetInt(m map[any]cborValue, key int64) (cborValue, bool) {
 	return v, ok
 }
 
-func (b *Broker) makePublicJWK() map[string]any {
-	pub := b.privateKey.PublicKey
+func makePublicJWK(keyID string, pub *rsa.PublicKey) map[string]any {
 	n := base64RawURL(pub.N.Bytes())
 	eBytes := big.NewInt(int64(pub.E)).Bytes()
 	return map[string]any{
 		"kty": "RSA",
 		"use": "sig",
-		"kid": b.cfg.KeyID,
+		"kid": keyID,
 		"alg": "RS256",
 		"n":   n,
 		"e":   base64RawURL(eBytes),
@@ -2680,12 +2765,12 @@ func (b *Broker) makePublicJWK() map[string]any {
 }
 
 func (b *Broker) signJWT(claims map[string]any) (string, error) {
-	header := map[string]any{"typ": "JWT", "alg": "RS256", "kid": b.cfg.KeyID}
+	header := map[string]any{"typ": "JWT", "alg": "RS256", "kid": b.activeKey.keyID}
 	hb, _ := json.Marshal(header)
 	cb, _ := json.Marshal(claims)
 	signingInput := base64RawURL(hb) + "." + base64RawURL(cb)
 	h := sha256.Sum256([]byte(signingInput))
-	sig, err := rsa.SignPKCS1v15(rand.Reader, b.privateKey, crypto.SHA256, h[:])
+	sig, err := rsa.SignPKCS1v15(rand.Reader, b.activeKey.privateKey, crypto.SHA256, h[:])
 	if err != nil {
 		return "", err
 	}
@@ -2706,11 +2791,9 @@ func (b *Broker) verifyJWT(token string) (map[string]any, error) {
 	if err := json.Unmarshal(headerBytes, &header); err != nil {
 		return nil, err
 	}
-	// TODO: support multi-key JWKS rotation. Today the broker advertises a
-	// single key at /oauth2/jwks and rejects any token whose kid does not
-	// match cfg.KeyID. To rotate, this check must look up the signing key
-	// by kid against a key set, not a single active key.
-	if header["alg"] != "RS256" || header["kid"] != b.cfg.KeyID {
+	kid, _ := header["kid"].(string)
+	verifyKey, ok := b.verifyKeys[kid]
+	if header["alg"] != "RS256" || kid == "" || !ok {
 		return nil, fmt.Errorf("bad header")
 	}
 	sig, err := decodeB64URL(parts[2])
@@ -2719,7 +2802,7 @@ func (b *Broker) verifyJWT(token string) (map[string]any, error) {
 	}
 	signingInput := parts[0] + "." + parts[1]
 	h := sha256.Sum256([]byte(signingInput))
-	if err := rsa.VerifyPKCS1v15(&b.privateKey.PublicKey, crypto.SHA256, h[:], sig); err != nil {
+	if err := rsa.VerifyPKCS1v15(verifyKey, crypto.SHA256, h[:], sig); err != nil {
 		return nil, err
 	}
 	claimsBytes, err := decodeB64URL(parts[1])
@@ -3106,85 +3189,252 @@ func resolveDataDir(path string) (string, error) {
 	return filepath.Clean(path), nil
 }
 
-func prepareSigningKeyPEM(cfg *Config, dataDir string) error {
-	if strings.TrimSpace(cfg.SigningKeyPEM) != "" || dataDir == "" {
+type managedSigningKeySet struct {
+	ActiveKeyID string              `json:"active_key_id"`
+	Keys        []managedSigningKey `json:"keys"`
+}
+
+type managedSigningKey struct {
+	KeyID         string `json:"key_id"`
+	SigningKeyPEM string `json:"signing_key_pem"`
+	CreatedAt     int64  `json:"created_at"`
+	RetiredAt     int64  `json:"retired_at,omitempty"`
+}
+
+func prepareSigningKeys(cfg *Config, dataDir string, forceRotate bool) error {
+	if strings.TrimSpace(cfg.SigningKeyPEM) != "" || len(cfg.SigningKeys) > 0 || dataDir == "" {
 		return nil
 	}
 
-	keyPath := filepath.Join(dataDir, defaultKeyPath)
-	keyPEM, created, err := loadOrCreateRSASigningKeyPEM(keyPath)
+	path := filepath.Join(dataDir, defaultKeysPath)
+	keySet, loaded, err := loadManagedSigningKeySet(path)
 	if err != nil {
 		return err
 	}
-	cfg.SigningKeyPEM = string(keyPEM)
-	if created {
-		log.Printf("generated RSA signing key at %s", keyPath)
+	if !loaded {
+		keySet, err = initialManagedSigningKeySet(cfg.KeyID, time.Now())
+		if err != nil {
+			return err
+		}
+	}
+	changed, err := keySet.rotateAndPrune(cfg.KeyID, cfg.SigningKeyRotationDays, cfg.SigningKeyRetentionDays, forceRotate && loaded, time.Now())
+	if err != nil {
+		return err
+	}
+	if !loaded || changed {
+		if err := saveManagedSigningKeySet(path, keySet); err != nil {
+			return err
+		}
+	}
+	cfg.SigningKeys = keySet.signingKeyConfigs()
+	cfg.KeyID = keySet.ActiveKeyID
+	if !loaded {
+		log.Printf("generated RSA signing key set at %s", path)
+	} else if changed {
+		log.Printf("updated RSA signing key set at %s", path)
 	} else {
-		log.Printf("loaded RSA signing key from %s", keyPath)
+		log.Printf("loaded RSA signing key set from %s", path)
 	}
 	return nil
 }
 
-func loadOrCreateRSASigningKeyPEM(path string) ([]byte, bool, error) {
-	keyPEM, err := readRSASigningKeyPEM(path)
-	if err == nil {
-		return keyPEM, false, nil
+func loadManagedSigningKeySet(path string) (managedSigningKeySet, bool, error) {
+	var keySet managedSigningKeySet
+	b, err := os.ReadFile(path) //nolint:gosec // key path is derived from operator-supplied data directory.
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return keySet, false, nil
+		}
+		return keySet, false, err
 	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return nil, false, err
+	if err := json.Unmarshal(b, &keySet); err != nil {
+		return keySet, false, err
 	}
+	return keySet, true, nil
+}
 
+func initialManagedSigningKeySet(keyIDPrefix string, now time.Time) (managedSigningKeySet, error) {
+	key, err := newManagedSigningKey(keyIDPrefix, now)
+	if err != nil {
+		return managedSigningKeySet{}, err
+	}
+	return managedSigningKeySet{ActiveKeyID: key.KeyID, Keys: []managedSigningKey{key}}, nil
+}
+
+func (s *managedSigningKeySet) rotateAndPrune(keyIDPrefix string, rotationDays, retentionDays int, forceRotate bool, now time.Time) (bool, error) {
+	changed := false
+	createdInitial := false
+	if len(s.Keys) == 0 {
+		key, err := newManagedSigningKey(keyIDPrefix, now)
+		if err != nil {
+			return false, err
+		}
+		s.ActiveKeyID = key.KeyID
+		s.Keys = []managedSigningKey{key}
+		changed = true
+		createdInitial = true
+	}
+	if err := s.validate(); err != nil {
+		return false, err
+	}
+	activeIndex := s.activeIndex()
+	if activeIndex < 0 {
+		return false, fmt.Errorf("active signing key %q not found", s.ActiveKeyID)
+	}
+	if !createdInitial && shouldRotateSigningKey(s.Keys[activeIndex], rotationDays, forceRotate, now) {
+		s.Keys[activeIndex].RetiredAt = now.Unix()
+		key, err := newManagedSigningKey(keyIDPrefix, now)
+		if err != nil {
+			return false, err
+		}
+		s.ActiveKeyID = key.KeyID
+		s.Keys = append(s.Keys, key)
+		changed = true
+	}
+	if s.prune(retentionDays, now) {
+		changed = true
+	}
+	return changed, s.validate()
+}
+
+func (s managedSigningKeySet) validate() error {
+	if strings.TrimSpace(s.ActiveKeyID) == "" {
+		return fmt.Errorf("active signing key id is required")
+	}
+	seen := map[string]bool{}
+	activeSeen := false
+	for i, key := range s.Keys {
+		if strings.TrimSpace(key.KeyID) == "" {
+			return fmt.Errorf("signing key %d: key_id is required", i)
+		}
+		if seen[key.KeyID] {
+			return fmt.Errorf("duplicate signing key id %q", key.KeyID)
+		}
+		seen[key.KeyID] = true
+		if strings.TrimSpace(key.SigningKeyPEM) == "" {
+			return fmt.Errorf("signing key %q: signing_key_pem is required", key.KeyID)
+		}
+		if _, err := parseRSAPrivateKeyPEM([]byte(key.SigningKeyPEM)); err != nil {
+			return fmt.Errorf("parse signing key %q: %w", key.KeyID, err)
+		}
+		if key.KeyID == s.ActiveKeyID {
+			activeSeen = true
+			if key.RetiredAt != 0 {
+				return fmt.Errorf("active signing key %q is retired", key.KeyID)
+			}
+		}
+	}
+	if !activeSeen {
+		return fmt.Errorf("active signing key %q not found", s.ActiveKeyID)
+	}
+	return nil
+}
+
+func (s managedSigningKeySet) activeIndex() int {
+	for i, key := range s.Keys {
+		if key.KeyID == s.ActiveKeyID {
+			return i
+		}
+	}
+	return -1
+}
+
+func shouldRotateSigningKey(key managedSigningKey, rotationDays int, forceRotate bool, now time.Time) bool {
+	if forceRotate {
+		return true
+	}
+	if rotationDays <= 0 {
+		return false
+	}
+	createdAt := time.Unix(key.CreatedAt, 0)
+	return !createdAt.IsZero() && !now.Before(createdAt.AddDate(0, 0, rotationDays))
+}
+
+func (s *managedSigningKeySet) prune(retentionDays int, now time.Time) bool {
+	if retentionDays < 0 {
+		return false
+	}
+	cutoff := now.AddDate(0, 0, -retentionDays).Unix()
+	keys := s.Keys[:0]
+	changed := false
+	for _, key := range s.Keys {
+		if key.KeyID != s.ActiveKeyID && key.RetiredAt != 0 && key.RetiredAt < cutoff {
+			changed = true
+			continue
+		}
+		keys = append(keys, key)
+	}
+	s.Keys = keys
+	return changed
+}
+
+func (s managedSigningKeySet) signingKeyConfigs() []SigningKeyConfig {
+	out := make([]SigningKeyConfig, 0, len(s.Keys))
+	for _, key := range s.Keys {
+		out = append(out, SigningKeyConfig{
+			KeyID:         key.KeyID,
+			SigningKeyPEM: key.SigningKeyPEM,
+			Active:        key.KeyID == s.ActiveKeyID,
+		})
+	}
+	return out
+}
+
+func newManagedSigningKey(keyIDPrefix string, now time.Time) (managedSigningKey, error) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return nil, false, err
+		return managedSigningKey{}, err
 	}
-	keyPEM, err = marshalRSAPrivateKeyPEM(key)
+	keyPEM, err := marshalRSAPrivateKeyPEM(key)
 	if err != nil {
-		return nil, false, err
+		return managedSigningKey{}, err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, false, err
+	return managedSigningKey{
+		KeyID:         newSigningKeyID(keyIDPrefix, now),
+		SigningKeyPEM: string(keyPEM),
+		CreatedAt:     now.Unix(),
+	}, nil
+}
+
+func newSigningKeyID(prefix string, now time.Time) string {
+	prefix = sanitizeKeyIDPrefix(prefix)
+	if prefix == "" {
+		prefix = "broker-key"
 	}
-	if err := writeNewFile(path, keyPEM, 0o600); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			keyPEM, readErr := readRSASigningKeyPEM(path)
-			return keyPEM, false, readErr
+	return prefix + "-" + now.UTC().Format("20060102T150405Z") + "-" + randomB64(6)
+}
+
+func sanitizeKeyIDPrefix(prefix string) string {
+	prefix = strings.TrimSpace(prefix)
+	var b strings.Builder
+	for _, r := range prefix {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-' || r == '_':
+			b.WriteRune(r)
 		}
-		return nil, false, err
 	}
-	return keyPEM, true, nil
+	return strings.Trim(b.String(), "-_")
 }
 
-func readRSASigningKeyPEM(path string) ([]byte, error) {
-	keyPEM, err := os.ReadFile(path) //nolint:gosec // key path is derived from operator-supplied data path.
-	if err != nil {
-		return nil, err
+func saveManagedSigningKeySet(path string, keySet managedSigningKeySet) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
 	}
-	if _, err := parseRSAPrivateKeyPEM(keyPEM); err != nil {
-		return nil, fmt.Errorf("parse signing key file %s: %w", path, err)
-	}
-	return keyPEM, nil
-}
-
-func writeNewFile(path string, b []byte, perm os.FileMode) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm) //nolint:gosec // key path is derived from operator-supplied data path.
+	b, err := json.MarshalIndent(keySet, "", "  ")
 	if err != nil {
 		return err
 	}
-	n, writeErr := f.Write(b)
-	closeErr := f.Close()
-	if writeErr == nil && n != len(b) {
-		writeErr = io.ErrShortWrite
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
 	}
-	if writeErr != nil {
-		_ = os.Remove(path)
-		return writeErr
-	}
-	if closeErr != nil {
-		_ = os.Remove(path)
-		return closeErr
-	}
-	return nil
+	return os.Rename(tmp, path)
 }
 
 func envOrDefault(name, fallback string) string {
@@ -3198,6 +3448,7 @@ func main() {
 	configPath := flag.String("config", envOrDefault(envConfigPath, defaultConfigPath), "Path to JSON config")
 	dataPath := flag.String("data", envOrDefault(envDataPath, defaultDataDir), "Path to persistent authbroker data directory")
 	printKey := flag.Bool("generate-key", false, "Generate a PEM RSA key and exit")
+	rotateSigningKey := flag.Bool("rotate-key", false, "Force managed signing key rotation on startup")
 	flag.Parse()
 
 	if *printKey {
@@ -3219,11 +3470,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
+	normalizeConfig(&cfg)
 	dataDir, err := resolveDataDir(*dataPath)
 	if err != nil {
 		log.Fatalf("resolve data path: %v", err)
 	}
-	if err := prepareSigningKeyPEM(&cfg, dataDir); err != nil {
+	if err := prepareSigningKeys(&cfg, dataDir, *rotateSigningKey); err != nil {
 		log.Fatalf("prepare signing key: %v", err)
 	}
 	store, err := NewStore(filepath.Join(dataDir, defaultDataFile))

@@ -2,6 +2,8 @@
   "issuer": "http://localhost:8080",
   "listen": ":8080",
   "key_id": "authbroker-dev-key-1",
+  "signing_key_rotation_days": 90,
+  "signing_key_retention_days": 30,
   "cookie_secure": false,
   "access_token_ttl_minutes": 15,
   "id_token_ttl_minutes": 15,
