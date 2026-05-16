@@ -55,7 +55,7 @@ johndoe / dogood
 serviceuser / mysecret
 ```
 
-The compose broker config lives in `compose/authbroker.config.json`. The test UI uses `http://localhost:8080` for browser redirects and `http://authbroker:8080` for server-side token and UserInfo calls inside the Docker network.
+The compose broker config lives in `compose/authbroker.config.json`. The test UI uses `http://localhost:8080` for browser redirects and `http://authbroker:8080` for server-side token and UserInfo calls inside the Docker network, then displays the LDAP-backed profile and groups.
 
 ## Generate a persistent signing key
 
@@ -81,7 +81,7 @@ echo "$CHALLENGE"
 Visit:
 
 ```text
-http://localhost:8080/oauth2/authorize?response_type=code&client_id=demo-web&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&scope=openid%20profile%20email&state=abc&nonce=n1&code_challenge=<CHALLENGE>&code_challenge_method=S256
+http://localhost:8080/oauth2/authorize?response_type=code&client_id=demo-web&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&scope=openid%20profile%20email%20groups&state=abc&nonce=n1&code_challenge=<CHALLENGE>&code_challenge_method=S256
 ```
 
 Login with an LDAP/AD user configured in your directory:
@@ -116,6 +116,7 @@ For Active Directory UPN bind:
   "user_filter": "(userPrincipalName={login})",
   "email_attribute": "mail",
   "name_attribute": "displayName",
+  "groups_attribute": "memberOf",
   "timeout_seconds": 5
 }
 ```
@@ -126,7 +127,7 @@ The broker will bind as:
 <username>@example.com
 ```
 
-It then searches below `base_dn`, escapes the `{login}` value, and copies the configured LDAP attributes into OIDC `email` and `name` claims.
+It then searches below `base_dn`, escapes the `{login}` value, and copies the configured LDAP attributes into OIDC `email`, `name`, and `groups` claims.
 
 For OpenLDAP DN-template bind:
 
@@ -138,11 +139,12 @@ For OpenLDAP DN-template bind:
   "user_filter": "(uid={username})",
   "email_attribute": "mail",
   "name_attribute": "cn",
+  "groups_attribute": "memberOf",
   "timeout_seconds": 5
 }
 ```
 
-Profile lookup is optional. If `base_dn` and `user_filter` are omitted, the broker only performs the bind and falls back to the submitted username plus `domain_suffix` for profile claims. Use `"start_tls": true` only with `ldap://` URLs; `ldaps://` starts TLS during dial. This starter does not implement LDAP group sync, nested AD groups, or Kerberos/SPNEGO. Add those as separate federation modules.
+Profile lookup is optional. If `base_dn` and `user_filter` are omitted, the broker only performs the bind and falls back to the submitted username plus `domain_suffix` for profile claims. Use `"start_tls": true` only with `ldap://` URLs; `ldaps://` starts TLS during dial. This starter does not implement group sync, nested AD group resolution, or Kerberos/SPNEGO. Add those as separate federation modules.
 
 ## TOTP MFA
 

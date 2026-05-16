@@ -45,6 +45,7 @@ type profile struct {
 	PreferredUsername string
 	Email             string
 	Name              string
+	Groups            []string
 }
 
 type tokenResponse struct {
@@ -118,7 +119,7 @@ func (a *app) handleLogin(w http.ResponseWriter, r *http.Request) {
 		"response_type":         {"code"},
 		"client_id":             {a.clientID},
 		"redirect_uri":          {redirectURI},
-		"scope":                 {"openid profile email"},
+		"scope":                 {"openid profile email groups"},
 		"state":                 {state},
 		"nonce":                 {nonce},
 		"code_challenge":        {base64.RawURLEncoding.EncodeToString(challengeHash[:])},
@@ -274,7 +275,24 @@ func profileFromClaims(claims map[string]any) profile {
 	username, _ := claims["preferred_username"].(string)
 	email, _ := claims["email"].(string)
 	name, _ := claims["name"].(string)
-	return profile{Subject: sub, PreferredUsername: username, Email: email, Name: name}
+	return profile{Subject: sub, PreferredUsername: username, Email: email, Name: name, Groups: stringSliceClaim(claims["groups"])}
+}
+
+func stringSliceClaim(value any) []string {
+	switch v := value.(type) {
+	case []string:
+		return append([]string(nil), v...)
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func decodeJWTClaims(token string) (map[string]any, error) {
@@ -337,6 +355,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
         <dt>Username</dt><dd>{{.Profile.PreferredUsername}}</dd>
         <dt>Email</dt><dd>{{.Profile.Email}}</dd>
         <dt>Name</dt><dd>{{.Profile.Name}}</dd>
+        <dt>Groups</dt><dd>{{range $i, $group := .Profile.Groups}}{{if $i}}, {{end}}{{$group}}{{else}}none{{end}}</dd>
       </dl>
       <form method="post" action="/logout"><button type="submit">Sign out</button></form>
     {{else}}

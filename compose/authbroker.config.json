@@ -16,6 +16,7 @@
     "user_filter": "(mail={login})",
     "email_attribute": "mail",
     "name_attribute": "cn",
+    "groups_attribute": "memberOf",
     "start_tls": false,
     "insecure_skip_verify": true,
     "timeout_seconds": 5

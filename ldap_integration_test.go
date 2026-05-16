@@ -104,6 +104,25 @@ func TestLDAPProfileSearchConfigValidation(t *testing.T) {
 	}
 }
 
+func TestLDAPGroupNames(t *testing.T) {
+	got := ldapGroupNames([]string{
+		"cn=app_elk_team10_ingest,ou=groups,dc=glauth,dc=com",
+		"ou=app_elk_team10_user,ou=groups,dc=glauth,dc=com",
+		"plain-group",
+		"cn=app_elk_team10_ingest,ou=groups,dc=glauth,dc=com",
+		"",
+	})
+	want := []string{"app_elk_team10_ingest", "app_elk_team10_user", "plain-group"}
+	if len(got) != len(want) {
+		t.Fatalf("ldapGroupNames() = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ldapGroupNames() = %#v, want %#v", got, want)
+		}
+	}
+}
+
 func TestLDAPBrokerOAuthIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Docker-backed LDAP integration test in short mode")
@@ -123,6 +142,7 @@ func TestLDAPBrokerOAuthIntegration(t *testing.T) {
 		UserFilter:         "(mail=%s)",
 		EmailAttribute:     "mail",
 		NameAttribute:      "cn",
+		GroupsAttribute:    "memberOf",
 		InsecureSkipVerify: true,
 		TimeoutSeconds:     5,
 	}
@@ -141,6 +161,7 @@ func TestLDAPBrokerOAuthIntegration(t *testing.T) {
 		assertStringClaim(t, accessClaims, "sub", "ingestuser")
 		assertStringClaim(t, accessClaims, "email", "ingestuser@example.com")
 		assertStringClaim(t, accessClaims, "name", "ingestuser")
+		assertStringSliceClaimContains(t, accessClaims, "groups", "app_elk_team10_ingest")
 
 		idClaims, err := broker.verifyJWT(tokens.IDToken)
 		if err != nil {
@@ -149,6 +170,7 @@ func TestLDAPBrokerOAuthIntegration(t *testing.T) {
 		assertStringClaim(t, idClaims, "sub", "ingestuser")
 		assertStringClaim(t, idClaims, "email", "ingestuser@example.com")
 		assertStringClaim(t, idClaims, "name", "ingestuser")
+		assertStringSliceClaimContains(t, idClaims, "groups", "app_elk_team10_ingest")
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/oauth2/userinfo", nil)
 		if err != nil {
@@ -171,6 +193,7 @@ func TestLDAPBrokerOAuthIntegration(t *testing.T) {
 		assertStringClaim(t, userinfo, "sub", "ingestuser")
 		assertStringClaim(t, userinfo, "email", "ingestuser@example.com")
 		assertStringClaim(t, userinfo, "name", "ingestuser")
+		assertStringSliceClaimContains(t, userinfo, "groups", "app_elk_team10_ingest")
 	})
 
 	t.Run("wrong password is unauthorized and issues no auth code", func(t *testing.T) {
@@ -281,7 +304,7 @@ func beginAuthorize(ctx context.Context, t *testing.T, client *http.Client, base
 		"response_type":         {"code"},
 		"client_id":             {"demo-web"},
 		"redirect_uri":          {baseURL + "/callback"},
-		"scope":                 {"openid profile email"},
+		"scope":                 {"openid profile email groups"},
 		"state":                 {"ldap-test-state"},
 		"nonce":                 {"ldap-test-nonce"},
 		"code_challenge":        {base64RawURL(hash[:])},
@@ -403,6 +426,35 @@ func assertStringClaim(t *testing.T, claims map[string]any, name, want string) {
 
 	if got, _ := claims[name].(string); got != want {
 		t.Fatalf("claim %s = %#v, want %q", name, claims[name], want)
+	}
+}
+
+func assertStringSliceClaimContains(t *testing.T, claims map[string]any, name, want string) {
+	t.Helper()
+
+	values := stringSliceClaim(claims[name])
+	for _, value := range values {
+		if value == want {
+			return
+		}
+	}
+	t.Fatalf("claim %s = %#v, want it to contain %q", name, claims[name], want)
+}
+
+func stringSliceClaim(value any) []string {
+	switch v := value.(type) {
+	case []string:
+		return append([]string(nil), v...)
+	case []any:
+		values := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				values = append(values, s)
+			}
+		}
+		return values
+	default:
+		return nil
 	}
 }
 

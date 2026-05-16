@@ -73,6 +73,7 @@ type LDAPConfig struct {
 	UserFilter         string `json:"user_filter,omitempty"`
 	EmailAttribute     string `json:"email_attribute,omitempty"`
 	NameAttribute      string `json:"name_attribute,omitempty"`
+	GroupsAttribute    string `json:"groups_attribute,omitempty"`
 	StartTLS           bool   `json:"start_tls,omitempty"`
 	InsecureSkipVerify bool   `json:"insecure_skip_verify,omitempty"`
 	TimeoutSeconds     int    `json:"timeout_seconds"`
@@ -100,6 +101,7 @@ type StoredUser struct {
 	Username            string               `json:"username"`
 	Email               string               `json:"email,omitempty"`
 	Name                string               `json:"name,omitempty"`
+	Groups              []string             `json:"groups,omitempty"`
 	TOTPSecretBase32    string               `json:"totp_secret_base32,omitempty"`
 	WebAuthnCredentials []WebAuthnCredential `json:"webauthn_credentials,omitempty"`
 }
@@ -180,6 +182,9 @@ func (s *Store) UpsertProfile(p UserProfile) (*StoredUser, error) {
 	if p.Name != "" {
 		u.Name = p.Name
 	}
+	if p.Groups != nil {
+		u.Groups = append([]string(nil), p.Groups...)
+	}
 	out := cloneStoredUser(u)
 	s.mu.Unlock()
 	return out, s.Save()
@@ -248,6 +253,9 @@ func cloneStoredUser(u *StoredUser) *StoredUser {
 		return nil
 	}
 	c := *u
+	if u.Groups != nil {
+		c.Groups = append([]string(nil), u.Groups...)
+	}
 	if u.WebAuthnCredentials != nil {
 		c.WebAuthnCredentials = append([]WebAuthnCredential(nil), u.WebAuthnCredentials...)
 	}
@@ -258,6 +266,7 @@ type UserProfile struct {
 	Subject string
 	Email   string
 	Name    string
+	Groups  []string
 }
 
 type Authenticator interface {
@@ -328,6 +337,7 @@ func (a *LDAPAuthenticator) profileSearchEnabled() (bool, error) {
 func (a *LDAPAuthenticator) searchProfile(conn *ldap.Conn, username, bindName string, profile UserProfile) (UserProfile, error) {
 	emailAttr := ldapAttribute(a.cfg.EmailAttribute, "mail")
 	nameAttr := ldapAttribute(a.cfg.NameAttribute, "cn")
+	groupsAttr := strings.TrimSpace(a.cfg.GroupsAttribute)
 	searchReq := ldap.NewSearchRequest(
 		a.cfg.BaseDN,
 		ldap.ScopeWholeSubtree,
@@ -336,7 +346,7 @@ func (a *LDAPAuthenticator) searchProfile(conn *ldap.Conn, username, bindName st
 		a.cfg.TimeoutSeconds,
 		false,
 		a.userFilter(username, bindName),
-		uniqueNonEmpty(emailAttr, nameAttr),
+		uniqueNonEmpty(emailAttr, nameAttr, groupsAttr),
 		nil,
 	)
 	result, err := conn.Search(searchReq)
@@ -352,6 +362,9 @@ func (a *LDAPAuthenticator) searchProfile(conn *ldap.Conn, username, bindName st
 	}
 	if name := strings.TrimSpace(entry.GetAttributeValue(nameAttr)); name != "" {
 		profile.Name = name
+	}
+	if groupsAttr != "" {
+		profile.Groups = ldapGroupNames(entry.GetAttributeValues(groupsAttr))
 	}
 	return profile, nil
 }
@@ -386,6 +399,46 @@ func (a *LDAPAuthenticator) bindName(username string) string {
 		return a.cfg.UserDNTemplate
 	}
 	return a.loginName(username)
+}
+
+func ldapGroupNames(values []string) []string {
+	seen := map[string]bool{}
+	groups := []string{}
+	for _, value := range values {
+		value = ldapGroupName(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		groups = append(groups, value)
+	}
+	sort.Strings(groups)
+	return groups
+}
+
+func ldapGroupName(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if strings.Contains(value, "=") {
+		dn, err := ldap.ParseDN(value)
+		if err == nil && len(dn.RDNs) > 0 {
+			fallback := ""
+			for _, attr := range dn.RDNs[0].Attributes {
+				if fallback == "" && strings.TrimSpace(attr.Value) != "" {
+					fallback = strings.TrimSpace(attr.Value)
+				}
+				if strings.EqualFold(attr.Type, "cn") && strings.TrimSpace(attr.Value) != "" {
+					return strings.TrimSpace(attr.Value)
+				}
+			}
+			if fallback != "" {
+				return fallback
+			}
+		}
+	}
+	return value
 }
 
 func escapeLDAPDN(s string) string {
@@ -604,8 +657,8 @@ func (b *Broker) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 		"subject_types_supported":               []string{"public"},
 		"id_token_signing_alg_values_supported": []string{"RS256"},
 		"token_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post", "none"},
-		"scopes_supported":                      []string{"openid", "profile", "email", "offline_access"},
-		"claims_supported":                      []string{"sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "preferred_username", "email", "name"},
+		"scopes_supported":                      []string{"openid", "profile", "email", "groups", "offline_access"},
+		"claims_supported":                      []string{"sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "preferred_username", "email", "name", "groups"},
 		"code_challenge_methods_supported":      []string{"S256"},
 	})
 }
@@ -959,6 +1012,9 @@ func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime
 	if user != nil {
 		accessClaims["email"] = user.Email
 		accessClaims["name"] = displayName(user)
+		if len(user.Groups) > 0 {
+			accessClaims["groups"] = user.Groups
+		}
 	}
 	access, err := b.signJWT(accessClaims)
 	if err != nil {
@@ -980,6 +1036,9 @@ func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime
 	if user != nil {
 		idClaims["email"] = user.Email
 		idClaims["name"] = displayName(user)
+		if len(user.Groups) > 0 {
+			idClaims["groups"] = user.Groups
+		}
 	}
 	idToken, err := b.signJWT(idClaims)
 	if err != nil {
@@ -1040,6 +1099,9 @@ func (b *Broker) handleUserInfo(w http.ResponseWriter, r *http.Request) {
 	if user != nil {
 		resp["email"] = user.Email
 		resp["name"] = displayName(user)
+		if len(user.Groups) > 0 {
+			resp["groups"] = user.Groups
+		}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

@@ -17,6 +17,7 @@
     "user_filter": "(userPrincipalName={login})",
     "email_attribute": "mail",
     "name_attribute": "displayName",
+    "groups_attribute": "memberOf",
     "start_tls": false,
     "insecure_skip_verify": false,
     "timeout_seconds": 5
