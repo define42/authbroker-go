@@ -51,6 +51,7 @@ const (
 type Config struct {
 	Issuer        string `json:"issuer"`
 	Listen        string `json:"listen"`
+	DisplayName   string `json:"display_name,omitempty"`
 	SigningKeyPEM string `json:"signing_key_pem,omitempty"`
 	KeyID         string `json:"key_id"`
 	CookieSecure  *bool  `json:"cookie_secure,omitempty"`
@@ -992,7 +993,7 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 	return b, nil
 }
 
-//nolint:gocognit,cyclop // Defaulting the flat JSON config is intentionally centralized.
+//nolint:gocognit,cyclop,funlen // Defaulting the flat JSON config is intentionally centralized.
 func normalizeConfig(cfg *Config) {
 	if cfg.Listen == "" {
 		cfg.Listen = ":8080"
@@ -1025,6 +1026,9 @@ func normalizeConfig(cfg *Config) {
 	if cfg.WebAuthn.RPDisplayName == "" {
 		cfg.WebAuthn.RPDisplayName = "Go Auth Broker"
 	}
+	if strings.TrimSpace(cfg.DisplayName) == "" {
+		cfg.DisplayName = cfg.WebAuthn.RPDisplayName
+	}
 	if cfg.WebAuthn.RPID == "" {
 		if u, err := url.Parse(cfg.Issuer); err == nil {
 			cfg.WebAuthn.RPID = u.Hostname()
@@ -1052,6 +1056,69 @@ func normalizeConfig(cfg *Config) {
 			cfg.AppTokens[i].TokenTTLMinutes = 480
 		}
 	}
+}
+
+// sweepExpired removes expired entries from every in-memory map. Without
+// this, revoked-JTI markers and abandoned WebAuthn/OAuth challenges
+// accumulate indefinitely until the process restarts. Each map is swept
+// independently; collapsing into a generic helper would obscure the
+// per-map field accesses.
+//
+//nolint:gocognit // Linear sweep across seven typed maps.
+func (b *Broker) sweepExpired(now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for k, v := range b.sessions {
+		if now.After(v.ExpiresAt) {
+			delete(b.sessions, k)
+		}
+	}
+	for k, v := range b.authRequests {
+		if now.After(v.ExpiresAt) {
+			delete(b.authRequests, k)
+		}
+	}
+	for k, v := range b.authCodes {
+		if now.After(v.ExpiresAt) {
+			delete(b.authCodes, k)
+		}
+	}
+	for k, v := range b.refresh {
+		if now.After(v.ExpiresAt) {
+			delete(b.refresh, k)
+		}
+	}
+	for k, exp := range b.revokedJTIs {
+		if now.After(exp) {
+			delete(b.revokedJTIs, k)
+		}
+	}
+	for k, v := range b.webauthnReg {
+		if now.After(v.ExpiresAt) {
+			delete(b.webauthnReg, k)
+		}
+	}
+	for k, v := range b.webauthnLog {
+		if now.After(v.ExpiresAt) {
+			delete(b.webauthnLog, k)
+		}
+	}
+}
+
+// startBackgroundSweeper periodically calls sweepExpired. It is intended for
+// long-running server instances; tests construct brokers without invoking it
+// so they do not leak goroutines.
+func (b *Broker) startBackgroundSweeper(interval time.Duration) {
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for t := range ticker.C {
+			b.sweepExpired(t)
+		}
+	}()
 }
 
 func validAppTokenID(id string) bool {
@@ -1094,6 +1161,8 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
+		// Default to no-store; cacheable endpoints (JWKS, discovery) override
+		// this header explicitly before writing their response.
 		w.Header().Set("Cache-Control", "no-store")
 		next.ServeHTTP(w, r)
 	})
@@ -1105,6 +1174,7 @@ func (b *Broker) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 func (b *Broker) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 	issuer := b.cfg.Issuer
+	w.Header().Set("Cache-Control", "public, max-age=300, must-revalidate")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"issuer":                                issuer,
 		"authorization_endpoint":                issuer + "/oauth2/authorize",
@@ -1125,6 +1195,7 @@ func (b *Broker) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (b *Broker) handleJWKS(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", "public, max-age=300, must-revalidate")
 	writeJSON(w, http.StatusOK, map[string]any{"keys": []any{b.publicJWK}})
 }
 
@@ -1133,6 +1204,7 @@ func (b *Broker) handleHome(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	b.maybeExtendSession(w, r)
 	data := b.homeData(r, nil)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = brokerHomeTemplate.Execute(w, data)
@@ -1196,6 +1268,7 @@ func (b *Broker) handleAppToken(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/login", http.StatusFound)
 		return
 	}
+	b.maybeExtendSession(w, r)
 	tokenID := r.PathValue("id")
 	tokenCfg, ok := b.appTokens[tokenID]
 	if !ok {
@@ -1239,12 +1312,12 @@ func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	}
 	if client.RequirePKCE || client.Public {
 		if challenge == "" || method != "S256" {
-			redirectOAuthError(w, redirectURI, q.Get("state"), "invalid_request", "PKCE S256 is required")
+			redirectOAuthError(w, r, redirectURI, q.Get("state"), "invalid_request", "PKCE S256 is required")
 			return
 		}
 	}
 	if challenge != "" && method != "S256" {
-		redirectOAuthError(w, redirectURI, q.Get("state"), "invalid_request", "only PKCE S256 is accepted")
+		redirectOAuthError(w, r, redirectURI, q.Get("state"), "invalid_request", "only PKCE S256 is accepted")
 		return
 	}
 
@@ -1262,7 +1335,8 @@ func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if sess, ok := b.validSession(r); ok {
-		b.issueCodeRedirect(w, authReq, sess)
+		b.maybeExtendSession(w, r)
+		b.issueCodeRedirect(w, r, authReq, sess)
 		return
 	}
 
@@ -1352,7 +1426,7 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 
 	sess := b.createSession(w, user.Username)
 	if oauthLogin {
-		b.issueCodeRedirect(w, ar, sess)
+		b.issueCodeRedirect(w, r, ar, sess)
 		return
 	}
 	http.Redirect(w, r, "/", http.StatusFound)
@@ -1484,6 +1558,49 @@ func (b *Broker) validSession(r *http.Request) (Session, bool) {
 	return s, true
 }
 
+// maybeExtendSession refreshes the broker session's expiry on activity once
+// more than half of the TTL has been consumed. The cookie is re-set so the
+// browser does not drop it at the original expiration.
+func (b *Broker) maybeExtendSession(w http.ResponseWriter, r *http.Request) {
+	c, err := r.Cookie(sessionCookieName)
+	if err != nil || c.Value == "" {
+		return
+	}
+	ttl := time.Duration(b.cfg.SessionTTLHrs) * time.Hour
+	if ttl <= 0 {
+		return
+	}
+	now := time.Now()
+	b.mu.Lock()
+	s, ok := b.sessions[c.Value]
+	if !ok || now.After(s.ExpiresAt) {
+		b.mu.Unlock()
+		return
+	}
+	if time.Until(s.ExpiresAt) > ttl/2 {
+		b.mu.Unlock()
+		return
+	}
+	s.ExpiresAt = now.Add(ttl)
+	b.sessions[c.Value] = s
+	newExpiry := s.ExpiresAt
+	b.mu.Unlock()
+
+	secure := strings.HasPrefix(b.cfg.Issuer, "https://")
+	if b.cfg.CookieSecure != nil {
+		secure = *b.cfg.CookieSecure
+	}
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure is controlled by issuer/config for local HTTP demos and HTTPS deployments.
+		Name:     sessionCookieName,
+		Value:    c.Value,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+		Expires:  newExpiry,
+	})
+}
+
 func (b *Broker) clearSession(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
 		b.mu.Lock()
@@ -1528,7 +1645,7 @@ func (b *Broker) createSession(w http.ResponseWriter, userID string) Session {
 	return sess
 }
 
-func (b *Broker) issueCodeRedirect(w http.ResponseWriter, ar AuthorizationRequest, sess Session) {
+func (b *Broker) issueCodeRedirect(w http.ResponseWriter, r *http.Request, ar AuthorizationRequest, sess Session) {
 	code := randomB64(32)
 	ac := AuthCode{
 		Code:                code,
@@ -1553,7 +1670,7 @@ func (b *Broker) issueCodeRedirect(w http.ResponseWriter, ar AuthorizationReques
 		q.Set("state", ar.State)
 	}
 	u.RawQuery = q.Encode()
-	http.Redirect(w, &http.Request{}, u.String(), http.StatusFound)
+	http.Redirect(w, r, u.String(), http.StatusFound)
 }
 
 func (b *Broker) handleToken(w http.ResponseWriter, r *http.Request) {
@@ -1648,22 +1765,53 @@ func (b *Broker) tokenAuthorizationCode(w http.ResponseWriter, r *http.Request, 
 
 func (b *Broker) tokenRefresh(w http.ResponseWriter, r *http.Request, client Client) {
 	rt := r.Form.Get("refresh_token")
+	requestedScope := strings.TrimSpace(r.Form.Get("scope"))
 	b.mu.Lock()
 	old, ok := b.refresh[rt]
-	if ok {
-		delete(b.refresh, rt) // refresh token rotation
-	}
-	b.mu.Unlock()
-	if !ok || time.Now().After(old.ExpiresAt) || old.ClientID != client.ClientID {
+	if !ok {
+		b.mu.Unlock()
 		tokenError(w, "invalid_grant", "invalid refresh_token")
 		return
 	}
-	resp, err := b.issueUserTokens(old.UserID, client.ClientID, old.Scope, "", old.AuthTime, true)
+	if time.Now().After(old.ExpiresAt) || old.ClientID != client.ClientID {
+		delete(b.refresh, rt)
+		b.mu.Unlock()
+		tokenError(w, "invalid_grant", "invalid refresh_token")
+		return
+	}
+	// Per RFC 6749 §6, the client may request a narrower scope on refresh,
+	// but never one that exceeds the original grant. Reject scope expansion
+	// without consuming the refresh token so the legitimate client can retry.
+	if requestedScope != "" && !scopeSubset(requestedScope, old.Scope) {
+		b.mu.Unlock()
+		tokenError(w, "invalid_scope", "requested scope exceeds original grant")
+		return
+	}
+	delete(b.refresh, rt) // refresh token rotation
+	b.mu.Unlock()
+	scope := old.Scope
+	if requestedScope != "" {
+		scope = requestedScope
+	}
+	resp, err := b.issueUserTokens(old.UserID, client.ClientID, scope, "", old.AuthTime, true)
 	if err != nil {
 		tokenErrorStatus(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func scopeSubset(requested, granted string) bool {
+	grantedSet := map[string]bool{}
+	for _, p := range strings.Fields(granted) {
+		grantedSet[p] = true
+	}
+	for _, p := range strings.Fields(requested) {
+		if !grantedSet[p] {
+			return false
+		}
+	}
+	return true
 }
 
 func (b *Broker) tokenClientCredentials(w http.ResponseWriter, r *http.Request, client Client) {
@@ -1682,6 +1830,7 @@ func (b *Broker) tokenClientCredentials(w http.ResponseWriter, r *http.Request, 
 		"jti":       randomB64(16),
 		"client_id": client.ClientID,
 		"scope":     r.Form.Get("scope"),
+		"token_use": "access",
 	}
 	access, err := b.signJWT(claims)
 	if err != nil {
@@ -1712,6 +1861,7 @@ func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime
 		"client_id":          clientID,
 		"scope":              scope,
 		"preferred_username": userID,
+		"token_use":          "access",
 	}
 	if user != nil {
 		accessClaims["email"] = user.Email
@@ -1845,6 +1995,11 @@ func (b *Broker) handleUserInfo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid token", http.StatusUnauthorized)
 		return
 	}
+	if tokenUse, _ := claims["token_use"].(string); tokenUse != "access" {
+		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="userinfo requires an access token"`)
+		http.Error(w, "invalid token", http.StatusUnauthorized)
+		return
+	}
 	sub, _ := claims["sub"].(string)
 	clientID, _ := claims["client_id"].(string)
 	if clientID == "" {
@@ -1907,6 +2062,7 @@ func (b *Broker) handleTOTPEnroll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not authenticated", http.StatusUnauthorized)
 		return
 	}
+	b.maybeExtendSession(w, r)
 	secretBytes := make([]byte, 20)
 	if _, err := rand.Read(secretBytes); err != nil {
 		http.Error(w, "random error", http.StatusInternalServerError)
@@ -1917,8 +2073,12 @@ func (b *Broker) handleTOTPEnroll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
-	label := url.QueryEscape(b.cfg.Issuer + ":" + sess.UserID)
-	issuer := url.QueryEscape(b.cfg.Issuer)
+	issuerName := strings.TrimSpace(b.cfg.DisplayName)
+	if issuerName == "" {
+		issuerName = "Authbroker"
+	}
+	label := url.QueryEscape(issuerName + ":" + sess.UserID)
+	issuer := url.QueryEscape(issuerName)
 	otpauth := fmt.Sprintf("otpauth://totp/%s?secret=%s&issuer=%s&algorithm=SHA1&digits=6&period=30", label, secret, issuer)
 	writeJSON(w, http.StatusOK, map[string]string{"secret_base32": secret, "otpauth_uri": otpauth})
 }
@@ -1929,13 +2089,16 @@ func (b *Broker) handleWebAuthnRegisterBegin(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "not authenticated", http.StatusUnauthorized)
 		return
 	}
+	b.maybeExtendSession(w, r)
 	user, _ := b.store.GetUser(sess.UserID)
 	if user == nil {
 		user = &StoredUser{Username: sess.UserID}
 	}
 	challenge := randomB64(32)
 	b.mu.Lock()
-	b.webauthnReg[sess.UserID] = ChallengeRecord{UserID: sess.UserID, Challenge: challenge, ExpiresAt: time.Now().Add(5 * time.Minute)}
+	// Key by challenge (not user ID) so parallel registration attempts from
+	// the same account don't overwrite one another's challenge state.
+	b.webauthnReg[challenge] = ChallengeRecord{UserID: sess.UserID, Challenge: challenge, ExpiresAt: time.Now().Add(5 * time.Minute)}
 	b.mu.Unlock()
 
 	creds := make([]map[string]string, 0, len(user.WebAuthnCredentials))
@@ -1971,22 +2134,35 @@ func (b *Broker) handleWebAuthnRegisterFinish(w http.ResponseWriter, r *http.Req
 		http.Error(w, "not authenticated", http.StatusUnauthorized)
 		return
 	}
-	b.mu.Lock()
-	ch, ok := b.webauthnReg[sess.UserID]
-	if ok {
-		delete(b.webauthnReg, sess.UserID)
-	}
-	b.mu.Unlock()
-	if !ok || time.Now().After(ch.ExpiresAt) {
-		http.Error(w, "registration challenge expired", http.StatusBadRequest)
-		return
-	}
-
+	b.maybeExtendSession(w, r)
 	var req webauthnAttestationResponse
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
+	clientDataBytes, err := decodeB64URL(req.Response.ClientDataJSON)
+	if err != nil {
+		http.Error(w, "bad clientDataJSON", http.StatusBadRequest)
+		return
+	}
+	var cd webauthnClientData
+	if err := json.Unmarshal(clientDataBytes, &cd); err != nil {
+		http.Error(w, "bad client data", http.StatusBadRequest)
+		return
+	}
+	challenge := normalizeChallenge(cd.Challenge)
+
+	b.mu.Lock()
+	ch, ok := b.webauthnReg[challenge]
+	if ok {
+		delete(b.webauthnReg, challenge)
+	}
+	b.mu.Unlock()
+	if !ok || time.Now().After(ch.ExpiresAt) || ch.UserID != sess.UserID {
+		http.Error(w, "registration challenge expired", http.StatusBadRequest)
+		return
+	}
+
 	cred, err := b.verifyWebAuthnAttestation(req, ch.Challenge)
 	if err != nil {
 		http.Error(w, "invalid attestation: "+err.Error(), http.StatusBadRequest)
@@ -2009,17 +2185,24 @@ func (b *Broker) handleWebAuthnLoginBegin(w http.ResponseWriter, r *http.Request
 		http.Error(w, "username is required", http.StatusBadRequest)
 		return
 	}
-	user, ok := b.store.GetUser(req.Username)
-	if !ok || len(user.WebAuthnCredentials) == 0 {
-		http.Error(w, "no passkey credentials registered", http.StatusNotFound)
-		return
+	// Always return a valid challenge with an allowCredentials list, even
+	// when the user does not exist or has no passkeys enrolled. This keeps
+	// /webauthn/login/begin from leaking whether an account is registered.
+	// The browser handles an empty allowCredentials by surfacing the
+	// standard "no credential" dialog; /webauthn/login/finish rejects the
+	// flow when the challenge is bound to no user.
+	var creds []WebAuthnCredential
+	userID := ""
+	if user, ok := b.store.GetUser(req.Username); ok {
+		creds = user.WebAuthnCredentials
+		userID = user.Username
 	}
 	challenge := randomB64(32)
 	b.mu.Lock()
-	b.webauthnLog[challenge] = ChallengeRecord{UserID: user.Username, Challenge: challenge, ExpiresAt: time.Now().Add(5 * time.Minute)}
+	b.webauthnLog[challenge] = ChallengeRecord{UserID: userID, Challenge: challenge, ExpiresAt: time.Now().Add(5 * time.Minute)}
 	b.mu.Unlock()
-	allow := make([]map[string]string, 0, len(user.WebAuthnCredentials))
-	for _, c := range user.WebAuthnCredentials {
+	allow := make([]map[string]string, 0, len(creds))
+	for _, c := range creds {
 		allow = append(allow, map[string]string{"type": "public-key", "id": c.IDBase64URL})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -2057,7 +2240,7 @@ func (b *Broker) handleWebAuthnLoginFinish(w http.ResponseWriter, r *http.Reques
 		delete(b.webauthnLog, challenge)
 	}
 	b.mu.Unlock()
-	if !ok || time.Now().After(ch.ExpiresAt) {
+	if !ok || time.Now().After(ch.ExpiresAt) || ch.UserID == "" {
 		http.Error(w, "login challenge expired", http.StatusBadRequest)
 		return
 	}
@@ -2516,6 +2699,10 @@ func (b *Broker) verifyJWT(token string) (map[string]any, error) {
 	if err := json.Unmarshal(headerBytes, &header); err != nil {
 		return nil, err
 	}
+	// TODO: support multi-key JWKS rotation. Today the broker advertises a
+	// single key at /oauth2/jwks and rejects any token whose kid does not
+	// match cfg.KeyID. To rotate, this check must look up the signing key
+	// by kid against a key set, not a single active key.
 	if header["alg"] != "RS256" || header["kid"] != b.cfg.KeyID {
 		return nil, fmt.Errorf("bad header")
 	}
@@ -2624,7 +2811,7 @@ func clientAllowsPostLogoutRedirect(c Client, redirectURI string) bool {
 	return false
 }
 
-func redirectOAuthError(w http.ResponseWriter, redirectURI, state, code, desc string) {
+func redirectOAuthError(w http.ResponseWriter, r *http.Request, redirectURI, state, code, desc string) {
 	u, err := url.Parse(redirectURI)
 	if err != nil {
 		http.Error(w, code, http.StatusBadRequest)
@@ -2639,7 +2826,7 @@ func redirectOAuthError(w http.ResponseWriter, redirectURI, state, code, desc st
 		q.Set("state", state)
 	}
 	u.RawQuery = q.Encode()
-	http.Redirect(w, &http.Request{}, u.String(), http.StatusFound) //nolint:gosec // redirect URI was validated against the registered client redirect_uris.
+	http.Redirect(w, r, u.String(), http.StatusFound) //nolint:gosec // redirect URI was validated against the registered client redirect_uris.
 }
 
 func tokenError(w http.ResponseWriter, code, desc string) {
@@ -2918,6 +3105,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("new broker: %v", err)
 	}
+	broker.startBackgroundSweeper(time.Minute)
 	dumpRoutes(broker)
 	srv := &http.Server{
 		Addr:              broker.cfg.Listen,
