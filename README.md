@@ -29,6 +29,12 @@ Open the OIDC discovery document:
 curl http://localhost:8080/.well-known/openid-configuration
 ```
 
+Open the broker's own login/logout page:
+
+```text
+http://localhost:8080/
+```
+
 JWKS:
 
 ```bash
@@ -55,7 +61,7 @@ johndoe / dogood
 serviceuser / mysecret
 ```
 
-The compose broker config lives in `compose/authbroker.config.json`. The test UI uses `http://localhost:8080` for browser redirects and `http://authbroker:8080` for server-side token and UserInfo calls inside the Docker network, then displays the LDAP-backed profile and client-mapped groups. Sign out uses the broker's OIDC `end_session_endpoint`, so it clears both the demo app session and the central authbroker SSO session.
+The authbroker page at <http://localhost:8080/> can also sign in or sign out of the central authbroker session directly. The compose broker config lives in `compose/authbroker.config.json`. The test UI uses `http://localhost:8080` for browser redirects and `http://authbroker:8080` for server-side token and UserInfo calls inside the Docker network, then displays the LDAP-backed profile and client-mapped groups. Sign out uses the broker's OIDC `end_session_endpoint`, so it clears both the demo app session and the central authbroker SSO session.
 In the GLAUTH fixture, `johndoe` also has a Demo OU-style group membership, `CN=demo_reports,OU=Demo,DC=glauth,DC=com`, which the compose client maps to `demo_reports`.
 
 ## Generate a persistent signing key

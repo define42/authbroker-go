@@ -408,6 +408,81 @@ func TestBrokerLogoutRejectsUnregisteredRedirect(t *testing.T) {
 	}
 }
 
+func TestBrokerStandaloneLoginAndLogoutPages(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	broker.authn = staticAuthenticator{profile: UserProfile{
+		Subject: "johndoe",
+		Email:   "johndoe@example.com",
+		Name:    "John Doe",
+	}}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rr := httptest.NewRecorder()
+	broker.routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected home status 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "You are not signed in") {
+		t.Fatalf("home page did not show signed-out state: %s", rr.Body.String())
+	}
+
+	form := url.Values{
+		"username": {"johndoe"},
+		"password": {"dogood"},
+	}
+	loginReq := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
+	loginReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginRR := httptest.NewRecorder()
+	broker.routes().ServeHTTP(loginRR, loginReq)
+	if loginRR.Code != http.StatusFound {
+		t.Fatalf("expected login status 302, got %d: %s", loginRR.Code, loginRR.Body.String())
+	}
+	if location := loginRR.Header().Get("Location"); location != "/" {
+		t.Fatalf("login Location = %q, want /", location)
+	}
+	sessionCookie := findCookie(loginRR, sessionCookieName)
+	if sessionCookie == nil || sessionCookie.Value == "" {
+		t.Fatalf("login response did not set %s cookie; cookies=%#v", sessionCookieName, loginRR.Result().Cookies())
+	}
+
+	homeReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	homeReq.AddCookie(sessionCookie)
+	homeRR := httptest.NewRecorder()
+	broker.routes().ServeHTTP(homeRR, homeReq)
+	if homeRR.Code != http.StatusOK {
+		t.Fatalf("expected signed-in home status 200, got %d: %s", homeRR.Code, homeRR.Body.String())
+	}
+	if !strings.Contains(homeRR.Body.String(), "Signed in as <strong>johndoe</strong>") {
+		t.Fatalf("home page did not show signed-in state: %s", homeRR.Body.String())
+	}
+
+	logoutPageReq := httptest.NewRequest(http.MethodGet, "/logout", nil)
+	logoutPageReq.AddCookie(sessionCookie)
+	logoutPageRR := httptest.NewRecorder()
+	broker.routes().ServeHTTP(logoutPageRR, logoutPageReq)
+	if logoutPageRR.Code != http.StatusOK {
+		t.Fatalf("expected logout page status 200, got %d: %s", logoutPageRR.Code, logoutPageRR.Body.String())
+	}
+	if !strings.Contains(logoutPageRR.Body.String(), "Sign out of authbroker") {
+		t.Fatalf("logout page did not render confirmation: %s", logoutPageRR.Body.String())
+	}
+
+	logoutReq := httptest.NewRequest(http.MethodPost, "/logout", nil)
+	logoutReq.AddCookie(sessionCookie)
+	logoutRR := httptest.NewRecorder()
+	broker.routes().ServeHTTP(logoutRR, logoutReq)
+	if logoutRR.Code != http.StatusFound {
+		t.Fatalf("expected logout status 302, got %d: %s", logoutRR.Code, logoutRR.Body.String())
+	}
+	assertDeletedCookie(t, logoutRR, sessionCookieName)
+	broker.mu.Lock()
+	_, stillActive := broker.sessions[sessionCookie.Value]
+	broker.mu.Unlock()
+	if stillActive {
+		t.Fatalf("standalone logout did not remove broker session")
+	}
+}
+
 func TestLDAPBrokerOAuthIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Docker-backed LDAP integration test in short mode")
@@ -711,6 +786,18 @@ func newLogoutTestBroker(t *testing.T) *Broker {
 	return broker
 }
 
+type staticAuthenticator struct {
+	profile UserProfile
+	err     error
+}
+
+func (a staticAuthenticator) Authenticate(context.Context, string, string) (UserProfile, error) {
+	if a.err != nil {
+		return UserProfile{}, a.err
+	}
+	return a.profile, nil
+}
+
 func startTestBroker(ctx context.Context, t *testing.T, ldapCfg LDAPConfig) (string, *Broker, *http.Client, func()) {
 	t.Helper()
 
@@ -842,6 +929,15 @@ func assertDeletedCookie(t *testing.T, rr *httptest.ResponseRecorder, name strin
 		}
 	}
 	t.Fatalf("response did not delete cookie %q; cookies=%#v", name, rr.Result().Cookies())
+}
+
+func findCookie(rr *httptest.ResponseRecorder, name string) *http.Cookie {
+	for _, cookie := range rr.Result().Cookies() {
+		if cookie.Name == name {
+			return cookie
+		}
+	}
+	return nil
 }
 
 func stringSliceClaim(value any) []string {

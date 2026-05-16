@@ -1002,12 +1002,15 @@ func normalizeConfig(cfg *Config) {
 
 func (b *Broker) routes() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", b.handleHome)
 	mux.HandleFunc("GET /healthz", b.handleHealth)
 	mux.HandleFunc("GET /.well-known/openid-configuration", b.handleDiscovery)
 	mux.HandleFunc("GET /oauth2/jwks", b.handleJWKS)
 	mux.HandleFunc("GET /oauth2/authorize", b.handleAuthorize)
 	mux.HandleFunc("GET /login", b.handleLoginGet)
 	mux.HandleFunc("POST /login", b.handleLoginPost)
+	mux.HandleFunc("GET /logout", b.handleLocalLogoutGet)
+	mux.HandleFunc("POST /logout", b.handleLocalLogoutPost)
 	mux.HandleFunc("POST /oauth2/token", b.handleToken)
 	mux.HandleFunc("GET /oauth2/userinfo", b.handleUserInfo)
 	mux.HandleFunc("POST /oauth2/revoke", b.handleRevoke)
@@ -1058,6 +1061,23 @@ func (b *Broker) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 
 func (b *Broker) handleJWKS(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"keys": []any{b.publicJWK}})
+}
+
+func (b *Broker) handleHome(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	data := map[string]any{
+		"Issuer": b.cfg.Issuer,
+	}
+	if sess, ok := b.validSession(r); ok {
+		data["Authenticated"] = true
+		data["UserID"] = sess.UserID
+		data["ExpiresAt"] = sess.ExpiresAt.Format(time.RFC1123)
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = brokerHomeTemplate.Execute(w, data)
 }
 
 func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
@@ -1118,17 +1138,21 @@ func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 
 func (b *Broker) handleLoginGet(w http.ResponseWriter, r *http.Request) {
 	rid := r.URL.Query().Get("request_id")
-	b.mu.Lock()
-	ar, ok := b.authRequests[rid]
-	b.mu.Unlock()
-	if !ok || time.Now().After(ar.ExpiresAt) {
-		http.Error(w, "login request expired", http.StatusBadRequest)
-		return
+	clientID := "authbroker"
+	if rid != "" {
+		b.mu.Lock()
+		ar, ok := b.authRequests[rid]
+		b.mu.Unlock()
+		if !ok || time.Now().After(ar.ExpiresAt) {
+			http.Error(w, "login request expired", http.StatusBadRequest)
+			return
+		}
+		clientID = ar.ClientID
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = loginTemplate.Execute(w, map[string]any{
 		"RequestID": rid,
-		"ClientID":  ar.ClientID,
+		"ClientID":  clientID,
 		"TOTPHint":  b.cfg.MFA.TOTPRequired,
 	})
 }
@@ -1139,22 +1163,29 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rid := r.Form.Get("request_id")
-	b.mu.Lock()
-	ar, ok := b.authRequests[rid]
-	if ok {
-		delete(b.authRequests, rid)
-	}
-	b.mu.Unlock()
-	if !ok || time.Now().After(ar.ExpiresAt) {
-		http.Error(w, "login request expired", http.StatusBadRequest)
-		return
+	oauthLogin := rid != ""
+	var ar AuthorizationRequest
+	if oauthLogin {
+		var ok bool
+		b.mu.Lock()
+		ar, ok = b.authRequests[rid]
+		if ok {
+			delete(b.authRequests, rid)
+		}
+		b.mu.Unlock()
+		if !ok || time.Now().After(ar.ExpiresAt) {
+			http.Error(w, "login request expired", http.StatusBadRequest)
+			return
+		}
 	}
 
 	username := strings.TrimSpace(r.Form.Get("username"))
 	password := r.Form.Get("password")
 	profile, err := b.authn.Authenticate(r.Context(), username, password)
 	if err != nil {
-		b.putAuthRequest(ar)
+		if oauthLogin {
+			b.putAuthRequest(ar)
+		}
 		http.Error(w, "invalid username or password", http.StatusUnauthorized)
 		return
 	}
@@ -1167,19 +1198,44 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	if b.needsTOTP(user) {
 		otp := strings.TrimSpace(r.Form.Get("otp"))
 		if user.TOTPSecretBase32 == "" {
-			b.putAuthRequest(ar)
+			if oauthLogin {
+				b.putAuthRequest(ar)
+			}
 			http.Error(w, "TOTP is required but the user is not enrolled", http.StatusUnauthorized)
 			return
 		}
 		if !verifyTOTP(user.TOTPSecretBase32, otp, time.Now(), 1) {
-			b.putAuthRequest(ar)
+			if oauthLogin {
+				b.putAuthRequest(ar)
+			}
 			http.Error(w, "invalid TOTP code", http.StatusUnauthorized)
 			return
 		}
 	}
 
 	sess := b.createSession(w, user.Username)
-	b.issueCodeRedirect(w, ar, sess)
+	if oauthLogin {
+		b.issueCodeRedirect(w, ar, sess)
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+func (b *Broker) handleLocalLogoutGet(w http.ResponseWriter, r *http.Request) {
+	sess, ok := b.validSession(r)
+	if !ok {
+		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = brokerLogoutTemplate.Execute(w, map[string]any{
+		"UserID": sess.UserID,
+	})
+}
+
+func (b *Broker) handleLocalLogoutPost(w http.ResponseWriter, r *http.Request) {
+	b.clearSession(w, r)
+	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 func (b *Broker) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -2418,6 +2474,38 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
+
+var brokerHomeTemplate = template.Must(template.New("broker-home").Parse(`<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Authbroker</title></head>
+<body style="font-family: sans-serif; max-width: 42rem; margin: 3rem auto; line-height: 1.45;">
+  <h1>Authbroker</h1>
+  <p style="color:#555">Issuer: <code>{{.Issuer}}</code></p>
+  {{if .Authenticated}}
+    <p>Signed in as <strong>{{.UserID}}</strong>.</p>
+    <p style="color:#555">Session expires: {{.ExpiresAt}}</p>
+    <form method="get" action="/logout">
+      <button type="submit">Sign out</button>
+    </form>
+  {{else}}
+    <p>You are not signed in to authbroker.</p>
+    <p><a href="/login">Sign in</a></p>
+  {{end}}
+</body>
+</html>`))
+
+var brokerLogoutTemplate = template.Must(template.New("broker-logout").Parse(`<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Logout</title></head>
+<body style="font-family: sans-serif; max-width: 36rem; margin: 3rem auto; line-height: 1.45;">
+  <h1>Logout</h1>
+  <p>Signed in as <strong>{{.UserID}}</strong>.</p>
+  <form method="post" action="/logout">
+    <button type="submit">Sign out of authbroker</button>
+    <a href="/" style="margin-left:1rem">Cancel</a>
+  </form>
+</body>
+</html>`))
 
 var loginTemplate = template.Must(template.New("login").Parse(`<!doctype html>
 <html>
