@@ -123,6 +123,33 @@ func TestLDAPGroupNames(t *testing.T) {
 	}
 }
 
+func TestLDAPNestedADGroupFilter(t *testing.T) {
+	authn := &LDAPAuthenticator{cfg: LDAPConfig{
+		GroupSearchFilter: "objectClass=group",
+	}}
+	got := authn.nestedADGroupFilter(`CN=Jane *(Ops),OU=Users,DC=example,DC=com`)
+	want := `(&(objectClass=group)(member:1.2.840.113556.1.4.1941:=CN=Jane \2a\28Ops\29,OU=Users,DC=example,DC=com))`
+	if got != want {
+		t.Fatalf("nestedADGroupFilter() = %q, want %q", got, want)
+	}
+}
+
+func TestMergeStrings(t *testing.T) {
+	got := mergeStrings(
+		[]string{"direct-b", "direct-a"},
+		[]string{"nested-a", "direct-a", ""},
+	)
+	want := []string{"direct-a", "direct-b", "nested-a"}
+	if len(got) != len(want) {
+		t.Fatalf("mergeStrings() = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("mergeStrings() = %#v, want %#v", got, want)
+		}
+	}
+}
+
 func TestLDAPBrokerOAuthIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Docker-backed LDAP integration test in short mode")

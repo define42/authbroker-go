@@ -117,6 +117,10 @@ For Active Directory UPN bind:
   "email_attribute": "mail",
   "name_attribute": "displayName",
   "groups_attribute": "memberOf",
+  "nested_groups": true,
+  "group_search_base_dn": "dc=example,dc=com",
+  "group_search_filter": "(objectClass=group)",
+  "group_name_attribute": "cn",
   "timeout_seconds": 5
 }
 ```
@@ -128,6 +132,12 @@ The broker will bind as:
 ```
 
 It then searches below `base_dn`, escapes the `{login}` value, and copies the configured LDAP attributes into OIDC `email`, `name`, and `groups` claims.
+
+Group support:
+
+- Direct LDAP groups from `groups_attribute`: yes
+- Nested AD groups: yes, when `nested_groups` is `true`
+- Nested OpenLDAP groups: no
 
 For OpenLDAP DN-template bind:
 
@@ -144,7 +154,7 @@ For OpenLDAP DN-template bind:
 }
 ```
 
-Profile lookup is optional. If `base_dn` and `user_filter` are omitted, the broker only performs the bind and falls back to the submitted username plus `domain_suffix` for profile claims. Use `"start_tls": true` only with `ldap://` URLs; `ldaps://` starts TLS during dial. This starter does not implement group sync, nested AD group resolution, or Kerberos/SPNEGO. Add those as separate federation modules.
+Profile lookup is optional. If `base_dn` and `user_filter` are omitted, the broker only performs the bind and falls back to the submitted username plus `domain_suffix` for profile claims. Use `"start_tls": true` only with `ldap://` URLs; `ldaps://` starts TLS during dial. Nested AD lookup searches groups with the recursive matching rule `member:1.2.840.113556.1.4.1941:=<userDN>` and merges those results with direct groups. This starter does not implement group sync, nested OpenLDAP group resolution, or Kerberos/SPNEGO. Add those as separate federation modules.
 
 ## TOTP MFA
 

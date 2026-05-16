@@ -74,6 +74,10 @@ type LDAPConfig struct {
 	EmailAttribute     string `json:"email_attribute,omitempty"`
 	NameAttribute      string `json:"name_attribute,omitempty"`
 	GroupsAttribute    string `json:"groups_attribute,omitempty"`
+	NestedGroups       bool   `json:"nested_groups,omitempty"`
+	GroupSearchBaseDN  string `json:"group_search_base_dn,omitempty"`
+	GroupSearchFilter  string `json:"group_search_filter,omitempty"`
+	GroupNameAttribute string `json:"group_name_attribute,omitempty"`
 	StartTLS           bool   `json:"start_tls,omitempty"`
 	InsecureSkipVerify bool   `json:"insecure_skip_verify,omitempty"`
 	TimeoutSeconds     int    `json:"timeout_seconds"`
@@ -366,7 +370,60 @@ func (a *LDAPAuthenticator) searchProfile(conn *ldap.Conn, username, bindName st
 	if groupsAttr != "" {
 		profile.Groups = ldapGroupNames(entry.GetAttributeValues(groupsAttr))
 	}
+	if a.cfg.NestedGroups {
+		nestedGroups, err := a.searchNestedADGroups(conn, entry.DN)
+		if err != nil {
+			return UserProfile{}, err
+		}
+		profile.Groups = mergeStrings(profile.Groups, nestedGroups)
+	}
 	return profile, nil
+}
+
+func (a *LDAPAuthenticator) searchNestedADGroups(conn *ldap.Conn, userDN string) ([]string, error) {
+	userDN = strings.TrimSpace(userDN)
+	if userDN == "" {
+		return nil, fmt.Errorf("ldap nested group search requires a user DN")
+	}
+	baseDN := strings.TrimSpace(a.cfg.GroupSearchBaseDN)
+	if baseDN == "" {
+		baseDN = a.cfg.BaseDN
+	}
+	nameAttr := ldapAttribute(a.cfg.GroupNameAttribute, "cn")
+	searchReq := ldap.NewSearchRequest(
+		baseDN,
+		ldap.ScopeWholeSubtree,
+		ldap.NeverDerefAliases,
+		0,
+		a.cfg.TimeoutSeconds,
+		false,
+		a.nestedADGroupFilter(userDN),
+		uniqueNonEmpty(nameAttr),
+		nil,
+	)
+	result, err := conn.Search(searchReq)
+	if err != nil {
+		return nil, fmt.Errorf("ldap nested group search failed: %w", err)
+	}
+
+	groups := make([]string, 0, len(result.Entries))
+	for _, entry := range result.Entries {
+		group := strings.TrimSpace(entry.GetAttributeValue(nameAttr))
+		if group == "" {
+			group = ldapGroupName(entry.DN)
+		}
+		groups = append(groups, group)
+	}
+	return ldapGroupNames(groups), nil
+}
+
+func (a *LDAPAuthenticator) nestedADGroupFilter(userDN string) string {
+	groupFilter := strings.TrimSpace(a.cfg.GroupSearchFilter)
+	if groupFilter == "" {
+		groupFilter = "(objectClass=group)"
+	}
+	memberFilter := "(member:1.2.840.113556.1.4.1941:=" + ldap.EscapeFilter(userDN) + ")"
+	return ldapAndFilter(groupFilter, memberFilter)
 }
 
 func (a *LDAPAuthenticator) userFilter(username, bindName string) string {
@@ -439,6 +496,44 @@ func ldapGroupName(value string) string {
 		}
 	}
 	return value
+}
+
+func ldapAndFilter(filters ...string) string {
+	parts := make([]string, 0, len(filters))
+	for _, filter := range filters {
+		filter = strings.TrimSpace(filter)
+		if filter == "" {
+			continue
+		}
+		if !strings.HasPrefix(filter, "(") {
+			filter = "(" + filter + ")"
+		}
+		parts = append(parts, filter)
+	}
+	if len(parts) == 0 {
+		return "(objectClass=*)"
+	}
+	if len(parts) == 1 {
+		return parts[0]
+	}
+	return "(&" + strings.Join(parts, "") + ")"
+}
+
+func mergeStrings(values ...[]string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, slice := range values {
+		for _, value := range slice {
+			value = strings.TrimSpace(value)
+			if value == "" || seen[value] {
+				continue
+			}
+			seen[value] = true
+			out = append(out, value)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func escapeLDAPDN(s string) string {

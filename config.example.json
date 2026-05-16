@@ -18,6 +18,10 @@
     "email_attribute": "mail",
     "name_attribute": "displayName",
     "groups_attribute": "memberOf",
+    "nested_groups": true,
+    "group_search_base_dn": "dc=example,dc=com",
+    "group_search_filter": "(objectClass=group)",
+    "group_name_attribute": "cn",
     "start_tls": false,
     "insecure_skip_verify": false,
     "timeout_seconds": 5
