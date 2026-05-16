@@ -347,22 +347,23 @@ await fetch('/webauthn/login/finish', {
 
 ## Production hardening checklist
 
-Before production, add at least:
+Before production, the remaining hardening work is:
 
 - TLS-only deployment behind a trusted ingress/proxy
-- persistent database for sessions, authorization codes, refresh tokens, users, MFA and WebAuthn credentials
-- encrypted secret storage for signing keys and LDAP bind secrets
+- durable transactional storage for sessions, authorization codes, refresh tokens, revoked token IDs, users, MFA secrets, and WebAuthn credentials; the current broker uses in-memory runtime maps plus a single JSON user store
+- encrypted secret storage for signing keys, TLS trust material, and deployment secrets
 - key rotation and multiple JWKS keys
-- consent screens and client administration
+- consent screens, client administration, and app-token profile administration
+- app-token issuance audit, revocation strategy, per-app TTL review, and policy for who may generate each token profile
 - rate limiting and brute-force protection
-- audit logs
-- CSRF protection for browser form endpoints
+- audit logs for login, logout, token issuance, MFA, WebAuthn, and admin/config changes
+- CSRF protection for browser form endpoints, especially logout and app-token generation
 - stricter Content-Security-Policy
-- LDAP group mapping and nested AD group support
+- directory-specific group policy validation; LDAP group mapping and nested AD groups are implemented, but nested OpenLDAP group resolution and group lifecycle sync are not
 - OpenID Foundation conformance testing
 - WebAuthn conformance testing and broader attestation support
 - refresh-token reuse detection
-- back-channel logout/front-channel logout if required
+- OIDC front-channel/back-channel logout session notifications to relying parties if required; RP-initiated logout is implemented
 
 ## Important limitations
 
