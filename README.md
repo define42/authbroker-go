@@ -48,6 +48,7 @@ The compose stack starts:
 - `glauth` as the LDAPS server, using the users in `testldap/default-config.cfg`
 - `authbroker` on <http://localhost:8080>
 - `test-web-ui` on <http://localhost:8090>
+- `passkey-demo` on <http://localhost:8091>
 
 ```bash
 docker compose up --build
@@ -63,6 +64,8 @@ serviceuser / mysecret
 
 The authbroker page at <http://localhost:8080/> can also sign in or sign out of the central authbroker session directly. The compose broker config lives in `compose/authbroker.config.json`. The test UI uses `http://localhost:8080` for browser redirects and `http://authbroker:8080` for server-side token and UserInfo calls inside the Docker network, then displays the LDAP-backed profile and client-mapped groups. Sign out uses the broker's OIDC `end_session_endpoint`, so it clears both the demo app session and the central authbroker SSO session.
 In the GLAUTH fixture, `johndoe` also has a Demo OU-style group membership, `CN=demo_reports,OU=Demo,DC=glauth,DC=com`, which the compose client maps to `demo_reports`.
+
+Open <http://localhost:8091> for the passkey demo. Sign in with LDAP first, register a passkey for that account, sign out of the demo broker session, then use "Sign in with passkey". The passkey demo proxies `/webauthn/*` to authbroker so the browser sees a single WebAuthn origin, `http://localhost:8091`; that origin is listed in the compose `webauthn.origins`.
 
 ## Generate a persistent signing key
 
@@ -213,6 +216,8 @@ curl -X POST -b cookies.txt -c cookies.txt http://localhost:8080/mfa/totp/enroll
 The response contains an `otpauth_uri` that can be added to an authenticator app. Once a user has a TOTP secret, the login form requires a code.
 
 ## WebAuthn/passkeys
+
+The Docker Compose passkey demo at <http://localhost:8091> is the easiest way to exercise this flow. WebAuthn is origin-bound, so any app hosting the browser ceremony must be included in `webauthn.origins`, and the configured `rp_id` must be registrable for that origin.
 
 The server exposes JSON endpoints:
 

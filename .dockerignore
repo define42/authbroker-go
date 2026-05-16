@@ -8,3 +8,4 @@ coverage.*
 *.coverprofile
 *.test
 test-web-ui
+passkey-demo

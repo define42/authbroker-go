@@ -52,3 +52,23 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+  passkey-demo:
+    build:
+      context: ./passkey-demo
+      dockerfile: Dockerfile
+    environment:
+      PASSKEY_DEMO_LISTEN: ":8091"
+      PUBLIC_BASE_URL: "http://localhost:8091"
+      AUTHBROKER_PUBLIC_URL: "http://localhost:8080"
+      AUTHBROKER_INTERNAL_URL: "http://authbroker:8080"
+    depends_on:
+      authbroker:
+        condition: service_healthy
+    ports:
+      - "8091:8091"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8091/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20

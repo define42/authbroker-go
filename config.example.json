@@ -34,7 +34,7 @@
   "webauthn": {
     "rp_id": "localhost",
     "rp_display_name": "Go Auth Broker",
-    "origins": ["http://localhost:8080"]
+    "origins": ["http://localhost:8080", "http://localhost:8091"]
   },
 
   "clients": [
