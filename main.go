@@ -36,6 +36,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	ldap "github.com/go-ldap/ldap/v3"
@@ -162,6 +163,8 @@ type PersistentData struct {
 	AuthCodes     map[string]AuthCode             `json:"authorization_codes,omitempty"`
 	RefreshTokens map[string]RefreshToken         `json:"refresh_tokens,omitempty"`
 	RevokedJTIs   map[string]time.Time            `json:"revoked_jtis,omitempty"`
+	WebAuthnReg   map[string]ChallengeRecord      `json:"webauthn_registration_challenges,omitempty"`
+	WebAuthnLog   map[string]ChallengeRecord      `json:"webauthn_login_challenges,omitempty"`
 }
 
 type Store struct {
@@ -176,6 +179,8 @@ type StoredRuntimeState struct {
 	AuthCodes     map[string]AuthCode
 	RefreshTokens map[string]RefreshToken
 	RevokedJTIs   map[string]time.Time
+	WebAuthnReg   map[string]ChallengeRecord
+	WebAuthnLog   map[string]ChallengeRecord
 }
 
 func NewStore(path string) (*Store, error) {
@@ -183,20 +188,9 @@ func NewStore(path string) (*Store, error) {
 	if path == "" {
 		return s, nil
 	}
-	b, err := os.ReadFile(path) //nolint:gosec // data path is supplied by the local operator.
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return s, nil
-		}
+	if err := s.withLockedData(nil); err != nil {
 		return nil, err
 	}
-	if len(bytes.TrimSpace(b)) == 0 {
-		return s, nil
-	}
-	if err := json.Unmarshal(b, &s.data); err != nil {
-		return nil, err
-	}
-	s.ensureMaps()
 	return s, nil
 }
 
@@ -208,6 +202,8 @@ func newPersistentData() PersistentData {
 		AuthCodes:     map[string]AuthCode{},
 		RefreshTokens: map[string]RefreshToken{},
 		RevokedJTIs:   map[string]time.Time{},
+		WebAuthnReg:   map[string]ChallengeRecord{},
+		WebAuthnLog:   map[string]ChallengeRecord{},
 	}
 }
 
@@ -230,12 +226,12 @@ func (s *Store) ensureMaps() {
 	if s.data.RevokedJTIs == nil {
 		s.data.RevokedJTIs = map[string]time.Time{}
 	}
-}
-
-func (s *Store) Save() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.saveLocked()
+	if s.data.WebAuthnReg == nil {
+		s.data.WebAuthnReg = map[string]ChallengeRecord{}
+	}
+	if s.data.WebAuthnLog == nil {
+		s.data.WebAuthnLog = map[string]ChallengeRecord{}
+	}
 }
 
 func (s *Store) saveLocked() error {
@@ -246,113 +242,271 @@ func (s *Store) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+	return writeFileAtomic(s.path, b, 0o600)
+}
+
+func (s *Store) loadLocked() error {
+	if s.path == "" {
+		return nil
+	}
+	data := newPersistentData()
+	b, err := os.ReadFile(s.path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			s.data = data
+			return nil
+		}
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	if len(bytes.TrimSpace(b)) == 0 {
+		s.data = data
+		return nil
+	}
+	if err := json.Unmarshal(b, &data); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	s.data = data
+	s.ensureMaps()
+	return nil
+}
+
+func (s *Store) withLockedData(fn func() (bool, error)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.path == "" {
+		if fn == nil {
+			return nil
+		}
+		changed, err := fn()
+		if err != nil || !changed {
+			return err
+		}
+		return s.saveLocked()
+	}
+	return withExclusiveFileLock(s.path+".lock", func() error {
+		if err := s.loadLocked(); err != nil {
+			return err
+		}
+		if fn == nil {
+			return nil
+		}
+		changed, err := fn()
+		if err != nil || !changed {
+			return err
+		}
+		return s.saveLocked()
+	})
+}
+
+func withExclusiveFileLock(lockPath string, fn func() error) error {
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+		return err
+	}
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // lock path is derived from operator-supplied data directory.
+	if err != nil {
+		return err
+	}
+	defer lockFile.Close()
+	for {
+		err = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EINTR) {
+			return err
+		}
+	}
+	defer func() {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	}()
+	return fn()
+}
+
+func writeFileAtomic(path string, content []byte, perm os.FileMode) (err error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		if err != nil {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(content); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	return syncDir(dir)
+}
+
+func syncDir(dir string) error {
+	dirFile, err := os.Open(dir) //nolint:gosec // directory path is derived from operator-supplied data directory.
+	if err != nil {
+		return err
+	}
+	defer dirFile.Close()
+	return dirFile.Sync()
 }
 
 func (s *Store) UpsertProfile(p UserProfile) (*StoredUser, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	u := s.data.Users[p.Subject]
-	if u == nil {
-		u = &StoredUser{Username: p.Subject}
-		s.data.Users[p.Subject] = u
-	}
-	if p.Email != "" {
-		u.Email = p.Email
-	}
-	if p.Name != "" {
-		u.Name = p.Name
-	}
-	if p.Groups != nil {
-		u.Groups = append([]string(nil), p.Groups...)
-	}
-	out := cloneStoredUser(u)
-	return out, s.saveLocked()
+	var out *StoredUser
+	err := s.withLockedData(func() (bool, error) {
+		u := s.data.Users[p.Subject]
+		if u == nil {
+			u = &StoredUser{Username: p.Subject}
+			s.data.Users[p.Subject] = u
+		}
+		if p.Email != "" {
+			u.Email = p.Email
+		}
+		if p.Name != "" {
+			u.Name = p.Name
+		}
+		if p.Groups != nil {
+			u.Groups = append([]string(nil), p.Groups...)
+		}
+		out = cloneStoredUser(u)
+		return true, nil
+	})
+	return out, err
 }
 
 func (s *Store) GetUser(username string) (*StoredUser, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	u, ok := s.data.Users[username]
-	if !ok || u == nil {
+	var out *StoredUser
+	err := s.withLockedData(func() (bool, error) {
+		u, ok := s.data.Users[username]
+		if !ok || u == nil {
+			return false, nil
+		}
+		out = cloneStoredUser(u)
+		return false, nil
+	})
+	if err != nil || out == nil {
 		return nil, false
 	}
-	return cloneStoredUser(u), true
+	return out, true
 }
 
 func (s *Store) SetTOTP(username, secret string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	u := s.data.Users[username]
-	if u == nil {
-		u = &StoredUser{Username: username}
-		s.data.Users[username] = u
-	}
-	u.TOTPSecretBase32 = secret
-	return s.saveLocked()
+	return s.withLockedData(func() (bool, error) {
+		u := s.data.Users[username]
+		if u == nil {
+			u = &StoredUser{Username: username}
+			s.data.Users[username] = u
+		}
+		u.TOTPSecretBase32 = secret
+		return true, nil
+	})
 }
 
 func (s *Store) AddWebAuthnCredential(username string, cred WebAuthnCredential) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	u := s.data.Users[username]
-	if u == nil {
-		u = &StoredUser{Username: username}
-		s.data.Users[username] = u
-	}
-	for _, existing := range u.WebAuthnCredentials {
-		if existing.IDBase64URL == cred.IDBase64URL {
-			return fmt.Errorf("credential already registered")
+	return s.withLockedData(func() (bool, error) {
+		u := s.data.Users[username]
+		if u == nil {
+			u = &StoredUser{Username: username}
+			s.data.Users[username] = u
 		}
-	}
-	u.WebAuthnCredentials = append(u.WebAuthnCredentials, cred)
-	return s.saveLocked()
+		for _, existing := range u.WebAuthnCredentials {
+			if existing.IDBase64URL == cred.IDBase64URL {
+				return false, fmt.Errorf("credential already registered")
+			}
+		}
+		u.WebAuthnCredentials = append(u.WebAuthnCredentials, cred)
+		return true, nil
+	})
 }
 
 func (s *Store) UpdateWebAuthnSignCount(username, credID string, signCount uint32) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	u := s.data.Users[username]
-	if u == nil {
-		return fmt.Errorf("user not found")
-	}
-	for i := range u.WebAuthnCredentials {
-		if u.WebAuthnCredentials[i].IDBase64URL == credID {
-			u.WebAuthnCredentials[i].SignCount = signCount
-			return s.saveLocked()
+	return s.withLockedData(func() (bool, error) {
+		u := s.data.Users[username]
+		if u == nil {
+			return false, fmt.Errorf("user not found")
 		}
-	}
-	return fmt.Errorf("credential not found")
+		for i := range u.WebAuthnCredentials {
+			if u.WebAuthnCredentials[i].IDBase64URL == credID {
+				u.WebAuthnCredentials[i].SignCount = signCount
+				return true, nil
+			}
+		}
+		return false, fmt.Errorf("credential not found")
+	})
 }
 
 func (s *Store) RuntimeState() StoredRuntimeState {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	var out StoredRuntimeState
+	if err := s.withLockedData(func() (bool, error) {
+		out = s.runtimeStateLocked()
+		return false, nil
+	}); err != nil {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		return s.runtimeStateLocked()
+	}
+	return out
+}
+
+func (s *Store) runtimeStateLocked() StoredRuntimeState {
 	return StoredRuntimeState{
 		Sessions:      cloneSessionMap(s.data.Sessions),
 		AuthRequests:  cloneAuthorizationRequestMap(s.data.AuthRequests),
 		AuthCodes:     cloneAuthCodeMap(s.data.AuthCodes),
 		RefreshTokens: cloneRefreshTokenMap(s.data.RefreshTokens),
 		RevokedJTIs:   cloneRevokedJTIMap(s.data.RevokedJTIs),
+		WebAuthnReg:   cloneChallengeRecordMap(s.data.WebAuthnReg),
+		WebAuthnLog:   cloneChallengeRecordMap(s.data.WebAuthnLog),
 	}
 }
 
 func (s *Store) ReplaceRuntimeState(state StoredRuntimeState) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.withLockedData(func() (bool, error) {
+		s.replaceRuntimeStateLocked(state)
+		return true, nil
+	})
+}
+
+func (s *Store) UpdateRuntimeState(fn func(*StoredRuntimeState) (bool, error)) (StoredRuntimeState, error) {
+	var state StoredRuntimeState
+	err := s.withLockedData(func() (bool, error) {
+		state = s.runtimeStateLocked()
+		changed, err := fn(&state)
+		if err != nil {
+			return false, err
+		}
+		if changed {
+			s.replaceRuntimeStateLocked(state)
+		}
+		return changed, nil
+	})
+	return state, err
+}
+
+func (s *Store) replaceRuntimeStateLocked(state StoredRuntimeState) {
 	s.data.Sessions = cloneSessionMap(state.Sessions)
 	s.data.AuthRequests = cloneAuthorizationRequestMap(state.AuthRequests)
 	s.data.AuthCodes = cloneAuthCodeMap(state.AuthCodes)
 	s.data.RefreshTokens = cloneRefreshTokenMap(state.RefreshTokens)
 	s.data.RevokedJTIs = cloneRevokedJTIMap(state.RevokedJTIs)
-	return s.saveLocked()
+	s.data.WebAuthnReg = cloneChallengeRecordMap(state.WebAuthnReg)
+	s.data.WebAuthnLog = cloneChallengeRecordMap(state.WebAuthnLog)
 }
 
 func cloneStoredUser(u *StoredUser) *StoredUser {
@@ -403,6 +557,14 @@ func cloneRefreshTokenMap(in map[string]RefreshToken) map[string]RefreshToken {
 
 func cloneRevokedJTIMap(in map[string]time.Time) map[string]time.Time {
 	out := make(map[string]time.Time, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneChallengeRecordMap(in map[string]ChallengeRecord) map[string]ChallengeRecord {
+	out := make(map[string]ChallengeRecord, len(in))
 	for k, v := range in {
 		out[k] = v
 	}
@@ -1201,8 +1363,8 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 		authCodes:    runtimeState.AuthCodes,
 		refresh:      runtimeState.RefreshTokens,
 		revokedJTIs:  runtimeState.RevokedJTIs,
-		webauthnReg:  map[string]ChallengeRecord{},
-		webauthnLog:  map[string]ChallengeRecord{},
+		webauthnReg:  runtimeState.WebAuthnReg,
+		webauthnLog:  runtimeState.WebAuthnLog,
 	}
 	b.sweepExpired(time.Now())
 	return b, nil
@@ -1279,25 +1441,22 @@ func normalizeConfig(cfg *Config) {
 	}
 }
 
-// sweepExpired removes expired entries from every in-memory map. Without
-// this, revoked-JTI markers and abandoned WebAuthn/OAuth challenges
-// accumulate indefinitely until the process restarts. Each map is swept
-// independently; collapsing into a generic helper would obscure the
-// per-map field accesses.
+// sweepExpired removes expired entries from shared runtime state so abandoned
+// grants do not accumulate indefinitely.
 func (b *Broker) sweepExpired(now time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	changed := sweepExpiredMap(b.sessions, now, func(v Session) time.Time { return v.ExpiresAt })
-	changed = sweepExpiredMap(b.authRequests, now, func(v AuthorizationRequest) time.Time { return v.ExpiresAt }) || changed
-	changed = sweepExpiredMap(b.authCodes, now, func(v AuthCode) time.Time { return v.ExpiresAt }) || changed
-	changed = sweepExpiredMap(b.refresh, now, func(v RefreshToken) time.Time { return v.ExpiresAt }) || changed
-	changed = sweepExpiredMap(b.revokedJTIs, now, func(v time.Time) time.Time { return v }) || changed
-	sweepExpiredMap(b.webauthnReg, now, func(v ChallengeRecord) time.Time { return v.ExpiresAt })
-	sweepExpiredMap(b.webauthnLog, now, func(v ChallengeRecord) time.Time { return v.ExpiresAt })
-	if changed {
-		if err := b.persistRuntimeStateLocked(); err != nil {
-			log.Printf("persist runtime state after sweep: %v", err)
-		}
+	if err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		changed := sweepExpiredMap(state.Sessions, now, func(v Session) time.Time { return v.ExpiresAt })
+		changed = sweepExpiredMap(state.AuthRequests, now, func(v AuthorizationRequest) time.Time { return v.ExpiresAt }) || changed
+		changed = sweepExpiredMap(state.AuthCodes, now, func(v AuthCode) time.Time { return v.ExpiresAt }) || changed
+		changed = sweepExpiredMap(state.RefreshTokens, now, func(v RefreshToken) time.Time { return v.ExpiresAt }) || changed
+		changed = sweepExpiredMap(state.RevokedJTIs, now, func(v time.Time) time.Time { return v }) || changed
+		changed = sweepExpiredMap(state.WebAuthnReg, now, func(v ChallengeRecord) time.Time { return v.ExpiresAt }) || changed
+		changed = sweepExpiredMap(state.WebAuthnLog, now, func(v ChallengeRecord) time.Time { return v.ExpiresAt }) || changed
+		return changed, nil
+	}); err != nil {
+		log.Printf("persist runtime state after sweep: %v", err)
 	}
 }
 
@@ -1335,14 +1494,39 @@ func (b *Broker) runtimeStateLocked() StoredRuntimeState {
 		AuthCodes:     cloneAuthCodeMap(b.authCodes),
 		RefreshTokens: cloneRefreshTokenMap(b.refresh),
 		RevokedJTIs:   cloneRevokedJTIMap(b.revokedJTIs),
+		WebAuthnReg:   cloneChallengeRecordMap(b.webauthnReg),
+		WebAuthnLog:   cloneChallengeRecordMap(b.webauthnLog),
 	}
 }
 
-func (b *Broker) persistRuntimeStateLocked() error {
+func (b *Broker) replaceRuntimeStateLocked(state StoredRuntimeState) {
+	b.sessions = cloneSessionMap(state.Sessions)
+	b.authRequests = cloneAuthorizationRequestMap(state.AuthRequests)
+	b.authCodes = cloneAuthCodeMap(state.AuthCodes)
+	b.refresh = cloneRefreshTokenMap(state.RefreshTokens)
+	b.revokedJTIs = cloneRevokedJTIMap(state.RevokedJTIs)
+	b.webauthnReg = cloneChallengeRecordMap(state.WebAuthnReg)
+	b.webauthnLog = cloneChallengeRecordMap(state.WebAuthnLog)
+}
+
+func (b *Broker) updateRuntimeStateLocked(fn func(*StoredRuntimeState) (bool, error)) error {
 	if b.store == nil {
+		state := b.runtimeStateLocked()
+		changed, err := fn(&state)
+		if err != nil {
+			return err
+		}
+		if changed {
+			b.replaceRuntimeStateLocked(state)
+		}
 		return nil
 	}
-	return b.store.ReplaceRuntimeState(b.runtimeStateLocked())
+	state, err := b.store.UpdateRuntimeState(fn)
+	if err != nil {
+		return err
+	}
+	b.replaceRuntimeStateLocked(state)
+	return nil
 }
 
 func validAppTokenID(id string) bool {
@@ -1581,10 +1765,18 @@ func (b *Broker) handleLoginGet(w http.ResponseWriter, r *http.Request) {
 	rid := r.URL.Query().Get("request_id")
 	clientID := "authbroker"
 	if rid != "" {
+		var ar AuthorizationRequest
 		b.mu.Lock()
-		ar, ok := b.authRequests[rid]
+		err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+			ar = state.AuthRequests[rid]
+			return false, nil
+		})
 		b.mu.Unlock()
-		if !ok || time.Now().After(ar.ExpiresAt) {
+		if err != nil {
+			http.Error(w, "store error", http.StatusInternalServerError)
+			return
+		}
+		if ar.ID == "" || time.Now().After(ar.ExpiresAt) {
 			http.Error(w, "login request expired", http.StatusBadRequest)
 			return
 		}
@@ -1610,14 +1802,14 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	if oauthLogin {
 		var ok bool
 		b.mu.Lock()
-		ar, ok = b.authRequests[rid]
-		if ok {
-			delete(b.authRequests, rid)
-		}
-		var persistErr error
-		if ok {
-			persistErr = b.persistRuntimeStateLocked()
-		}
+		persistErr := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+			ar, ok = state.AuthRequests[rid]
+			if !ok {
+				return false, nil
+			}
+			delete(state.AuthRequests, rid)
+			return true, nil
+		})
 		b.mu.Unlock()
 		if persistErr != nil {
 			http.Error(w, "store error", http.StatusInternalServerError)
@@ -1808,8 +2000,10 @@ func clientIDFromTokenClaims(claims map[string]any) string {
 func (b *Broker) putAuthRequest(ar AuthorizationRequest) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.authRequests[ar.ID] = ar
-	return b.persistRuntimeStateLocked()
+	return b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		state.AuthRequests[ar.ID] = ar
+		return true, nil
+	})
 }
 
 func (b *Broker) needsTOTP(user *StoredUser) bool {
@@ -1822,19 +2016,27 @@ func (b *Broker) validSession(r *http.Request) (Session, bool) {
 		return Session{}, false
 	}
 	b.mu.Lock()
-	s, ok := b.sessions[c.Value]
-	if !ok || time.Now().After(s.ExpiresAt) {
-		if ok {
-			delete(b.sessions, c.Value)
-			if err := b.persistRuntimeStateLocked(); err != nil {
-				log.Printf("persist expired session removal: %v", err)
-			}
+	defer b.mu.Unlock()
+	var s Session
+	var valid bool
+	err = b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		var ok bool
+		s, ok = state.Sessions[c.Value]
+		if !ok {
+			return false, nil
 		}
-		b.mu.Unlock()
+		if time.Now().After(s.ExpiresAt) {
+			delete(state.Sessions, c.Value)
+			return true, nil
+		}
+		valid = true
+		return false, nil
+	})
+	if err != nil {
+		log.Printf("load session state: %v", err)
 		return Session{}, false
 	}
-	b.mu.Unlock()
-	return s, true
+	return s, valid
 }
 
 // maybeExtendSession refreshes the broker session's expiry on activity once
@@ -1851,26 +2053,34 @@ func (b *Broker) maybeExtendSession(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now()
 	b.mu.Lock()
-	s, ok := b.sessions[c.Value]
-	if !ok || now.After(s.ExpiresAt) {
-		if ok {
-			delete(b.sessions, c.Value)
-			if err := b.persistRuntimeStateLocked(); err != nil {
-				log.Printf("persist expired session removal: %v", err)
-			}
+	var newExpiry time.Time
+	extended := false
+	err = b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		s, ok := state.Sessions[c.Value]
+		if !ok {
+			return false, nil
 		}
-		b.mu.Unlock()
-		return
-	}
-	if time.Until(s.ExpiresAt) > ttl/2 {
-		b.mu.Unlock()
-		return
-	}
-	s.ExpiresAt = now.Add(ttl)
-	b.sessions[c.Value] = s
-	newExpiry := s.ExpiresAt
-	if err := b.persistRuntimeStateLocked(); err != nil {
+		if now.After(s.ExpiresAt) {
+			delete(state.Sessions, c.Value)
+			return true, nil
+		}
+		if s.ExpiresAt.Sub(now) > ttl/2 {
+			return false, nil
+		}
+		s.ExpiresAt = now.Add(ttl)
+		state.Sessions[c.Value] = s
+		newExpiry = s.ExpiresAt
+		extended = true
+		return true, nil
+	})
+	if err != nil {
 		log.Printf("persist extended session: %v", err)
+		b.mu.Unlock()
+		return
+	}
+	if !extended {
+		b.mu.Unlock()
+		return
 	}
 	b.mu.Unlock()
 
@@ -1892,14 +2102,17 @@ func (b *Broker) maybeExtendSession(w http.ResponseWriter, r *http.Request) {
 func (b *Broker) clearSession(w http.ResponseWriter, r *http.Request) error {
 	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
 		b.mu.Lock()
-		if _, ok := b.sessions[c.Value]; ok {
-			delete(b.sessions, c.Value)
-			if err := b.persistRuntimeStateLocked(); err != nil {
-				b.mu.Unlock()
-				return err
+		err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+			if _, ok := state.Sessions[c.Value]; !ok {
+				return false, nil
 			}
-		}
+			delete(state.Sessions, c.Value)
+			return true, nil
+		})
 		b.mu.Unlock()
+		if err != nil {
+			return err
+		}
 	}
 	secure := strings.HasPrefix(b.cfg.Issuer, "https://")
 	if b.cfg.CookieSecure != nil {
@@ -1922,9 +2135,10 @@ func (b *Broker) createSession(w http.ResponseWriter, userID string) (Session, e
 	now := time.Now()
 	sess := Session{UserID: userID, ExpiresAt: now.Add(time.Duration(b.cfg.SessionTTLHrs) * time.Hour), AuthTime: now}
 	b.mu.Lock()
-	b.sessions[sid] = sess
-	if err := b.persistRuntimeStateLocked(); err != nil {
-		delete(b.sessions, sid)
+	if err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		state.Sessions[sid] = sess
+		return true, nil
+	}); err != nil {
 		b.mu.Unlock()
 		return Session{}, err
 	}
@@ -1960,9 +2174,10 @@ func (b *Broker) issueCodeRedirect(w http.ResponseWriter, r *http.Request, ar Au
 		ExpiresAt:           time.Now().Add(time.Duration(b.cfg.AuthCodeTTLSeconds) * time.Second),
 	}
 	b.mu.Lock()
-	b.authCodes[code] = ac
-	if err := b.persistRuntimeStateLocked(); err != nil {
-		delete(b.authCodes, code)
+	if err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		state.AuthCodes[code] = ac
+		return true, nil
+	}); err != nil {
 		b.mu.Unlock()
 		return err
 	}
@@ -2039,14 +2254,16 @@ func (b *Broker) tokenAuthorizationCode(w http.ResponseWriter, r *http.Request, 
 	redirectURI := r.Form.Get("redirect_uri")
 
 	b.mu.Lock()
-	ac, ok := b.authCodes[code]
-	if ok {
-		delete(b.authCodes, code)
-	}
-	var persistErr error
-	if ok {
-		persistErr = b.persistRuntimeStateLocked()
-	}
+	var ac AuthCode
+	var ok bool
+	persistErr := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		ac, ok = state.AuthCodes[code]
+		if !ok {
+			return false, nil
+		}
+		delete(state.AuthCodes, code)
+		return true, nil
+	})
 	b.mu.Unlock()
 	if persistErr != nil {
 		tokenErrorStatus(w, http.StatusInternalServerError, "server_error", persistErr.Error())
@@ -2081,38 +2298,44 @@ func (b *Broker) tokenRefresh(w http.ResponseWriter, r *http.Request, client Cli
 	rt := r.Form.Get("refresh_token")
 	requestedScope := strings.TrimSpace(r.Form.Get("scope"))
 	b.mu.Lock()
-	old, ok := b.refresh[rt]
-	if !ok {
-		b.mu.Unlock()
-		tokenError(w, "invalid_grant", "invalid refresh_token")
-		return
-	}
-	if time.Now().After(old.ExpiresAt) || old.ClientID != client.ClientID {
-		delete(b.refresh, rt)
-		if err := b.persistRuntimeStateLocked(); err != nil {
-			b.mu.Unlock()
-			tokenErrorStatus(w, http.StatusInternalServerError, "server_error", err.Error())
-			return
+	var old RefreshToken
+	var ok bool
+	invalidGrant := false
+	invalidScope := false
+	err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		old, ok = state.RefreshTokens[rt]
+		if !ok {
+			invalidGrant = true
+			return false, nil
 		}
-		b.mu.Unlock()
-		tokenError(w, "invalid_grant", "invalid refresh_token")
-		return
-	}
-	// Per RFC 6749 §6, the client may request a narrower scope on refresh,
-	// but never one that exceeds the original grant. Reject scope expansion
-	// without consuming the refresh token so the legitimate client can retry.
-	if requestedScope != "" && !scopeSubset(requestedScope, old.Scope) {
-		b.mu.Unlock()
-		tokenError(w, "invalid_scope", "requested scope exceeds original grant")
-		return
-	}
-	delete(b.refresh, rt) // refresh token rotation
-	if err := b.persistRuntimeStateLocked(); err != nil {
-		b.mu.Unlock()
+		if time.Now().After(old.ExpiresAt) || old.ClientID != client.ClientID {
+			delete(state.RefreshTokens, rt)
+			invalidGrant = true
+			return true, nil
+		}
+		// Per RFC 6749 §6, the client may request a narrower scope on refresh,
+		// but never one that exceeds the original grant. Reject scope expansion
+		// without consuming the refresh token so the legitimate client can retry.
+		if requestedScope != "" && !scopeSubset(requestedScope, old.Scope) {
+			invalidScope = true
+			return false, nil
+		}
+		delete(state.RefreshTokens, rt) // refresh token rotation
+		return true, nil
+	})
+	b.mu.Unlock()
+	if err != nil {
 		tokenErrorStatus(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
-	b.mu.Unlock()
+	if invalidGrant {
+		tokenError(w, "invalid_grant", "invalid refresh_token")
+		return
+	}
+	if invalidScope {
+		tokenError(w, "invalid_scope", "requested scope exceeds original grant")
+		return
+	}
 	scope := old.Scope
 	if requestedScope != "" {
 		scope = requestedScope
@@ -2245,9 +2468,10 @@ func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime
 			ExpiresAt: now.Add(time.Duration(b.cfg.RefreshTokenTTLDays) * 24 * time.Hour),
 		}
 		b.mu.Lock()
-		b.refresh[rt] = refreshToken
-		if err := b.persistRuntimeStateLocked(); err != nil {
-			delete(b.refresh, rt)
+		if err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+			state.RefreshTokens[rt] = refreshToken
+			return true, nil
+		}); err != nil {
 			b.mu.Unlock()
 			return nil, err
 		}
@@ -2376,11 +2600,13 @@ func (b *Broker) handleRevoke(w http.ResponseWriter, r *http.Request) {
 func (b *Broker) revokeRefreshToken(tok string, client Client) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if rt, ok := b.refresh[tok]; ok && rt.ClientID == client.ClientID {
-		delete(b.refresh, tok)
-		return b.persistRuntimeStateLocked()
-	}
-	return nil
+	return b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		if rt, ok := state.RefreshTokens[tok]; ok && rt.ClientID == client.ClientID {
+			delete(state.RefreshTokens, tok)
+			return true, nil
+		}
+		return false, nil
+	})
 }
 
 func (b *Broker) revokeJWT(tok string, client Client) error {
@@ -2396,8 +2622,10 @@ func (b *Broker) revokeJWT(tok string, client Client) error {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.revokedJTIs[jti] = time.Unix(expUnix, 0)
-	return b.persistRuntimeStateLocked()
+	return b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		state.RevokedJTIs[jti] = time.Unix(expUnix, 0)
+		return true, nil
+	})
 }
 
 func (b *Broker) handleTOTPEnroll(w http.ResponseWriter, r *http.Request) {
@@ -2442,8 +2670,15 @@ func (b *Broker) handleWebAuthnRegisterBegin(w http.ResponseWriter, r *http.Requ
 	b.mu.Lock()
 	// Key by challenge (not user ID) so parallel registration attempts from
 	// the same account don't overwrite one another's challenge state.
-	b.webauthnReg[challenge] = ChallengeRecord{UserID: sess.UserID, Challenge: challenge, ExpiresAt: time.Now().Add(5 * time.Minute)}
+	err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		state.WebAuthnReg[challenge] = ChallengeRecord{UserID: sess.UserID, Challenge: challenge, ExpiresAt: time.Now().Add(5 * time.Minute)}
+		return true, nil
+	})
 	b.mu.Unlock()
+	if err != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
 
 	creds := make([]map[string]string, 0, len(user.WebAuthnCredentials))
 	for _, c := range user.WebAuthnCredentials {
@@ -2497,12 +2732,22 @@ func (b *Broker) handleWebAuthnRegisterFinish(w http.ResponseWriter, r *http.Req
 	challenge := normalizeChallenge(cd.Challenge)
 
 	b.mu.Lock()
-	ch, ok := b.webauthnReg[challenge]
-	if ok {
-		delete(b.webauthnReg, challenge)
-	}
+	var ch ChallengeRecord
+	var found bool
+	persistErr := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		ch, found = state.WebAuthnReg[challenge]
+		if !found {
+			return false, nil
+		}
+		delete(state.WebAuthnReg, challenge)
+		return true, nil
+	})
 	b.mu.Unlock()
-	if !ok || time.Now().After(ch.ExpiresAt) || ch.UserID != sess.UserID {
+	if persistErr != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	if !found || time.Now().After(ch.ExpiresAt) || ch.UserID != sess.UserID {
 		http.Error(w, "registration challenge expired", http.StatusBadRequest)
 		return
 	}
@@ -2543,8 +2788,15 @@ func (b *Broker) handleWebAuthnLoginBegin(w http.ResponseWriter, r *http.Request
 	}
 	challenge := randomB64(32)
 	b.mu.Lock()
-	b.webauthnLog[challenge] = ChallengeRecord{UserID: userID, Challenge: challenge, ExpiresAt: time.Now().Add(5 * time.Minute)}
+	err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		state.WebAuthnLog[challenge] = ChallengeRecord{UserID: userID, Challenge: challenge, ExpiresAt: time.Now().Add(5 * time.Minute)}
+		return true, nil
+	})
 	b.mu.Unlock()
+	if err != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
 	allow := make([]map[string]string, 0, len(creds))
 	for _, c := range creds {
 		allow = append(allow, map[string]string{"type": "public-key", "id": c.IDBase64URL})
@@ -2579,11 +2831,21 @@ func (b *Broker) handleWebAuthnLoginFinish(w http.ResponseWriter, r *http.Reques
 	challenge := normalizeChallenge(cd.Challenge)
 
 	b.mu.Lock()
-	ch, ok := b.webauthnLog[challenge]
-	if ok {
-		delete(b.webauthnLog, challenge)
-	}
+	var ch ChallengeRecord
+	var ok bool
+	persistErr := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		ch, ok = state.WebAuthnLog[challenge]
+		if !ok {
+			return false, nil
+		}
+		delete(state.WebAuthnLog, challenge)
+		return true, nil
+	})
 	b.mu.Unlock()
+	if persistErr != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
 	if !ok || time.Now().After(ch.ExpiresAt) || ch.UserID == "" {
 		http.Error(w, "login challenge expired", http.StatusBadRequest)
 		return
@@ -3090,15 +3352,21 @@ func (b *Broker) verifyTokenNotRevoked(claims map[string]any) error {
 		return nil
 	}
 	b.mu.Lock()
-	exp, revoked := b.revokedJTIs[jti]
-	if revoked && time.Now().After(exp) {
-		delete(b.revokedJTIs, jti)
-		if err := b.persistRuntimeStateLocked(); err != nil {
-			log.Printf("persist expired revocation removal: %v", err)
+	var revoked bool
+	err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		exp, found := state.RevokedJTIs[jti]
+		revoked = found
+		if found && time.Now().After(exp) {
+			delete(state.RevokedJTIs, jti)
+			revoked = false
+			return true, nil
 		}
-		revoked = false
-	}
+		return false, nil
+	})
 	b.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	if revoked {
 		return fmt.Errorf("token revoked")
 	}
@@ -3473,27 +3741,42 @@ func prepareSigningKeys(cfg *Config, dataDir string, forceRotate bool) error {
 	}
 
 	path := filepath.Join(dataDir, defaultKeysPath)
-	keySet, loaded, err := loadManagedSigningKeySet(path)
-	if err != nil {
-		return err
-	}
-	if !loaded {
-		keySet, err = initialManagedSigningKeySet(cfg.KeyID, time.Now())
+	return withExclusiveFileLock(path+".lock", func() error {
+		keySet, loaded, changed, err := prepareManagedSigningKeySet(path, cfg, forceRotate, time.Now())
 		if err != nil {
 			return err
 		}
-	}
-	changed, err := keySet.rotateAndPrune(cfg.KeyID, cfg.SigningKeyRotationDays, cfg.SigningKeyRetentionDays, forceRotate && loaded, time.Now())
+		cfg.SigningKeys = keySet.signingKeyConfigs()
+		cfg.KeyID = keySet.ActiveKeyID
+		logManagedSigningKeySet(path, loaded, changed)
+		return nil
+	})
+}
+
+func prepareManagedSigningKeySet(path string, cfg *Config, forceRotate bool, now time.Time) (managedSigningKeySet, bool, bool, error) {
+	keySet, loaded, err := loadManagedSigningKeySet(path)
 	if err != nil {
-		return err
+		return managedSigningKeySet{}, false, false, err
+	}
+	if !loaded {
+		keySet, err = initialManagedSigningKeySet(cfg.KeyID, now)
+		if err != nil {
+			return managedSigningKeySet{}, false, false, err
+		}
+	}
+	changed, err := keySet.rotateAndPrune(cfg.KeyID, cfg.SigningKeyRotationDays, cfg.SigningKeyRetentionDays, forceRotate && loaded, now)
+	if err != nil {
+		return managedSigningKeySet{}, false, false, err
 	}
 	if !loaded || changed {
 		if err := saveManagedSigningKeySet(path, keySet); err != nil {
-			return err
+			return managedSigningKeySet{}, false, false, err
 		}
 	}
-	cfg.SigningKeys = keySet.signingKeyConfigs()
-	cfg.KeyID = keySet.ActiveKeyID
+	return keySet, loaded, changed, nil
+}
+
+func logManagedSigningKeySet(path string, loaded, changed bool) {
 	switch {
 	case !loaded:
 		log.Printf("generated RSA signing key set at %s", path)
@@ -3502,7 +3785,6 @@ func prepareSigningKeys(cfg *Config, dataDir string, forceRotate bool) error {
 	default:
 		log.Printf("loaded RSA signing key set from %s", path)
 	}
-	return nil
 }
 
 func loadManagedSigningKeySet(path string) (managedSigningKeySet, bool, error) {
@@ -3697,18 +3979,11 @@ func sanitizeKeyIDPrefix(prefix string) string {
 }
 
 func saveManagedSigningKeySet(path string, keySet managedSigningKeySet) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
 	b, err := json.MarshalIndent(keySet, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return writeFileAtomic(path, b, 0o600)
 }
 
 func envOrDefault(name, fallback string) string {

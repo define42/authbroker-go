@@ -1,8 +1,10 @@
 package main
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -114,4 +116,156 @@ func TestBrokerPersistsRuntimeStateMutations(t *testing.T) {
 	if len(state.RefreshTokens) != 1 {
 		t.Fatalf("persisted refresh tokens = %d, want 1", len(state.RefreshTokens))
 	}
+}
+
+func TestSharedStorePreservesRuntimeMutationsAcrossBrokers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), defaultDataFile)
+	brokerA := mustNewDurableBroker(t, path)
+	brokerB := mustNewDurableBroker(t, path)
+
+	if _, err := brokerA.createSession(httptest.NewRecorder(), "alice"); err != nil {
+		t.Fatalf("broker A create session: %v", err)
+	}
+	if _, err := brokerB.createSession(httptest.NewRecorder(), "bob"); err != nil {
+		t.Fatalf("broker B create session: %v", err)
+	}
+
+	reloaded, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("reload shared store: %v", err)
+	}
+	state := reloaded.RuntimeState()
+	if len(state.Sessions) != 2 {
+		t.Fatalf("shared sessions = %d, want 2", len(state.Sessions))
+	}
+}
+
+func TestSharedStoreConsumesAuthorizationCodeOnceAcrossBrokers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), defaultDataFile)
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	if _, err := store.UpsertProfile(UserProfile{Subject: "alice"}); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	brokerA := mustNewDurableBrokerWithStore(t, store)
+	brokerB := mustNewDurableBroker(t, path)
+	now := time.Now()
+	if err := store.ReplaceRuntimeState(StoredRuntimeState{
+		AuthCodes: map[string]AuthCode{
+			"shared-code": {
+				Code:        "shared-code",
+				UserID:      "alice",
+				ClientID:    "demo-web",
+				RedirectURI: "http://app.example/callback",
+				Scope:       "openid",
+				AuthTime:    now,
+				ExpiresAt:   now.Add(time.Minute),
+			},
+		},
+	}); err != nil {
+		t.Fatalf("seed authorization code: %v", err)
+	}
+
+	first := httptest.NewRecorder()
+	brokerA.tokenAuthorizationCode(first, tokenRequest(t, "shared-code"), Client{ClientID: "demo-web"})
+	if first.Code != 0 && first.Code != 200 {
+		t.Fatalf("first code exchange status = %d, want 200", first.Code)
+	}
+
+	second := httptest.NewRecorder()
+	brokerB.tokenAuthorizationCode(second, tokenRequest(t, "shared-code"), Client{ClientID: "demo-web"})
+	if second.Code != 400 {
+		t.Fatalf("second code exchange status = %d, want 400", second.Code)
+	}
+}
+
+func TestSharedStoreMergesUserUpdatesAcrossStores(t *testing.T) {
+	path := filepath.Join(t.TempDir(), defaultDataFile)
+	storeA, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("create store A: %v", err)
+	}
+	storeB, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("create store B: %v", err)
+	}
+
+	if _, err := storeA.UpsertProfile(UserProfile{Subject: "alice", Email: "alice@example.com"}); err != nil {
+		t.Fatalf("store A upsert profile: %v", err)
+	}
+	if err := storeB.SetTOTP("alice", "SECRET"); err != nil {
+		t.Fatalf("store B set totp: %v", err)
+	}
+
+	user, ok := storeA.GetUser("alice")
+	if !ok {
+		t.Fatal("shared user was not found")
+	}
+	if user.Email != "alice@example.com" || user.TOTPSecretBase32 != "SECRET" {
+		t.Fatalf("shared user = %#v, want email and totp from both stores", user)
+	}
+}
+
+func TestSharedStorePersistsWebAuthnLoginChallenges(t *testing.T) {
+	path := filepath.Join(t.TempDir(), defaultDataFile)
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	if _, err := store.UpsertProfile(UserProfile{Subject: "alice"}); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	brokerA := mustNewDurableBrokerWithStore(t, store)
+	brokerB := mustNewDurableBroker(t, path)
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/webauthn/login/begin", strings.NewReader(`{"username":"alice"}`))
+	brokerA.handleWebAuthnLoginBegin(recorder, req)
+	if recorder.Code != 200 {
+		t.Fatalf("webauthn login begin status = %d, want 200", recorder.Code)
+	}
+	state := store.RuntimeState()
+	if len(state.WebAuthnLog) != 1 {
+		t.Fatalf("shared webauthn login challenges = %d, want 1", len(state.WebAuthnLog))
+	}
+
+	brokerB.sweepExpired(time.Now().Add(10 * time.Minute))
+	state = store.RuntimeState()
+	if len(state.WebAuthnLog) != 0 {
+		t.Fatalf("expired shared webauthn login challenges = %d, want 0", len(state.WebAuthnLog))
+	}
+}
+
+func mustNewDurableBroker(t *testing.T, path string) *Broker {
+	t.Helper()
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	return mustNewDurableBrokerWithStore(t, store)
+}
+
+func mustNewDurableBrokerWithStore(t *testing.T, store *Store) *Broker {
+	t.Helper()
+	broker, err := NewBroker(Config{
+		Issuer:        "http://broker.example",
+		KeyID:         "test-key",
+		SigningKeyPEM: mustGeneratedKeyPEM(t),
+	}, store)
+	if err != nil {
+		t.Fatalf("create broker: %v", err)
+	}
+	return broker
+}
+
+func tokenRequest(t *testing.T, code string) *http.Request {
+	t.Helper()
+	req := httptest.NewRequest("POST", "/oauth2/token", strings.NewReader("code="+code+"&redirect_uri=http%3A%2F%2Fapp.example%2Fcallback"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if err := req.ParseForm(); err != nil {
+		t.Fatalf("parse token form: %v", err)
+	}
+	return req
 }

@@ -34,7 +34,7 @@ The same paths can be supplied through environment variables:
 AUTHBROKER_CONFIG=config.example.json AUTHBROKER_DATA=data go run .
 ```
 
-`AUTHBROKER_DATA` points at a data directory. The broker stores users, MFA secrets, WebAuthn credentials, sessions, OAuth authorization state, refresh tokens, and revoked token IDs in `data.json` with atomic file replacement. Managed signing keys live in `signing-keys.json` inside the same directory.
+`AUTHBROKER_DATA` points at a data directory. The broker stores users, MFA secrets, WebAuthn credentials and challenge state, sessions, OAuth authorization state, refresh tokens, and revoked token IDs in `data.json` with inter-process file locking and atomic file replacement. Managed signing keys live in `signing-keys.json` inside the same directory and use the same startup lock, so multiple broker instances can share one `AUTHBROKER_DATA` directory when the shared filesystem supports advisory locks and atomic rename.
 
 Open the OIDC discovery document:
 
@@ -367,8 +367,8 @@ await fetch('/webauthn/login/finish', {
 Before production, the remaining hardening work is:
 
 - TLS-only deployment behind a trusted ingress/proxy
-- database-backed storage for multi-instance deployments and higher write volume
 - encrypted secret storage for signing keys, TLS trust material, and deployment secrets
+- backup/restore and filesystem lock validation for the shared `AUTHBROKER_DATA` directory
 - operational key rotation policy review for each deployment
 - consent screens, client administration, and app-token profile administration
 - app-token issuance audit, revocation strategy, per-app TTL review, and policy for who may generate each token profile
