@@ -9,7 +9,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec // TOTP RFC 6238 uses HMAC-SHA1.
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
@@ -149,7 +149,7 @@ func NewStore(path string) (*Store, error) {
 	if path == "" {
 		return s, nil
 	}
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) //nolint:gosec // data path is supplied by the local operator.
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return s, nil
@@ -508,6 +508,7 @@ func ldapGroupIdentifiers(values []string) []string {
 	return groups
 }
 
+//nolint:gocognit,nestif // LDAP DN fallback parsing is clearest kept together.
 func ldapGroupName(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -583,6 +584,7 @@ type regexGroupMapping struct {
 	Pattern *regexp.Regexp
 }
 
+//nolint:gocognit,cyclop // Validation branches mirror the supported group mapping forms.
 func normalizeClientGroupMappings(in map[string]string) (map[string]string, error) {
 	if len(in) == 0 {
 		return nil, nil
@@ -636,6 +638,7 @@ func normalizeClientGroupMappings(in map[string]string) (map[string]string, erro
 	return out, nil
 }
 
+//nolint:gocognit,cyclop,funlen // Mapping modes are evaluated in one pass to preserve deterministic output.
 func mappedClientGroups(client Client, userGroups []string) []string {
 	if len(userGroups) == 0 || len(client.GroupMappings) == 0 {
 		return nil
@@ -919,6 +922,7 @@ type ChallengeRecord struct {
 	ExpiresAt time.Time
 }
 
+//nolint:gocognit,funlen // Broker construction validates clients, app tokens, and signing material together.
 func NewBroker(cfg Config, store *Store) (*Broker, error) {
 	normalizeConfig(&cfg)
 
@@ -988,6 +992,7 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 	return b, nil
 }
 
+//nolint:gocognit,cyclop // Defaulting the flat JSON config is intentionally centralized.
 func normalizeConfig(cfg *Config) {
 	if cfg.Listen == "" {
 		cfg.Listen = ":8080"
@@ -1094,11 +1099,11 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-func (b *Broker) handleHealth(w http.ResponseWriter, r *http.Request) {
+func (b *Broker) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (b *Broker) handleDiscovery(w http.ResponseWriter, r *http.Request) {
+func (b *Broker) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 	issuer := b.cfg.Issuer
 	writeJSON(w, http.StatusOK, map[string]any{
 		"issuer":                                issuer,
@@ -1119,7 +1124,7 @@ func (b *Broker) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (b *Broker) handleJWKS(w http.ResponseWriter, r *http.Request) {
+func (b *Broker) handleJWKS(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"keys": []any{b.publicJWK}})
 }
 
@@ -1145,6 +1150,7 @@ type appTokenView struct {
 
 type issuedAppTokenView struct {
 	appTokenView
+
 	Token string
 }
 
@@ -1287,6 +1293,7 @@ func (b *Broker) handleLoginGet(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+//nolint:gocognit,nestif,funlen // Login keeps OAuth request restoration and TOTP handling in one flow.
 func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad form", http.StatusBadRequest)
@@ -1368,6 +1375,7 @@ func (b *Broker) handleLocalLogoutPost(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
+//nolint:gocognit,nestif // OIDC logout validation is easier to audit as one flow.
 func (b *Broker) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		if err := r.ParseForm(); err != nil {
@@ -1412,7 +1420,7 @@ func (b *Broker) handleLogout(w http.ResponseWriter, r *http.Request) {
 			q.Set("state", state)
 			u.RawQuery = q.Encode()
 		}
-		http.Redirect(w, r, u.String(), http.StatusFound)
+		http.Redirect(w, r, u.String(), http.StatusFound) //nolint:gosec // redirect URI was validated against registered post_logout_redirect_uris.
 		return
 	}
 
@@ -1486,7 +1494,7 @@ func (b *Broker) clearSession(w http.ResponseWriter, r *http.Request) {
 	if b.cfg.CookieSecure != nil {
 		secure = *b.cfg.CookieSecure
 	}
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure is controlled by issuer/config for local HTTP demos and HTTPS deployments.
 		Name:     sessionCookieName,
 		Value:    "",
 		Path:     "/",
@@ -1508,7 +1516,7 @@ func (b *Broker) createSession(w http.ResponseWriter, userID string) Session {
 	if b.cfg.CookieSecure != nil {
 		secure = *b.cfg.CookieSecure
 	}
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure is controlled by issuer/config for local HTTP demos and HTTPS deployments.
 		Name:     sessionCookieName,
 		Value:    sid,
 		Path:     "/",
@@ -1688,6 +1696,7 @@ func (b *Broker) tokenClientCredentials(w http.ResponseWriter, r *http.Request, 
 	})
 }
 
+//nolint:gocognit,funlen // Access and ID token claims are intentionally assembled together.
 func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime time.Time, includeRefresh bool) (map[string]any, error) {
 	user, _ := b.store.GetUser(userID)
 	now := time.Now()
@@ -1768,6 +1777,7 @@ func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime
 	return resp, nil
 }
 
+//nolint:nestif // Optional profile and group claims are grouped by source.
 func (b *Broker) issueAppToken(sess Session, tokenCfg AppTokenConfig) (string, error) {
 	user, _ := b.store.GetUser(sess.UserID)
 	now := time.Now()
@@ -2059,6 +2069,7 @@ func (b *Broker) handleWebAuthnLoginFinish(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, map[string]string{"status": "authenticated"})
 }
 
+//nolint:gocognit,cyclop // WebAuthn validation is kept linear to match the protocol checks.
 func (b *Broker) verifyWebAuthnAttestation(req webauthnAttestationResponse, expectedChallenge string) (WebAuthnCredential, error) {
 	rawID, err := decodeB64URL(req.RawID)
 	if err != nil || len(rawID) == 0 {
@@ -2120,6 +2131,7 @@ func (b *Broker) verifyWebAuthnAttestation(req webauthnAttestationResponse, expe
 	}, nil
 }
 
+//nolint:gocognit,cyclop // WebAuthn assertion checks are intentionally explicit and ordered.
 func (b *Broker) verifyWebAuthnAssertion(req webauthnAssertionResponse, username, expectedChallenge string, clientDataBytes []byte, cd webauthnClientData) error {
 	if cd.Type != "webauthn.get" {
 		return fmt.Errorf("wrong clientData type")
@@ -2348,6 +2360,7 @@ type cborValue struct {
 	mapValue   map[any]cborValue
 }
 
+//nolint:gocognit,cyclop,funlen // This minimal CBOR decoder is deliberately local and explicit for WebAuthn.
 func parseCBOR(data []byte) (cborValue, []byte, error) {
 	if len(data) == 0 {
 		return cborValue{}, nil, io.ErrUnexpectedEOF
@@ -2411,6 +2424,8 @@ func parseCBOR(data []byte) (cborValue, []byte, error) {
 				m[k.intValue] = v
 			case cborString:
 				m[k.strValue] = v
+			case cborInvalid, cborBytes, cborArray, cborMap:
+				return cborValue{}, nil, fmt.Errorf("unsupported cbor map key")
 			default:
 				return cborValue{}, nil, fmt.Errorf("unsupported cbor map key")
 			}
@@ -2487,6 +2502,7 @@ func (b *Broker) signJWT(claims map[string]any) (string, error) {
 	return signingInput + "." + base64RawURL(sig), nil
 }
 
+//nolint:gocognit,cyclop,funlen // JWT parsing and claim checks stay together for readability.
 func (b *Broker) verifyJWT(token string) (map[string]any, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
@@ -2623,7 +2639,7 @@ func redirectOAuthError(w http.ResponseWriter, redirectURI, state, code, desc st
 		q.Set("state", state)
 	}
 	u.RawQuery = q.Encode()
-	http.Redirect(w, &http.Request{}, u.String(), http.StatusFound)
+	http.Redirect(w, &http.Request{}, u.String(), http.StatusFound) //nolint:gosec // redirect URI was validated against the registered client redirect_uris.
 }
 
 func tokenError(w http.ResponseWriter, code, desc string) {
@@ -2640,6 +2656,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+//nolint:gochecknoglobals // Parsed templates are immutable and shared by handlers.
 var brokerHomeTemplate = template.Must(template.New("broker-home").Parse(`<!doctype html>
 <html>
 <head><meta charset="utf-8"><title>Authbroker</title></head>
@@ -2682,6 +2699,7 @@ var brokerHomeTemplate = template.Must(template.New("broker-home").Parse(`<!doct
 </body>
 </html>`))
 
+//nolint:gochecknoglobals // Parsed templates are immutable and shared by handlers.
 var brokerLogoutTemplate = template.Must(template.New("broker-logout").Parse(`<!doctype html>
 <html>
 <head><meta charset="utf-8"><title>Logout</title></head>
@@ -2695,6 +2713,7 @@ var brokerLogoutTemplate = template.Must(template.New("broker-logout").Parse(`<!
 </body>
 </html>`))
 
+//nolint:gochecknoglobals // Parsed templates are immutable and shared by handlers.
 var loginTemplate = template.Must(template.New("login").Parse(`<!doctype html>
 <html>
 <head><meta charset="utf-8"><title>Login</title></head>
@@ -2727,6 +2746,9 @@ func verifyTOTP(secretBase32, code string, now time.Time, window int) bool {
 }
 
 func totpCode(secretBase32 string, counter int64) string {
+	if counter < 0 {
+		return "000000"
+	}
 	secretBase32 = strings.ToUpper(strings.TrimSpace(secretBase32))
 	pad := len(secretBase32) % 8
 	if pad != 0 {
@@ -2794,7 +2816,7 @@ func dialLDAP(ctx context.Context, cfg LDAPConfig) (*ldap.Conn, error) {
 		timeout = 5 * time.Second
 	}
 	dialer := &net.Dialer{Timeout: timeout}
-	tlsConfig := &tls.Config{ServerName: u.Hostname(), InsecureSkipVerify: cfg.InsecureSkipVerify} //nolint:gosec -- configurable for labs
+	tlsConfig := &tls.Config{ServerName: u.Hostname(), InsecureSkipVerify: cfg.InsecureSkipVerify} //nolint:gosec // InsecureSkipVerify is operator-configurable for local LDAP fixtures.
 	conn, err := ldap.DialURL(cfg.URL, ldap.DialWithDialer(dialer), ldap.DialWithTLSConfig(tlsConfig))
 	if err != nil {
 		return nil, err
@@ -2802,12 +2824,12 @@ func dialLDAP(ctx context.Context, cfg LDAPConfig) (*ldap.Conn, error) {
 	conn.SetTimeout(timeout)
 	if cfg.StartTLS {
 		if err := conn.StartTLS(tlsConfig); err != nil {
-			conn.Close()
+			_ = conn.Close()
 			return nil, err
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	return conn, nil
@@ -2857,7 +2879,7 @@ func uniqueNonEmpty(values ...string) []string {
 
 func loadConfig(path string) (Config, error) {
 	var cfg Config
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) //nolint:gosec // config path is supplied by the local operator.
 	if err != nil {
 		return cfg, err
 	}
@@ -2878,7 +2900,9 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		pem.Encode(os.Stdout, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+		if err := pem.Encode(os.Stdout, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}); err != nil {
+			log.Fatal(err)
+		}
 		return
 	}
 
@@ -2904,7 +2928,7 @@ func main() {
 	log.Fatal(srv.ListenAndServe())
 }
 
-func dumpRoutes(b *Broker) {
+func dumpRoutes(_ *Broker) {
 	routes := []string{
 		"/.well-known/openid-configuration",
 		"/oauth2/authorize",

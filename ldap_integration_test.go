@@ -1,3 +1,4 @@
+// Package main contains tests for the single-file authbroker.
 package main
 
 import (
@@ -317,6 +318,7 @@ func TestScopeIncludes(t *testing.T) {
 	}
 }
 
+//nolint:gosec // Fixed demo secret hash is a test fixture.
 func TestClientSecretMatchesSHA256(t *testing.T) {
 	client := Client{
 		ClientID:           "demo-web",
@@ -376,7 +378,7 @@ func TestBrokerLogoutClearsSessionAndRedirects(t *testing.T) {
 		"state":                    {"logout-state"},
 	}
 	req := httptest.NewRequest(http.MethodGet, "/oauth2/logout?"+q.Encode(), nil)
-	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "logout-session"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "logout-session"}) //nolint:gosec // Test attaches a synthetic session cookie.
 	rr := httptest.NewRecorder()
 	broker.handleLogout(rr, req)
 
@@ -409,6 +411,7 @@ func TestBrokerLogoutRejectsUnregisteredRedirect(t *testing.T) {
 	}
 }
 
+//nolint:gocognit,cyclop,funlen // End-to-end page flow test intentionally exercises several states.
 func TestBrokerStandaloneLoginAndLogoutPages(t *testing.T) {
 	broker := newLogoutTestBroker(t)
 	broker.authn = staticAuthenticator{profile: UserProfile{
@@ -547,6 +550,7 @@ func TestBrokerStandaloneLoginAndLogoutPages(t *testing.T) {
 	}
 }
 
+//nolint:gocognit,cyclop,funlen // Docker-backed integration test covers the full OAuth profile flow.
 func TestLDAPBrokerOAuthIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Docker-backed LDAP integration test in short mode")
@@ -817,6 +821,7 @@ func codeFromRedirect(location string) (string, error) {
 	return code, nil
 }
 
+//nolint:gosec // Fixed demo secret hash is a test fixture.
 func newLogoutTestBroker(t *testing.T) *Broker {
 	t.Helper()
 
@@ -880,6 +885,7 @@ func (a staticAuthenticator) Authenticate(context.Context, string, string) (User
 	return a.profile, nil
 }
 
+//nolint:funlen,gosec // Integration broker setup is clearer as one fixture helper with fixed test credentials.
 func startTestBroker(ctx context.Context, t *testing.T, ldapCfg LDAPConfig) (string, *Broker, *http.Client, func()) {
 	t.Helper()
 
@@ -1083,6 +1089,7 @@ func requireDocker(t *testing.T) {
 	}
 }
 
+//nolint:gosec // Docker arguments are built from test fixture paths and a generated container name.
 func startDockerGlauth(ctx context.Context, t *testing.T) (string, func()) {
 	t.Helper()
 
@@ -1120,6 +1127,7 @@ func startDockerGlauth(ctx context.Context, t *testing.T) (string, func()) {
 	return "ldaps://127.0.0.1:" + port, cleanup
 }
 
+//nolint:gosec // Docker command arguments are fixed except for the generated test container name and port.
 func dockerMappedPort(ctx context.Context, containerName, containerPort string) (string, error) {
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
