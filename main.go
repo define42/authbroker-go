@@ -55,10 +55,11 @@ type Config struct {
 	KeyID         string `json:"key_id"`
 	CookieSecure  *bool  `json:"cookie_secure,omitempty"`
 
-	LDAP     LDAPConfig     `json:"ldap"`
-	Clients  []Client       `json:"clients"`
-	MFA      MFAConfig      `json:"mfa"`
-	WebAuthn WebAuthnConfig `json:"webauthn"`
+	LDAP      LDAPConfig       `json:"ldap"`
+	Clients   []Client         `json:"clients"`
+	MFA       MFAConfig        `json:"mfa"`
+	WebAuthn  WebAuthnConfig   `json:"webauthn"`
+	AppTokens []AppTokenConfig `json:"app_tokens,omitempty"`
 
 	AccessTokenTTLMinutes int `json:"access_token_ttl_minutes"`
 	IDTokenTTLMinutes     int `json:"id_token_ttl_minutes"`
@@ -103,6 +104,16 @@ type WebAuthnConfig struct {
 	RPID          string   `json:"rp_id"`           // e.g. "auth.example.com" or "localhost"
 	RPDisplayName string   `json:"rp_display_name"` // e.g. "Example Auth Broker"
 	Origins       []string `json:"origins"`         // e.g. ["https://auth.example.com"]
+}
+
+type AppTokenConfig struct {
+	ID              string            `json:"id"`
+	DisplayName     string            `json:"display_name,omitempty"`
+	Audience        string            `json:"audience,omitempty"`
+	ClientID        string            `json:"client_id,omitempty"`
+	Scope           string            `json:"scope,omitempty"`
+	TokenTTLMinutes int               `json:"token_ttl_minutes,omitempty"`
+	GroupMappings   map[string]string `json:"group_mappings,omitempty"`
 }
 
 type StoredUser struct {
@@ -848,7 +859,8 @@ type Broker struct {
 	privateKey *rsa.PrivateKey
 	publicJWK  map[string]any
 
-	clients map[string]Client
+	clients   map[string]Client
+	appTokens map[string]AppTokenConfig
 
 	mu           sync.Mutex
 	sessions     map[string]Session
@@ -937,6 +949,25 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 		c.GroupMappings = groupMappings
 		clientMap[c.ClientID] = c
 	}
+	appTokenMap := map[string]AppTokenConfig{}
+	for i, tokenCfg := range cfg.AppTokens {
+		if tokenCfg.ID == "" {
+			return nil, fmt.Errorf("app_tokens[%d].id is required", i)
+		}
+		if !validAppTokenID(tokenCfg.ID) {
+			return nil, fmt.Errorf("app token %q: id may only contain letters, digits, dot, underscore, and hyphen", tokenCfg.ID)
+		}
+		groupMappings, err := normalizeClientGroupMappings(tokenCfg.GroupMappings)
+		if err != nil {
+			return nil, fmt.Errorf("app token %q: %w", tokenCfg.ID, err)
+		}
+		tokenCfg.GroupMappings = groupMappings
+		cfg.AppTokens[i] = tokenCfg
+		if _, exists := appTokenMap[tokenCfg.ID]; exists {
+			return nil, fmt.Errorf("duplicate app token id %q", tokenCfg.ID)
+		}
+		appTokenMap[tokenCfg.ID] = tokenCfg
+	}
 
 	b := &Broker{
 		cfg:          cfg,
@@ -944,6 +975,7 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 		authn:        &LDAPAuthenticator{cfg: cfg.LDAP},
 		privateKey:   key,
 		clients:      clientMap,
+		appTokens:    appTokenMap,
 		sessions:     map[string]Session{},
 		authRequests: map[string]AuthorizationRequest{},
 		authCodes:    map[string]AuthCode{},
@@ -998,6 +1030,33 @@ func normalizeConfig(cfg *Config) {
 			cfg.WebAuthn.Origins = []string{u.Scheme + "://" + u.Host}
 		}
 	}
+	for i := range cfg.AppTokens {
+		if cfg.AppTokens[i].DisplayName == "" {
+			cfg.AppTokens[i].DisplayName = cfg.AppTokens[i].ID
+		}
+		if cfg.AppTokens[i].Audience == "" {
+			cfg.AppTokens[i].Audience = cfg.AppTokens[i].ID
+		}
+		if cfg.AppTokens[i].ClientID == "" {
+			cfg.AppTokens[i].ClientID = cfg.AppTokens[i].Audience
+		}
+		if cfg.AppTokens[i].Scope == "" {
+			cfg.AppTokens[i].Scope = "openid profile email groups"
+		}
+		if cfg.AppTokens[i].TokenTTLMinutes <= 0 {
+			cfg.AppTokens[i].TokenTTLMinutes = 480
+		}
+	}
+}
+
+func validAppTokenID(id string) bool {
+	for _, r := range id {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
+			continue
+		}
+		return false
+	}
+	return id != ""
 }
 
 func (b *Broker) routes() http.Handler {
@@ -1011,6 +1070,7 @@ func (b *Broker) routes() http.Handler {
 	mux.HandleFunc("POST /login", b.handleLoginPost)
 	mux.HandleFunc("GET /logout", b.handleLocalLogoutGet)
 	mux.HandleFunc("POST /logout", b.handleLocalLogoutPost)
+	mux.HandleFunc("POST /app-tokens/{id}", b.handleAppToken)
 	mux.HandleFunc("POST /oauth2/token", b.handleToken)
 	mux.HandleFunc("GET /oauth2/userinfo", b.handleUserInfo)
 	mux.HandleFunc("POST /oauth2/revoke", b.handleRevoke)
@@ -1068,16 +1128,86 @@ func (b *Broker) handleHome(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	data := b.homeData(r, nil)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = brokerHomeTemplate.Execute(w, data)
+}
+
+type appTokenView struct {
+	ID              string
+	DisplayName     string
+	Audience        string
+	ClientID        string
+	Scope           string
+	TokenTTLSeconds int
+	JWKSURL         string
+}
+
+type issuedAppTokenView struct {
+	appTokenView
+	Token string
+}
+
+func (b *Broker) homeData(r *http.Request, issued *issuedAppTokenView) map[string]any {
 	data := map[string]any{
-		"Issuer": b.cfg.Issuer,
+		"Issuer":    b.cfg.Issuer,
+		"AppTokens": b.appTokenViews(),
 	}
 	if sess, ok := b.validSession(r); ok {
 		data["Authenticated"] = true
 		data["UserID"] = sess.UserID
 		data["ExpiresAt"] = sess.ExpiresAt.Format(time.RFC1123)
 	}
+	if issued != nil {
+		data["IssuedAppToken"] = issued
+	}
+	return data
+}
+
+func (b *Broker) appTokenViews() []appTokenView {
+	views := make([]appTokenView, 0, len(b.cfg.AppTokens))
+	for _, cfg := range b.cfg.AppTokens {
+		views = append(views, b.appTokenView(cfg))
+	}
+	return views
+}
+
+func (b *Broker) appTokenView(cfg AppTokenConfig) appTokenView {
+	return appTokenView{
+		ID:              cfg.ID,
+		DisplayName:     cfg.DisplayName,
+		Audience:        cfg.Audience,
+		ClientID:        cfg.ClientID,
+		Scope:           cfg.Scope,
+		TokenTTLSeconds: cfg.TokenTTLMinutes * 60,
+		JWKSURL:         b.cfg.Issuer + "/oauth2/jwks",
+	}
+}
+
+func (b *Broker) handleAppToken(w http.ResponseWriter, r *http.Request) {
+	sess, ok := b.validSession(r)
+	if !ok {
+		http.Redirect(w, r, "/login", http.StatusFound)
+		return
+	}
+	tokenID := r.PathValue("id")
+	tokenCfg, ok := b.appTokens[tokenID]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	token, err := b.issueAppToken(sess, tokenCfg)
+	if err != nil {
+		http.Error(w, "could not issue app token", http.StatusInternalServerError)
+		return
+	}
+	issued := &issuedAppTokenView{
+		appTokenView: b.appTokenView(tokenCfg),
+		Token:        token,
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = brokerHomeTemplate.Execute(w, data)
+	w.Header().Set("Cache-Control", "no-store")
+	_ = brokerHomeTemplate.Execute(w, b.homeData(r, issued))
 }
 
 func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
@@ -1636,6 +1766,41 @@ func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime
 		resp["refresh_token"] = rt
 	}
 	return resp, nil
+}
+
+func (b *Broker) issueAppToken(sess Session, tokenCfg AppTokenConfig) (string, error) {
+	user, _ := b.store.GetUser(sess.UserID)
+	now := time.Now()
+	scope := strings.TrimSpace(tokenCfg.Scope)
+	claims := map[string]any{
+		"iss":                b.cfg.Issuer,
+		"sub":                sess.UserID,
+		"aud":                tokenCfg.Audience,
+		"iat":                now.Unix(),
+		"nbf":                now.Unix(),
+		"exp":                now.Add(time.Duration(tokenCfg.TokenTTLMinutes) * time.Minute).Unix(),
+		"jti":                randomB64(16),
+		"client_id":          tokenCfg.ClientID,
+		"scope":              scope,
+		"auth_time":          sess.AuthTime.Unix(),
+		"preferred_username": sess.UserID,
+		"user_id":            sess.UserID,
+		"app_token_id":       tokenCfg.ID,
+		"token_use":          "access",
+	}
+	if user != nil {
+		claims["email"] = user.Email
+		claims["name"] = displayName(user)
+		if user.Email != "" {
+			claims["user_email"] = user.Email
+		}
+		if scopeIncludes(scope, "groups") {
+			if groups := mappedClientGroups(Client{GroupMappings: tokenCfg.GroupMappings}, user.Groups); len(groups) > 0 {
+				claims["groups"] = groups
+			}
+		}
+	}
+	return b.signJWT(claims)
 }
 
 func displayName(u *StoredUser) string {
@@ -2484,6 +2649,29 @@ var brokerHomeTemplate = template.Must(template.New("broker-home").Parse(`<!doct
   {{if .Authenticated}}
     <p>Signed in as <strong>{{.UserID}}</strong>.</p>
     <p style="color:#555">Session expires: {{.ExpiresAt}}</p>
+    {{if .AppTokens}}
+      <section style="border:1px solid #ddd; border-radius:8px; padding:1rem; margin:1.5rem 0;">
+        <h2 style="margin-top:0; font-size:1.15rem;">App tokens</h2>
+        {{range .AppTokens}}
+          <div style="border-top:1px solid #eee; padding-top:1rem; margin-top:1rem;">
+            <h3 style="margin:.25rem 0; font-size:1rem;">{{.DisplayName}}</h3>
+            <p style="color:#555">Audience: <code>{{.Audience}}</code> · Client ID: <code>{{.ClientID}}</code> · JWKS: <code>{{.JWKSURL}}</code></p>
+            <p style="color:#555">Scope: <code>{{.Scope}}</code> · Expires in {{.TokenTTLSeconds}} seconds</p>
+            <form method="post" action="/app-tokens/{{.ID}}">
+              <button type="submit">Generate JWT</button>
+            </form>
+          </div>
+        {{end}}
+        {{with .IssuedAppToken}}
+          <div style="border-top:1px solid #ddd; padding-top:1rem; margin-top:1rem;">
+            <h3 style="margin:.25rem 0; font-size:1rem;">{{.DisplayName}} JWT</h3>
+            <p style="color:#555">Expires in {{.TokenTTLSeconds}} seconds. Use it as a bearer token.</p>
+            <textarea id="app-token-value" readonly spellcheck="false" autocomplete="off" style="width:100%; min-height:9rem; box-sizing:border-box; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;">{{.Token}}</textarea>
+            <p><button type="button" onclick="navigator.clipboard.writeText(document.getElementById('app-token-value').value)">Copy JWT</button></p>
+          </div>
+        {{end}}
+      </section>
+    {{end}}
     <form method="get" action="/logout">
       <button type="submit">Sign out</button>
     </form>
@@ -2724,6 +2912,7 @@ func dumpRoutes(b *Broker) {
 		"/oauth2/jwks",
 		"/oauth2/userinfo",
 		"/oauth2/revoke",
+		"/app-tokens/{id}",
 		"/mfa/totp/enroll",
 		"/webauthn/register/begin",
 		"/webauthn/register/finish",

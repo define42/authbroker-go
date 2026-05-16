@@ -32,6 +32,21 @@
     "origins": ["http://localhost:8080", "http://localhost:8091"]
   },
 
+  "app_tokens": [
+    {
+      "id": "litellm",
+      "display_name": "LiteLLM",
+      "audience": "litellm",
+      "client_id": "litellm",
+      "scope": "openid profile email groups",
+      "token_ttl_minutes": 480,
+      "group_mappings": {
+        "app_elk_team10_ingest": "elk-ingest",
+        "OU=Demo,DC=glauth,DC=com": "{cn}"
+      }
+    }
+  ],
+
   "clients": [
     {
       "client_id": "test-web-ui",

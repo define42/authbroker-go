@@ -67,6 +67,59 @@ In the GLAUTH fixture, `johndoe` also has a Demo OU-style group membership, `CN=
 
 Open <http://localhost:8091> for the passkey demo. Sign in with LDAP first, register a passkey for that account, sign out of the demo broker session, then use "Sign in with passkey". The passkey demo proxies `/webauthn/*` to authbroker so the browser sees a single WebAuthn origin, `http://localhost:8091`; that origin is listed in the compose `webauthn.origins`.
 
+## App Tokens
+
+Users who sign in directly at <http://localhost:8080/> can generate signed JWTs for configured applications and copy them from the page. Each app token profile has its own audience, client ID, TTL, scope, and group mapping. Tokens use the broker signing key and can be validated through the existing JWKS endpoint:
+
+```text
+http://localhost:8080/oauth2/jwks
+```
+
+Example config with two token profiles:
+
+```json
+"app_tokens": [
+  {
+    "id": "litellm",
+    "display_name": "LiteLLM",
+    "audience": "litellm",
+    "client_id": "litellm",
+    "scope": "openid profile email groups",
+    "token_ttl_minutes": 480,
+    "group_mappings": {
+      "OU=Demo,DC=example,DC=com": "{cn}",
+      "regex:(?i)^CN=app_gitlab_[^,]+,": "{cn}"
+    }
+  },
+  {
+    "id": "internal-api",
+    "display_name": "Internal API",
+    "audience": "internal-api",
+    "scope": "openid profile email",
+    "token_ttl_minutes": 120
+  }
+]
+```
+
+For LiteLLM, point JWT auth at the broker like this:
+
+```yaml
+general_settings:
+  enable_jwt_auth: true
+  litellm_jwtauth:
+    user_id_jwt_field: "sub"
+    user_email_jwt_field: "email"
+    team_ids_jwt_field: "groups"
+    user_id_upsert: true
+```
+
+```bash
+export JWT_PUBLIC_KEY_URL="http://localhost:8080/oauth2/jwks"
+export JWT_AUDIENCE="litellm"
+```
+
+App tokens include `sub`, `preferred_username`, `email`, `name`, `client_id`, `app_token_id`, `scope`, and mapped `groups` when the selected profile has `group_mappings` and the profile scope includes `groups`. LiteLLM's JWT auth docs are at <https://docs.litellm.ai/docs/proxy/token_auth>.
+
 ## Generate a persistent signing key
 
 By default the server generates an ephemeral RSA key on startup. For real use, generate a stable key:

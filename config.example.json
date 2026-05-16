@@ -37,6 +37,28 @@
     "origins": ["http://localhost:8080", "http://localhost:8091"]
   },
 
+  "app_tokens": [
+    {
+      "id": "litellm",
+      "display_name": "LiteLLM",
+      "audience": "litellm",
+      "client_id": "litellm",
+      "scope": "openid profile email groups",
+      "token_ttl_minutes": 480,
+      "group_mappings": {
+        "OU=Demo,DC=example,DC=com": "{cn}",
+        "regex:(?i)^CN=app_gitlab_[^,]+,": "{cn}"
+      }
+    },
+    {
+      "id": "internal-api",
+      "display_name": "Internal API",
+      "audience": "internal-api",
+      "scope": "openid profile email",
+      "token_ttl_minutes": 120
+    }
+  ],
+
   "clients": [
     {
       "client_id": "demo-web",

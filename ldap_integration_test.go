@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -414,6 +415,7 @@ func TestBrokerStandaloneLoginAndLogoutPages(t *testing.T) {
 		Subject: "johndoe",
 		Email:   "johndoe@example.com",
 		Name:    "John Doe",
+		Groups:  []string{"CN=demo_reports,OU=Demo,DC=example,DC=com", "CN=unmapped,OU=Other,DC=example,DC=com"},
 	}}
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -424,6 +426,16 @@ func TestBrokerStandaloneLoginAndLogoutPages(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "You are not signed in") {
 		t.Fatalf("home page did not show signed-out state: %s", rr.Body.String())
+	}
+
+	unauthTokenReq := httptest.NewRequest(http.MethodPost, "/app-tokens/litellm", nil)
+	unauthTokenRR := httptest.NewRecorder()
+	broker.routes().ServeHTTP(unauthTokenRR, unauthTokenReq)
+	if unauthTokenRR.Code != http.StatusFound {
+		t.Fatalf("expected unauthenticated app token status 302, got %d: %s", unauthTokenRR.Code, unauthTokenRR.Body.String())
+	}
+	if location := unauthTokenRR.Header().Get("Location"); location != "/login" {
+		t.Fatalf("unauthenticated app token Location = %q, want /login", location)
 	}
 
 	form := url.Values{
@@ -454,6 +466,58 @@ func TestBrokerStandaloneLoginAndLogoutPages(t *testing.T) {
 	}
 	if !strings.Contains(homeRR.Body.String(), "Signed in as <strong>johndoe</strong>") {
 		t.Fatalf("home page did not show signed-in state: %s", homeRR.Body.String())
+	}
+	if !strings.Contains(homeRR.Body.String(), "App tokens") || !strings.Contains(homeRR.Body.String(), "LiteLLM") || !strings.Contains(homeRR.Body.String(), "Internal API") {
+		t.Fatalf("home page did not show configured app token actions: %s", homeRR.Body.String())
+	}
+
+	tokenReq := httptest.NewRequest(http.MethodPost, "/app-tokens/litellm", nil)
+	tokenReq.AddCookie(sessionCookie)
+	tokenRR := httptest.NewRecorder()
+	broker.routes().ServeHTTP(tokenRR, tokenReq)
+	if tokenRR.Code != http.StatusOK {
+		t.Fatalf("expected app token status 200, got %d: %s", tokenRR.Code, tokenRR.Body.String())
+	}
+	if cacheControl := tokenRR.Header().Get("Cache-Control"); cacheControl != "no-store" {
+		t.Fatalf("app token Cache-Control = %q, want no-store", cacheControl)
+	}
+	token := appTokenFromHTML(t, tokenRR.Body.String())
+	claims, err := broker.verifyJWT(token)
+	if err != nil {
+		t.Fatalf("verify app token: %v", err)
+	}
+	assertStringClaim(t, claims, "sub", "johndoe")
+	assertStringClaim(t, claims, "aud", "litellm")
+	assertStringClaim(t, claims, "client_id", "litellm")
+	assertStringClaim(t, claims, "app_token_id", "litellm")
+	assertStringClaim(t, claims, "email", "johndoe@example.com")
+	assertStringClaim(t, claims, "name", "John Doe")
+	assertStringClaim(t, claims, "user_id", "johndoe")
+	if ttl := claimInt64(t, claims, "exp") - claimInt64(t, claims, "iat"); ttl != 480*60 {
+		t.Fatalf("app token ttl = %d seconds, want %d", ttl, 480*60)
+	}
+	groups := stringSliceClaim(claims["groups"])
+	if len(groups) != 1 || groups[0] != "demo_reports" {
+		t.Fatalf("app token groups = %#v, want [demo_reports]", groups)
+	}
+
+	apiTokenReq := httptest.NewRequest(http.MethodPost, "/app-tokens/internal-api", nil)
+	apiTokenReq.AddCookie(sessionCookie)
+	apiTokenRR := httptest.NewRecorder()
+	broker.routes().ServeHTTP(apiTokenRR, apiTokenReq)
+	if apiTokenRR.Code != http.StatusOK {
+		t.Fatalf("expected second app token status 200, got %d: %s", apiTokenRR.Code, apiTokenRR.Body.String())
+	}
+	apiToken := appTokenFromHTML(t, apiTokenRR.Body.String())
+	apiClaims, err := broker.verifyJWT(apiToken)
+	if err != nil {
+		t.Fatalf("verify second app token: %v", err)
+	}
+	assertStringClaim(t, apiClaims, "aud", "internal-api")
+	assertStringClaim(t, apiClaims, "client_id", "internal-api")
+	assertStringClaim(t, apiClaims, "app_token_id", "internal-api")
+	if groups := stringSliceClaim(apiClaims["groups"]); len(groups) != 0 {
+		t.Fatalf("second app token groups = %#v, want none", groups)
 	}
 
 	logoutPageReq := httptest.NewRequest(http.MethodGet, "/logout", nil)
@@ -765,6 +829,24 @@ func newLogoutTestBroker(t *testing.T) *Broker {
 		Listen:       ":0",
 		KeyID:        "logout-test-key",
 		CookieSecure: boolPtr(false),
+		AppTokens: []AppTokenConfig{
+			{
+				ID:              "litellm",
+				DisplayName:     "LiteLLM",
+				Audience:        "litellm",
+				ClientID:        "litellm",
+				Scope:           "openid profile email groups",
+				TokenTTLMinutes: 480,
+				GroupMappings: map[string]string{
+					"OU=Demo,DC=example,DC=com": "{cn}",
+				},
+			},
+			{
+				ID:              "internal-api",
+				DisplayName:     "Internal API",
+				TokenTTLMinutes: 120,
+			},
+		},
 		Clients: []Client{
 			{
 				ClientID:           "demo-web",
@@ -938,6 +1020,28 @@ func findCookie(rr *httptest.ResponseRecorder, name string) *http.Cookie {
 		}
 	}
 	return nil
+}
+
+var appTokenPattern = regexp.MustCompile(`<textarea[^>]*id="app-token-value"[^>]*>([^<]+)</textarea>`)
+
+func appTokenFromHTML(t *testing.T, body string) string {
+	t.Helper()
+
+	matches := appTokenPattern.FindStringSubmatch(body)
+	if len(matches) != 2 {
+		t.Fatalf("app token textarea not found in body: %s", body)
+	}
+	return strings.TrimSpace(matches[1])
+}
+
+func claimInt64(t *testing.T, claims map[string]any, name string) int64 {
+	t.Helper()
+
+	got, ok := numberClaim(claims[name])
+	if !ok {
+		t.Fatalf("claim %s = %#v, want number", name, claims[name])
+	}
+	return got
 }
 
 func stringSliceClaim(value any) []string {
