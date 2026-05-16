@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os/exec"
 	"path/filepath"
@@ -334,6 +335,79 @@ func TestClientSecretMatchesSHA256(t *testing.T) {
 	}
 }
 
+func TestDiscoveryAdvertisesEndSessionEndpoint(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/openid-configuration", nil)
+	rr := httptest.NewRecorder()
+	broker.handleDiscovery(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var discovery map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &discovery); err != nil {
+		t.Fatalf("decode discovery: %v", err)
+	}
+	assertStringClaim(t, discovery, "end_session_endpoint", "http://broker.example/oauth2/logout")
+}
+
+func TestBrokerLogoutClearsSessionAndRedirects(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	broker.mu.Lock()
+	broker.sessions["logout-session"] = Session{
+		UserID:    "johndoe",
+		ExpiresAt: time.Now().Add(time.Hour),
+		AuthTime:  time.Now(),
+	}
+	broker.mu.Unlock()
+
+	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid", "", time.Now(), false)
+	if err != nil {
+		t.Fatalf("issue tokens: %v", err)
+	}
+	idToken, _ := tokens["id_token"].(string)
+	if idToken == "" {
+		t.Fatalf("missing id token in %#v", tokens)
+	}
+	q := url.Values{
+		"id_token_hint":            {idToken},
+		"post_logout_redirect_uri": {"http://app.example/"},
+		"state":                    {"logout-state"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/logout?"+q.Encode(), nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "logout-session"})
+	rr := httptest.NewRecorder()
+	broker.handleLogout(rr, req)
+
+	if rr.Code != http.StatusFound {
+		t.Fatalf("expected status 302, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if location := rr.Header().Get("Location"); location != "http://app.example/?state=logout-state" {
+		t.Fatalf("Location = %q", location)
+	}
+	broker.mu.Lock()
+	_, stillActive := broker.sessions["logout-session"]
+	broker.mu.Unlock()
+	if stillActive {
+		t.Fatalf("broker session was not cleared")
+	}
+	assertDeletedCookie(t, rr, sessionCookieName)
+}
+
+func TestBrokerLogoutRejectsUnregisteredRedirect(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	q := url.Values{
+		"client_id":                {"demo-web"},
+		"post_logout_redirect_uri": {"http://evil.example/"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/logout?"+q.Encode(), nil)
+	rr := httptest.NewRecorder()
+	broker.handleLogout(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestLDAPBrokerOAuthIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Docker-backed LDAP integration test in short mode")
@@ -604,6 +678,39 @@ func codeFromRedirect(location string) (string, error) {
 	return code, nil
 }
 
+func newLogoutTestBroker(t *testing.T) *Broker {
+	t.Helper()
+
+	store, err := NewStore("")
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	cfg := Config{
+		Issuer:       "http://broker.example",
+		Listen:       ":0",
+		KeyID:        "logout-test-key",
+		CookieSecure: boolPtr(false),
+		Clients: []Client{
+			{
+				ClientID:           "demo-web",
+				ClientSecretSHA256: "cd577fe2561ebff23505db0bb006300c7cdecbd46bc0e03c449afafaca2c25bf",
+				RedirectURIs: []string{
+					"http://app.example/callback",
+				},
+				PostLogoutRedirectURIs: []string{
+					"http://app.example/",
+				},
+				RequirePKCE: true,
+			},
+		},
+	}
+	broker, err := NewBroker(cfg, store)
+	if err != nil {
+		t.Fatalf("create broker: %v", err)
+	}
+	return broker
+}
+
 func startTestBroker(ctx context.Context, t *testing.T, ldapCfg LDAPConfig) (string, *Broker, *http.Client, func()) {
 	t.Helper()
 
@@ -628,6 +735,9 @@ func startTestBroker(ctx context.Context, t *testing.T, ldapCfg LDAPConfig) (str
 				ClientSecretSHA256: "cd577fe2561ebff23505db0bb006300c7cdecbd46bc0e03c449afafaca2c25bf",
 				RedirectURIs: []string{
 					baseURL + "/callback",
+				},
+				PostLogoutRedirectURIs: []string{
+					baseURL + "/",
 				},
 				RequirePKCE: true,
 				GroupMappings: map[string]string{
@@ -721,6 +831,17 @@ func assertStringSlicesEqual(t *testing.T, got, want []string) {
 			t.Fatalf("got %#v, want %#v", got, want)
 		}
 	}
+}
+
+func assertDeletedCookie(t *testing.T, rr *httptest.ResponseRecorder, name string) {
+	t.Helper()
+
+	for _, cookie := range rr.Result().Cookies() {
+		if cookie.Name == name && cookie.MaxAge < 0 {
+			return
+		}
+	}
+	t.Fatalf("response did not delete cookie %q; cookies=%#v", name, rr.Result().Cookies())
 }
 
 func stringSliceClaim(value any) []string {

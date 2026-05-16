@@ -86,12 +86,13 @@ type LDAPConfig struct {
 }
 
 type Client struct {
-	ClientID           string            `json:"client_id"`
-	ClientSecretSHA256 string            `json:"client_secret_sha256,omitempty"`
-	RedirectURIs       []string          `json:"redirect_uris"`
-	Public             bool              `json:"public"`
-	RequirePKCE        bool              `json:"require_pkce"`
-	GroupMappings      map[string]string `json:"group_mappings,omitempty"`
+	ClientID               string            `json:"client_id"`
+	ClientSecretSHA256     string            `json:"client_secret_sha256,omitempty"`
+	RedirectURIs           []string          `json:"redirect_uris"`
+	PostLogoutRedirectURIs []string          `json:"post_logout_redirect_uris,omitempty"`
+	Public                 bool              `json:"public"`
+	RequirePKCE            bool              `json:"require_pkce"`
+	GroupMappings          map[string]string `json:"group_mappings,omitempty"`
 }
 
 type MFAConfig struct {
@@ -1010,6 +1011,8 @@ func (b *Broker) routes() http.Handler {
 	mux.HandleFunc("POST /oauth2/token", b.handleToken)
 	mux.HandleFunc("GET /oauth2/userinfo", b.handleUserInfo)
 	mux.HandleFunc("POST /oauth2/revoke", b.handleRevoke)
+	mux.HandleFunc("GET /oauth2/logout", b.handleLogout)
+	mux.HandleFunc("POST /oauth2/logout", b.handleLogout)
 	mux.HandleFunc("POST /mfa/totp/enroll", b.handleTOTPEnroll)
 	mux.HandleFunc("POST /webauthn/register/begin", b.handleWebAuthnRegisterBegin)
 	mux.HandleFunc("POST /webauthn/register/finish", b.handleWebAuthnRegisterFinish)
@@ -1041,6 +1044,7 @@ func (b *Broker) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 		"userinfo_endpoint":                     issuer + "/oauth2/userinfo",
 		"jwks_uri":                              issuer + "/oauth2/jwks",
 		"revocation_endpoint":                   issuer + "/oauth2/revoke",
+		"end_session_endpoint":                  issuer + "/oauth2/logout",
 		"response_types_supported":              []string{"code"},
 		"grant_types_supported":                 []string{"authorization_code", "refresh_token", "client_credentials"},
 		"subject_types_supported":               []string{"public"},
@@ -1178,6 +1182,89 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	b.issueCodeRedirect(w, ar, sess)
 }
 
+func (b *Broker) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "bad form", http.StatusBadRequest)
+			return
+		}
+	}
+
+	idTokenHint := strings.TrimSpace(logoutParam(r, "id_token_hint"))
+	clientID := strings.TrimSpace(logoutParam(r, "client_id"))
+	if idTokenHint != "" {
+		hintClientID, err := b.logoutClientIDFromIDTokenHint(idTokenHint)
+		if err != nil && clientID == "" {
+			http.Error(w, "invalid id_token_hint", http.StatusBadRequest)
+			return
+		}
+		if err == nil && hintClientID != "" {
+			if clientID != "" && clientID != hintClientID {
+				http.Error(w, "client_id does not match id_token_hint", http.StatusBadRequest)
+				return
+			}
+			clientID = hintClientID
+		}
+	}
+
+	postLogoutRedirectURI := strings.TrimSpace(logoutParam(r, "post_logout_redirect_uri"))
+	state := logoutParam(r, "state")
+	if postLogoutRedirectURI != "" {
+		client, ok := b.clients[clientID]
+		if !ok || !clientAllowsPostLogoutRedirect(client, postLogoutRedirectURI) {
+			http.Error(w, "invalid post_logout_redirect_uri", http.StatusBadRequest)
+			return
+		}
+		b.clearSession(w, r)
+		u, err := url.Parse(postLogoutRedirectURI)
+		if err != nil {
+			http.Error(w, "invalid post_logout_redirect_uri", http.StatusBadRequest)
+			return
+		}
+		if state != "" {
+			q := u.Query()
+			q.Set("state", state)
+			u.RawQuery = q.Encode()
+		}
+		http.Redirect(w, r, u.String(), http.StatusFound)
+		return
+	}
+
+	b.clearSession(w, r)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("logged out\n"))
+}
+
+func logoutParam(r *http.Request, name string) string {
+	if r.Method == http.MethodPost {
+		return r.Form.Get(name)
+	}
+	return r.URL.Query().Get(name)
+}
+
+func (b *Broker) logoutClientIDFromIDTokenHint(idTokenHint string) (string, error) {
+	claims, err := b.verifyJWT(idTokenHint)
+	if err != nil {
+		return "", err
+	}
+	return clientIDFromTokenClaims(claims), nil
+}
+
+func clientIDFromTokenClaims(claims map[string]any) string {
+	if clientID, _ := claims["client_id"].(string); clientID != "" {
+		return clientID
+	}
+	if aud, _ := claims["aud"].(string); aud != "" {
+		return aud
+	}
+	if audList, ok := claims["aud"].([]any); ok && len(audList) == 1 {
+		clientID, _ := audList[0].(string)
+		return clientID
+	}
+	return ""
+}
+
 func (b *Broker) putAuthRequest(ar AuthorizationRequest) {
 	b.mu.Lock()
 	b.authRequests[ar.ID] = ar
@@ -1201,6 +1288,27 @@ func (b *Broker) validSession(r *http.Request) (Session, bool) {
 		return Session{}, false
 	}
 	return s, true
+}
+
+func (b *Broker) clearSession(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
+		b.mu.Lock()
+		delete(b.sessions, c.Value)
+		b.mu.Unlock()
+	}
+	secure := strings.HasPrefix(b.cfg.Issuer, "https://")
+	if b.cfg.CookieSecure != nil {
+		secure = *b.cfg.CookieSecure
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
 }
 
 func (b *Broker) createSession(w http.ResponseWriter, userID string) Session {
@@ -2263,6 +2371,15 @@ func verifyPKCE(expectedChallenge, method, verifier string) bool {
 
 func clientAllowsRedirect(c Client, redirectURI string) bool {
 	for _, allowed := range c.RedirectURIs {
+		if redirectURI == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func clientAllowsPostLogoutRedirect(c Client, redirectURI string) bool {
+	for _, allowed := range c.PostLogoutRedirectURIs {
 		if redirectURI == allowed {
 			return true
 		}

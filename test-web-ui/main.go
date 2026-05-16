@@ -46,6 +46,7 @@ type profile struct {
 	Email             string
 	Name              string
 	Groups            []string
+	IDToken           string
 }
 
 type tokenResponse struct {
@@ -168,6 +169,7 @@ func (a *app) handleCallback(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		p = profileFromClaims(idClaims)
 	}
+	p.IDToken = tokens.IDToken
 	sessionID := randomB64(32)
 	a.mu.Lock()
 	a.sessions[sessionID] = p
@@ -184,6 +186,7 @@ func (a *app) handleCallback(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) handleLogout(w http.ResponseWriter, r *http.Request) {
+	p, _ := a.currentProfile(r)
 	cookie, err := r.Cookie(sessionCookieName)
 	if err == nil {
 		a.mu.Lock()
@@ -198,7 +201,15 @@ func (a *app) handleLogout(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
-	http.Redirect(w, r, "/", http.StatusFound)
+	q := url.Values{
+		"client_id":                {a.clientID},
+		"post_logout_redirect_uri": {a.publicBaseURL + "/"},
+		"state":                    {randomB64(16)},
+	}
+	if p.IDToken != "" {
+		q.Set("id_token_hint", p.IDToken)
+	}
+	http.Redirect(w, r, a.brokerPublicURL+"/oauth2/logout?"+q.Encode(), http.StatusFound)
 }
 
 func (a *app) exchangeCode(ctx context.Context, code string, attempt loginAttempt) (tokenResponse, error) {

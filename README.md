@@ -55,7 +55,7 @@ johndoe / dogood
 serviceuser / mysecret
 ```
 
-The compose broker config lives in `compose/authbroker.config.json`. The test UI uses `http://localhost:8080` for browser redirects and `http://authbroker:8080` for server-side token and UserInfo calls inside the Docker network, then displays the LDAP-backed profile and client-mapped groups.
+The compose broker config lives in `compose/authbroker.config.json`. The test UI uses `http://localhost:8080` for browser redirects and `http://authbroker:8080` for server-side token and UserInfo calls inside the Docker network, then displays the LDAP-backed profile and client-mapped groups. Sign out uses the broker's OIDC `end_session_endpoint`, so it clears both the demo app session and the central authbroker SSO session.
 In the GLAUTH fixture, `johndoe` also has a Demo OU-style group membership, `CN=demo_reports,OU=Demo,DC=glauth,DC=com`, which the compose client maps to `demo_reports`.
 
 ## Generate a persistent signing key
@@ -111,6 +111,16 @@ printf '%s' 'demo-secret' | sha256sum
 
 Use the resulting first field as `client_secret_sha256`. The client still sends the original secret (`demo-secret`) to `/oauth2/token`; the broker hashes it and compares it with the configured digest.
 
+## Logout
+
+The broker advertises an OIDC/Keycloak-style `end_session_endpoint` in discovery:
+
+```text
+http://localhost:8080/oauth2/logout
+```
+
+Clients should clear their own local session first, then redirect the browser to that endpoint with `id_token_hint`, `client_id`, `post_logout_redirect_uri`, and optional `state`. The broker clears the `broker_session` SSO cookie and redirects only to a URI registered in the client's `post_logout_redirect_uris`.
+
 Groups are also configured per client. LDAP/AD may return a large `memberOf` list, but the broker only emits groups that the client maps:
 
 ```json
@@ -118,6 +128,7 @@ Groups are also configured per client. LDAP/AD may return a large `memberOf` lis
   "client_id": "demo-web",
   "client_secret_sha256": "cd577fe2561ebff23505db0bb006300c7cdecbd46bc0e03c449afafaca2c25bf",
   "redirect_uris": ["http://localhost:3000/callback"],
+  "post_logout_redirect_uris": ["http://localhost:3000/"],
   "require_pkce": true,
   "group_mappings": {
     "CN=Demo App Admins,OU=Groups,DC=example,DC=com": "demo-admin",

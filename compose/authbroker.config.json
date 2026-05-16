@@ -37,6 +37,7 @@
       "client_id": "test-web-ui",
       "client_secret_sha256": "90ec7f3296397f5e77371162618cb79734bebd6bffe66d90d739383796a09f5b",
       "redirect_uris": ["http://localhost:8090/callback"],
+      "post_logout_redirect_uris": ["http://localhost:8090/"],
       "public": false,
       "require_pkce": true,
       "group_mappings": {
