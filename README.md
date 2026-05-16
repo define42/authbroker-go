@@ -1,7 +1,6 @@
 # Go authentication broker: OAuth2/OIDC + LDAP/AD + JWT/JWKS + PKCE + TOTP + WebAuthn
 
 [![codecov](https://codecov.io/gh/define42/authbroker-go/graph/badge.svg?token=0M6XMNZDTR)](https://codecov.io/gh/define42/authbroker-go)
-
 [![Go Report Card](https://goreportcard.com/badge/github.com/define42/authbroker-go)](https://goreportcard.com/report/github.com/define42/authbroker-go)
 [![Build Status](https://github.com/define42/authbroker-go/actions/workflows/test.yml/badge.svg)](https://github.com/define42/authbroker-go/actions/)
 
