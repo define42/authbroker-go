@@ -239,6 +239,42 @@ func TestMappedClientGroupsCNWildcardSource(t *testing.T) {
 	assertStringSlicesEqual(t, got, want)
 }
 
+func TestMappedClientGroupsRegexSource(t *testing.T) {
+	client := Client{GroupMappings: map[string]string{
+		"regex:(?i)^CN=app_gitlab_[^,]+,": "{cn}",
+	}}
+	groupMappings, err := normalizeClientGroupMappings(client.GroupMappings)
+	if err != nil {
+		t.Fatalf("normalizeClientGroupMappings(): %v", err)
+	}
+	client.GroupMappings = groupMappings
+
+	got := mappedClientGroups(client, []string{
+		"CN=app_gitlab_admins,OU=GitLab,DC=example,DC=com",
+		"cn=app_gitlab_users,OU=Engineering,DC=example,DC=com",
+		"CN=app_elk_team10_ingest,OU=Logging,DC=example,DC=com",
+	})
+	want := []string{"app_gitlab_admins", "app_gitlab_users"}
+	assertStringSlicesEqual(t, got, want)
+}
+
+func TestMappedClientGroupsRegexCaptures(t *testing.T) {
+	client := Client{GroupMappings: map[string]string{
+		"regex:(?i)^CN=app_gitlab_(?P<role>[^,]+),": "gitlab-{role}",
+	}}
+	groupMappings, err := normalizeClientGroupMappings(client.GroupMappings)
+	if err != nil {
+		t.Fatalf("normalizeClientGroupMappings(): %v", err)
+	}
+	client.GroupMappings = groupMappings
+
+	got := mappedClientGroups(client, []string{
+		"CN=app_gitlab_admins,OU=Any,DC=example,DC=com",
+	})
+	want := []string{"gitlab-admins"}
+	assertStringSlicesEqual(t, got, want)
+}
+
 func TestNormalizeClientGroupMappingsValidation(t *testing.T) {
 	if _, err := normalizeClientGroupMappings(map[string]string{"": "app-user"}); err == nil {
 		t.Fatalf("blank group mapping source should fail")
@@ -262,6 +298,11 @@ func TestNormalizeClientGroupMappingsValidation(t *testing.T) {
 		"CN=*,OU=Demo,DC=example,DC=com": "demo-{cn}",
 	}); err == nil {
 		t.Fatalf("duplicate scoped group mapping source should fail")
+	}
+	if _, err := normalizeClientGroupMappings(map[string]string{
+		"regex:*": "{cn}",
+	}); err == nil {
+		t.Fatalf("invalid regex source should fail")
 	}
 }
 

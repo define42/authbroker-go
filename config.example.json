@@ -46,7 +46,8 @@
       "require_pkce": true,
       "group_mappings": {
         "CN=Demo App Admins,OU=Groups,DC=example,DC=com": "demo-admin",
-        "OU=Demo,DC=example,DC=com": "{cn}"
+        "OU=Demo,DC=example,DC=com": "{cn}",
+        "regex:(?i)^CN=app_gitlab_[^,]+,": "{cn}"
       }
     },
     {

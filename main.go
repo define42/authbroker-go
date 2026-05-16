@@ -32,6 +32,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -564,6 +565,12 @@ type scopedGroupMapping struct {
 	BaseDN *ldap.DN
 }
 
+type regexGroupMapping struct {
+	Source  string
+	Target  string
+	Pattern *regexp.Regexp
+}
+
 func normalizeClientGroupMappings(in map[string]string) (map[string]string, error) {
 	if len(in) == 0 {
 		return nil, nil
@@ -571,6 +578,7 @@ func normalizeClientGroupMappings(in map[string]string) (map[string]string, erro
 	out := map[string]string{}
 	seenSources := map[string]string{}
 	seenScoped := map[string]string{}
+	seenRegex := map[string]string{}
 	for source, target := range in {
 		source = strings.TrimSpace(source)
 		target = strings.TrimSpace(target)
@@ -579,6 +587,17 @@ func normalizeClientGroupMappings(in map[string]string) (map[string]string, erro
 		}
 		if target == "" {
 			return nil, fmt.Errorf("group_mappings target for %q cannot be blank", source)
+		}
+		if regexMapping, ok, err := parseRegexGroupMapping(source, target); err != nil {
+			return nil, err
+		} else if ok {
+			sourceKey := strings.ToLower(regexMapping.Source)
+			if existing, ok := seenRegex[sourceKey]; ok && existing != target {
+				return nil, fmt.Errorf("group_mappings has duplicate regex source %q with different targets", regexMapping.Source)
+			}
+			seenRegex[sourceKey] = target
+			out[regexMapping.Source] = target
+			continue
 		}
 		if scoped, ok, err := parseScopedGroupMapping(source, target); err != nil {
 			return nil, err
@@ -611,7 +630,12 @@ func mappedClientGroups(client Client, userGroups []string) []string {
 	}
 	mappings := map[string]string{}
 	scopedMappings := []scopedGroupMapping{}
+	regexMappings := []regexGroupMapping{}
 	for source, target := range client.GroupMappings {
+		if regexMapping, ok, err := parseRegexGroupMapping(source, target); err == nil && ok {
+			regexMappings = append(regexMappings, regexMapping)
+			continue
+		}
 		if scoped, ok, err := parseScopedGroupMapping(source, target); err == nil && ok {
 			scopedMappings = append(scopedMappings, scoped)
 			continue
@@ -645,9 +669,43 @@ func mappedClientGroups(client Client, userGroups []string) []string {
 			seen[mapped] = true
 			groups = append(groups, mapped)
 		}
+		for _, regexMapping := range regexMappings {
+			matches := regexMapping.Pattern.FindStringSubmatch(group)
+			if matches == nil {
+				continue
+			}
+			mapped := renderRegexGroupMappingTarget(regexMapping, groupName, group, matches)
+			if mapped == "" || seen[mapped] {
+				continue
+			}
+			seen[mapped] = true
+			groups = append(groups, mapped)
+		}
 	}
 	sort.Strings(groups)
 	return groups
+}
+
+func parseRegexGroupMapping(source, target string) (regexGroupMapping, bool, error) {
+	source = strings.TrimSpace(source)
+	target = strings.TrimSpace(target)
+	prefix := "regex:"
+	if !strings.HasPrefix(strings.ToLower(source), prefix) {
+		return regexGroupMapping{}, false, nil
+	}
+	pattern := strings.TrimSpace(source[len(prefix):])
+	if pattern == "" {
+		return regexGroupMapping{}, false, fmt.Errorf("regex group_mappings source cannot be blank")
+	}
+	compiled, err := regexp.Compile(pattern)
+	if err != nil {
+		return regexGroupMapping{}, false, fmt.Errorf("invalid regex group_mappings source %q: %w", source, err)
+	}
+	return regexGroupMapping{
+		Source:  prefix + pattern,
+		Target:  target,
+		Pattern: compiled,
+	}, true, nil
 }
 
 func parseScopedGroupMapping(source, target string) (scopedGroupMapping, bool, error) {
@@ -735,6 +793,27 @@ func renderGroupMappingTarget(target, groupName, groupDN string) string {
 		"{dn}", strings.TrimSpace(groupDN),
 	)
 	return strings.TrimSpace(replacer.Replace(target))
+}
+
+func renderRegexGroupMappingTarget(mapping regexGroupMapping, groupName, groupDN string, matches []string) string {
+	mapped := renderGroupMappingTarget(mapping.Target, groupName, groupDN)
+	replacements := []string{}
+	if len(matches) > 0 {
+		replacements = append(replacements, "{match}", matches[0], "{0}", matches[0])
+	}
+	for i := 1; i < len(matches); i++ {
+		replacements = append(replacements, fmt.Sprintf("{%d}", i), matches[i])
+	}
+	names := mapping.Pattern.SubexpNames()
+	for i := 1; i < len(matches) && i < len(names); i++ {
+		if names[i] != "" {
+			replacements = append(replacements, "{"+names[i]+"}", matches[i])
+		}
+	}
+	if len(replacements) > 0 {
+		mapped = strings.NewReplacer(replacements...).Replace(mapped)
+	}
+	return strings.TrimSpace(mapped)
 }
 
 func scopeIncludes(scope, wanted string) bool {

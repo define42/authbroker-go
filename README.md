@@ -121,12 +121,13 @@ Groups are also configured per client. LDAP/AD may return a large `memberOf` lis
   "require_pkce": true,
   "group_mappings": {
     "CN=Demo App Admins,OU=Groups,DC=example,DC=com": "demo-admin",
-    "OU=Demo,DC=example,DC=com": "{cn}"
+    "OU=Demo,DC=example,DC=com": "{cn}",
+    "regex:(?i)^CN=app_gitlab_[^,]+,": "{cn}"
   }
 }
 ```
 
-Mapping keys can be raw LDAP DNs or normalized group names. A mapping whose key is a base DN and whose value contains `{cn}` forwards every group with a `CN` below that base, so `"OU=Demo,DC=example,DC=com": "{cn}"` forwards `CN=Reports,OU=Demo,DC=example,DC=com` as `Reports`. The wildcard spelling `"CN=*,OU=Demo,DC=example,DC=com": "{cn}"` is also accepted. Only mapped groups are included in access tokens, ID tokens, and UserInfo, and only when the authorization request includes the `groups` scope.
+Mapping keys can be raw LDAP DNs or normalized group names. A mapping whose key is a base DN and whose value contains `{cn}` forwards every group with a `CN` below that base, so `"OU=Demo,DC=example,DC=com": "{cn}"` forwards `CN=Reports,OU=Demo,DC=example,DC=com` as `Reports`. The wildcard spelling `"CN=*,OU=Demo,DC=example,DC=com": "{cn}"` is also accepted. Regex mappings use the `regex:` prefix and run against the raw LDAP group value, so `"regex:(?i)^CN=app_gitlab_[^,]+,": "{cn}"` forwards `CN=app_gitlab_admins,OU=Any,DC=example,DC=com` as `app_gitlab_admins`, regardless of OU. Regex targets may use `{match}`, `{0}`, numeric captures like `{1}`, named captures like `{role}`, and the normal `{cn}`, `{group}`, and `{dn}` placeholders. Only mapped groups are included in access tokens, ID tokens, and UserInfo, and only when the authorization request includes the `groups` scope.
 
 ## LDAP/AD backend
 
