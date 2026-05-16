@@ -34,7 +34,7 @@ The same paths can be supplied through environment variables:
 AUTHBROKER_CONFIG=config.example.json AUTHBROKER_DATA=data go run .
 ```
 
-`AUTHBROKER_DATA` points at a data directory. The broker stores user/MFA/WebAuthn data in `data.json` and managed signing keys in `signing-keys.json` inside that directory.
+`AUTHBROKER_DATA` points at a data directory. The broker stores users, MFA secrets, WebAuthn credentials, sessions, OAuth authorization state, refresh tokens, and revoked token IDs in `data.json` with atomic file replacement. Managed signing keys live in `signing-keys.json` inside the same directory.
 
 Open the OIDC discovery document:
 
@@ -367,7 +367,7 @@ await fetch('/webauthn/login/finish', {
 Before production, the remaining hardening work is:
 
 - TLS-only deployment behind a trusted ingress/proxy
-- durable transactional storage for sessions, authorization codes, refresh tokens, revoked token IDs, users, MFA secrets, and WebAuthn credentials; the current broker uses in-memory runtime maps plus a single JSON user store
+- database-backed storage for multi-instance deployments and higher write volume
 - encrypted secret storage for signing keys, TLS trust material, and deployment secrets
 - operational key rotation policy review for each deployment
 - consent screens, client administration, and app-token profile administration

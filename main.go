@@ -156,7 +156,12 @@ type WebAuthnCredential struct {
 }
 
 type PersistentData struct {
-	Users map[string]*StoredUser `json:"users"`
+	Users         map[string]*StoredUser          `json:"users"`
+	Sessions      map[string]Session              `json:"sessions,omitempty"`
+	AuthRequests  map[string]AuthorizationRequest `json:"auth_requests,omitempty"`
+	AuthCodes     map[string]AuthCode             `json:"authorization_codes,omitempty"`
+	RefreshTokens map[string]RefreshToken         `json:"refresh_tokens,omitempty"`
+	RevokedJTIs   map[string]time.Time            `json:"revoked_jtis,omitempty"`
 }
 
 type Store struct {
@@ -165,8 +170,16 @@ type Store struct {
 	data PersistentData
 }
 
+type StoredRuntimeState struct {
+	Sessions      map[string]Session
+	AuthRequests  map[string]AuthorizationRequest
+	AuthCodes     map[string]AuthCode
+	RefreshTokens map[string]RefreshToken
+	RevokedJTIs   map[string]time.Time
+}
+
 func NewStore(path string) (*Store, error) {
-	s := &Store{path: path, data: PersistentData{Users: map[string]*StoredUser{}}}
+	s := &Store{path: path, data: newPersistentData()}
 	if path == "" {
 		return s, nil
 	}
@@ -183,19 +196,53 @@ func NewStore(path string) (*Store, error) {
 	if err := json.Unmarshal(b, &s.data); err != nil {
 		return nil, err
 	}
-	if s.data.Users == nil {
-		s.data.Users = map[string]*StoredUser{}
-	}
+	s.ensureMaps()
 	return s, nil
 }
 
+func newPersistentData() PersistentData {
+	return PersistentData{
+		Users:         map[string]*StoredUser{},
+		Sessions:      map[string]Session{},
+		AuthRequests:  map[string]AuthorizationRequest{},
+		AuthCodes:     map[string]AuthCode{},
+		RefreshTokens: map[string]RefreshToken{},
+		RevokedJTIs:   map[string]time.Time{},
+	}
+}
+
+func (s *Store) ensureMaps() {
+	if s.data.Users == nil {
+		s.data.Users = map[string]*StoredUser{}
+	}
+	if s.data.Sessions == nil {
+		s.data.Sessions = map[string]Session{}
+	}
+	if s.data.AuthRequests == nil {
+		s.data.AuthRequests = map[string]AuthorizationRequest{}
+	}
+	if s.data.AuthCodes == nil {
+		s.data.AuthCodes = map[string]AuthCode{}
+	}
+	if s.data.RefreshTokens == nil {
+		s.data.RefreshTokens = map[string]RefreshToken{}
+	}
+	if s.data.RevokedJTIs == nil {
+		s.data.RevokedJTIs = map[string]time.Time{}
+	}
+}
+
 func (s *Store) Save() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveLocked()
+}
+
+func (s *Store) saveLocked() error {
 	if s.path == "" {
 		return nil
 	}
-	s.mu.RLock()
 	b, err := json.MarshalIndent(s.data, "", "  ")
-	s.mu.RUnlock()
 	if err != nil {
 		return err
 	}
@@ -211,6 +258,7 @@ func (s *Store) Save() error {
 
 func (s *Store) UpsertProfile(p UserProfile) (*StoredUser, error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	u := s.data.Users[p.Subject]
 	if u == nil {
 		u = &StoredUser{Username: p.Subject}
@@ -226,8 +274,7 @@ func (s *Store) UpsertProfile(p UserProfile) (*StoredUser, error) {
 		u.Groups = append([]string(nil), p.Groups...)
 	}
 	out := cloneStoredUser(u)
-	s.mu.Unlock()
-	return out, s.Save()
+	return out, s.saveLocked()
 }
 
 func (s *Store) GetUser(username string) (*StoredUser, bool) {
@@ -242,18 +289,19 @@ func (s *Store) GetUser(username string) (*StoredUser, bool) {
 
 func (s *Store) SetTOTP(username, secret string) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	u := s.data.Users[username]
 	if u == nil {
 		u = &StoredUser{Username: username}
 		s.data.Users[username] = u
 	}
 	u.TOTPSecretBase32 = secret
-	s.mu.Unlock()
-	return s.Save()
+	return s.saveLocked()
 }
 
 func (s *Store) AddWebAuthnCredential(username string, cred WebAuthnCredential) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	u := s.data.Users[username]
 	if u == nil {
 		u = &StoredUser{Username: username}
@@ -261,31 +309,50 @@ func (s *Store) AddWebAuthnCredential(username string, cred WebAuthnCredential) 
 	}
 	for _, existing := range u.WebAuthnCredentials {
 		if existing.IDBase64URL == cred.IDBase64URL {
-			s.mu.Unlock()
 			return fmt.Errorf("credential already registered")
 		}
 	}
 	u.WebAuthnCredentials = append(u.WebAuthnCredentials, cred)
-	s.mu.Unlock()
-	return s.Save()
+	return s.saveLocked()
 }
 
 func (s *Store) UpdateWebAuthnSignCount(username, credID string, signCount uint32) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	u := s.data.Users[username]
 	if u == nil {
-		s.mu.Unlock()
 		return fmt.Errorf("user not found")
 	}
 	for i := range u.WebAuthnCredentials {
 		if u.WebAuthnCredentials[i].IDBase64URL == credID {
 			u.WebAuthnCredentials[i].SignCount = signCount
-			s.mu.Unlock()
-			return s.Save()
+			return s.saveLocked()
 		}
 	}
-	s.mu.Unlock()
 	return fmt.Errorf("credential not found")
+}
+
+func (s *Store) RuntimeState() StoredRuntimeState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return StoredRuntimeState{
+		Sessions:      cloneSessionMap(s.data.Sessions),
+		AuthRequests:  cloneAuthorizationRequestMap(s.data.AuthRequests),
+		AuthCodes:     cloneAuthCodeMap(s.data.AuthCodes),
+		RefreshTokens: cloneRefreshTokenMap(s.data.RefreshTokens),
+		RevokedJTIs:   cloneRevokedJTIMap(s.data.RevokedJTIs),
+	}
+}
+
+func (s *Store) ReplaceRuntimeState(state StoredRuntimeState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data.Sessions = cloneSessionMap(state.Sessions)
+	s.data.AuthRequests = cloneAuthorizationRequestMap(state.AuthRequests)
+	s.data.AuthCodes = cloneAuthCodeMap(state.AuthCodes)
+	s.data.RefreshTokens = cloneRefreshTokenMap(state.RefreshTokens)
+	s.data.RevokedJTIs = cloneRevokedJTIMap(state.RevokedJTIs)
+	return s.saveLocked()
 }
 
 func cloneStoredUser(u *StoredUser) *StoredUser {
@@ -300,6 +367,46 @@ func cloneStoredUser(u *StoredUser) *StoredUser {
 		c.WebAuthnCredentials = append([]WebAuthnCredential(nil), u.WebAuthnCredentials...)
 	}
 	return &c
+}
+
+func cloneSessionMap(in map[string]Session) map[string]Session {
+	out := make(map[string]Session, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneAuthorizationRequestMap(in map[string]AuthorizationRequest) map[string]AuthorizationRequest {
+	out := make(map[string]AuthorizationRequest, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneAuthCodeMap(in map[string]AuthCode) map[string]AuthCode {
+	out := make(map[string]AuthCode, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneRefreshTokenMap(in map[string]RefreshToken) map[string]RefreshToken {
+	out := make(map[string]RefreshToken, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneRevokedJTIMap(in map[string]time.Time) map[string]time.Time {
+	out := make(map[string]time.Time, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 type UserProfile struct {
@@ -904,14 +1011,7 @@ type signingKey struct {
 }
 
 func buildSigningKeySet(cfg Config) (signingKey, map[string]*rsa.PublicKey, []any, error) {
-	keyConfigs := cfg.SigningKeys
-	if len(keyConfigs) == 0 && strings.TrimSpace(cfg.SigningKeyPEM) != "" {
-		keyConfigs = []SigningKeyConfig{{
-			KeyID:         cfg.KeyID,
-			SigningKeyPEM: cfg.SigningKeyPEM,
-			Active:        true,
-		}}
-	}
+	keyConfigs := effectiveSigningKeyConfigs(cfg)
 	if len(keyConfigs) == 0 {
 		return signingKey{}, nil, nil, nil
 	}
@@ -920,36 +1020,18 @@ func buildSigningKeySet(cfg Config) (signingKey, map[string]*rsa.PublicKey, []an
 	publicJWKs := make([]any, 0, len(keyConfigs))
 	var active signingKey
 	activeCount := 0
-	activeFlags := 0
-	for _, keyCfg := range keyConfigs {
-		if keyCfg.Active {
-			activeFlags++
-		}
-	}
+	activeFlags := countActiveSigningKeyConfigs(keyConfigs)
 	for i, keyCfg := range keyConfigs {
-		keyID := strings.TrimSpace(keyCfg.KeyID)
-		if keyID == "" {
-			return signingKey{}, nil, nil, fmt.Errorf("signing_keys[%d].key_id is required", i)
+		keyID, key, publicJWK, err := parseSigningKeyConfig(keyCfg, i)
+		if err != nil {
+			return signingKey{}, nil, nil, err
 		}
 		if _, exists := verifyKeys[keyID]; exists {
 			return signingKey{}, nil, nil, fmt.Errorf("duplicate signing key id %q", keyID)
 		}
-		keyPEM := strings.TrimSpace(keyCfg.SigningKeyPEM)
-		if keyPEM == "" {
-			return signingKey{}, nil, nil, fmt.Errorf("signing key %q: signing_key_pem is required", keyID)
-		}
-		key, err := parseRSAPrivateKeyPEM([]byte(keyPEM))
-		if err != nil {
-			return signingKey{}, nil, nil, fmt.Errorf("parse signing key %q: %w", keyID, err)
-		}
 		verifyKeys[keyID] = &key.PublicKey
-		publicJWK := makePublicJWK(keyID, &key.PublicKey)
 		publicJWKs = append(publicJWKs, publicJWK)
-		isActive := keyCfg.Active
-		if activeFlags == 0 {
-			isActive = len(keyConfigs) == 1 || (cfg.KeyID != "" && keyID == cfg.KeyID)
-		}
-		if isActive {
+		if signingKeyConfigIsActive(keyCfg, activeFlags, len(keyConfigs), cfg.KeyID, keyID) {
 			activeCount++
 			active = signingKey{keyID: keyID, privateKey: key, publicJWK: publicJWK}
 		}
@@ -958,6 +1040,50 @@ func buildSigningKeySet(cfg Config) (signingKey, map[string]*rsa.PublicKey, []an
 		return signingKey{}, nil, nil, fmt.Errorf("exactly one signing key must be active")
 	}
 	return active, verifyKeys, publicJWKs, nil
+}
+
+func effectiveSigningKeyConfigs(cfg Config) []SigningKeyConfig {
+	if len(cfg.SigningKeys) > 0 || strings.TrimSpace(cfg.SigningKeyPEM) == "" {
+		return cfg.SigningKeys
+	}
+	return []SigningKeyConfig{{
+		KeyID:         cfg.KeyID,
+		SigningKeyPEM: cfg.SigningKeyPEM,
+		Active:        true,
+	}}
+}
+
+func countActiveSigningKeyConfigs(keyConfigs []SigningKeyConfig) int {
+	count := 0
+	for _, keyCfg := range keyConfigs {
+		if keyCfg.Active {
+			count++
+		}
+	}
+	return count
+}
+
+func parseSigningKeyConfig(keyCfg SigningKeyConfig, index int) (string, *rsa.PrivateKey, map[string]any, error) {
+	keyID := strings.TrimSpace(keyCfg.KeyID)
+	if keyID == "" {
+		return "", nil, nil, fmt.Errorf("signing_keys[%d].key_id is required", index)
+	}
+	keyPEM := strings.TrimSpace(keyCfg.SigningKeyPEM)
+	if keyPEM == "" {
+		return "", nil, nil, fmt.Errorf("signing key %q: signing_key_pem is required", keyID)
+	}
+	key, err := parseRSAPrivateKeyPEM([]byte(keyPEM))
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("parse signing key %q: %w", keyID, err)
+	}
+	return keyID, key, makePublicJWK(keyID, &key.PublicKey), nil
+}
+
+func signingKeyConfigIsActive(keyCfg SigningKeyConfig, activeFlags, keyCount int, cfgKeyID, keyID string) bool {
+	if activeFlags > 0 {
+		return keyCfg.Active
+	}
+	return keyCount == 1 || (cfgKeyID != "" && keyID == cfgKeyID)
 }
 
 type Session struct {
@@ -1060,6 +1186,7 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 		appTokenMap[tokenCfg.ID] = tokenCfg
 	}
 
+	runtimeState := store.RuntimeState()
 	b := &Broker{
 		cfg:          cfg,
 		store:        store,
@@ -1069,14 +1196,15 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 		publicJWKs:   publicJWKs,
 		clients:      clientMap,
 		appTokens:    appTokenMap,
-		sessions:     map[string]Session{},
-		authRequests: map[string]AuthorizationRequest{},
-		authCodes:    map[string]AuthCode{},
-		refresh:      map[string]RefreshToken{},
-		revokedJTIs:  map[string]time.Time{},
+		sessions:     runtimeState.Sessions,
+		authRequests: runtimeState.AuthRequests,
+		authCodes:    runtimeState.AuthCodes,
+		refresh:      runtimeState.RefreshTokens,
+		revokedJTIs:  runtimeState.RevokedJTIs,
 		webauthnReg:  map[string]ChallengeRecord{},
 		webauthnLog:  map[string]ChallengeRecord{},
 	}
+	b.sweepExpired(time.Now())
 	return b, nil
 }
 
@@ -1156,46 +1284,32 @@ func normalizeConfig(cfg *Config) {
 // accumulate indefinitely until the process restarts. Each map is swept
 // independently; collapsing into a generic helper would obscure the
 // per-map field accesses.
-//
-//nolint:gocognit // Linear sweep across seven typed maps.
 func (b *Broker) sweepExpired(now time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for k, v := range b.sessions {
-		if now.After(v.ExpiresAt) {
-			delete(b.sessions, k)
+	changed := sweepExpiredMap(b.sessions, now, func(v Session) time.Time { return v.ExpiresAt })
+	changed = sweepExpiredMap(b.authRequests, now, func(v AuthorizationRequest) time.Time { return v.ExpiresAt }) || changed
+	changed = sweepExpiredMap(b.authCodes, now, func(v AuthCode) time.Time { return v.ExpiresAt }) || changed
+	changed = sweepExpiredMap(b.refresh, now, func(v RefreshToken) time.Time { return v.ExpiresAt }) || changed
+	changed = sweepExpiredMap(b.revokedJTIs, now, func(v time.Time) time.Time { return v }) || changed
+	sweepExpiredMap(b.webauthnReg, now, func(v ChallengeRecord) time.Time { return v.ExpiresAt })
+	sweepExpiredMap(b.webauthnLog, now, func(v ChallengeRecord) time.Time { return v.ExpiresAt })
+	if changed {
+		if err := b.persistRuntimeStateLocked(); err != nil {
+			log.Printf("persist runtime state after sweep: %v", err)
 		}
 	}
-	for k, v := range b.authRequests {
-		if now.After(v.ExpiresAt) {
-			delete(b.authRequests, k)
+}
+
+func sweepExpiredMap[T any](m map[string]T, now time.Time, expiresAt func(T) time.Time) bool {
+	changed := false
+	for k, v := range m {
+		if now.After(expiresAt(v)) {
+			delete(m, k)
+			changed = true
 		}
 	}
-	for k, v := range b.authCodes {
-		if now.After(v.ExpiresAt) {
-			delete(b.authCodes, k)
-		}
-	}
-	for k, v := range b.refresh {
-		if now.After(v.ExpiresAt) {
-			delete(b.refresh, k)
-		}
-	}
-	for k, exp := range b.revokedJTIs {
-		if now.After(exp) {
-			delete(b.revokedJTIs, k)
-		}
-	}
-	for k, v := range b.webauthnReg {
-		if now.After(v.ExpiresAt) {
-			delete(b.webauthnReg, k)
-		}
-	}
-	for k, v := range b.webauthnLog {
-		if now.After(v.ExpiresAt) {
-			delete(b.webauthnLog, k)
-		}
-	}
+	return changed
 }
 
 // startBackgroundSweeper periodically calls sweepExpired. It is intended for
@@ -1212,6 +1326,23 @@ func (b *Broker) startBackgroundSweeper(interval time.Duration) {
 			b.sweepExpired(t)
 		}
 	}()
+}
+
+func (b *Broker) runtimeStateLocked() StoredRuntimeState {
+	return StoredRuntimeState{
+		Sessions:      cloneSessionMap(b.sessions),
+		AuthRequests:  cloneAuthorizationRequestMap(b.authRequests),
+		AuthCodes:     cloneAuthCodeMap(b.authCodes),
+		RefreshTokens: cloneRefreshTokenMap(b.refresh),
+		RevokedJTIs:   cloneRevokedJTIMap(b.revokedJTIs),
+	}
+}
+
+func (b *Broker) persistRuntimeStateLocked() error {
+	if b.store == nil {
+		return nil
+	}
+	return b.store.ReplaceRuntimeState(b.runtimeStateLocked())
 }
 
 func validAppTokenID(id string) bool {
@@ -1403,14 +1534,8 @@ func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	if method == "" && challenge != "" {
 		method = "S256"
 	}
-	if client.RequirePKCE || client.Public {
-		if challenge == "" || method != "S256" {
-			redirectOAuthError(w, r, redirectURI, q.Get("state"), "invalid_request", "PKCE S256 is required")
-			return
-		}
-	}
-	if challenge != "" && method != "S256" {
-		redirectOAuthError(w, r, redirectURI, q.Get("state"), "invalid_request", "only PKCE S256 is accepted")
+	if msg := authorizePKCEError(client, challenge, method); msg != "" {
+		redirectOAuthError(w, r, redirectURI, q.Get("state"), "invalid_request", msg)
 		return
 	}
 
@@ -1429,14 +1554,27 @@ func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 
 	if sess, ok := b.validSession(r); ok {
 		b.maybeExtendSession(w, r)
-		b.issueCodeRedirect(w, r, authReq, sess)
+		if err := b.issueCodeRedirect(w, r, authReq, sess); err != nil {
+			http.Error(w, "store error", http.StatusInternalServerError)
+		}
 		return
 	}
 
-	b.mu.Lock()
-	b.authRequests[authReq.ID] = authReq
-	b.mu.Unlock()
+	if err := b.putAuthRequest(authReq); err != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
 	http.Redirect(w, r, "/login?request_id="+url.QueryEscape(authReq.ID), http.StatusFound)
+}
+
+func authorizePKCEError(client Client, challenge, method string) string {
+	if (client.RequirePKCE || client.Public) && (challenge == "" || method != "S256") {
+		return "PKCE S256 is required"
+	}
+	if challenge != "" && method != "S256" {
+		return "only PKCE S256 is accepted"
+	}
+	return ""
 }
 
 func (b *Broker) handleLoginGet(w http.ResponseWriter, r *http.Request) {
@@ -1460,7 +1598,7 @@ func (b *Broker) handleLoginGet(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-//nolint:gocognit,nestif,funlen // Login keeps OAuth request restoration and TOTP handling in one flow.
+//nolint:gocognit,cyclop,nestif,funlen // Login keeps OAuth request restoration and TOTP handling in one flow.
 func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad form", http.StatusBadRequest)
@@ -1476,7 +1614,15 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		if ok {
 			delete(b.authRequests, rid)
 		}
+		var persistErr error
+		if ok {
+			persistErr = b.persistRuntimeStateLocked()
+		}
 		b.mu.Unlock()
+		if persistErr != nil {
+			http.Error(w, "store error", http.StatusInternalServerError)
+			return
+		}
 		if !ok || time.Now().After(ar.ExpiresAt) {
 			http.Error(w, "login request expired", http.StatusBadRequest)
 			return
@@ -1488,7 +1634,9 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	profile, err := b.authn.Authenticate(r.Context(), username, password)
 	if err != nil {
 		if oauthLogin {
-			b.putAuthRequest(ar)
+			if err := b.putAuthRequest(ar); err != nil {
+				log.Printf("restore auth request after login failure: %v", err)
+			}
 		}
 		http.Error(w, "invalid username or password", http.StatusUnauthorized)
 		return
@@ -1503,23 +1651,33 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		otp := strings.TrimSpace(r.Form.Get("otp"))
 		if user.TOTPSecretBase32 == "" {
 			if oauthLogin {
-				b.putAuthRequest(ar)
+				if err := b.putAuthRequest(ar); err != nil {
+					log.Printf("restore auth request after missing totp enrollment: %v", err)
+				}
 			}
 			http.Error(w, "TOTP is required but the user is not enrolled", http.StatusUnauthorized)
 			return
 		}
 		if !verifyTOTP(user.TOTPSecretBase32, otp, time.Now(), 1) {
 			if oauthLogin {
-				b.putAuthRequest(ar)
+				if err := b.putAuthRequest(ar); err != nil {
+					log.Printf("restore auth request after totp failure: %v", err)
+				}
 			}
 			http.Error(w, "invalid TOTP code", http.StatusUnauthorized)
 			return
 		}
 	}
 
-	sess := b.createSession(w, user.Username)
+	sess, err := b.createSession(w, user.Username)
+	if err != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
 	if oauthLogin {
-		b.issueCodeRedirect(w, r, ar, sess)
+		if err := b.issueCodeRedirect(w, r, ar, sess); err != nil {
+			http.Error(w, "store error", http.StatusInternalServerError)
+		}
 		return
 	}
 	http.Redirect(w, r, "/", http.StatusFound)
@@ -1538,11 +1696,13 @@ func (b *Broker) handleLocalLogoutGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *Broker) handleLocalLogoutPost(w http.ResponseWriter, r *http.Request) {
-	b.clearSession(w, r)
+	if err := b.clearSession(w, r); err != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
-//nolint:gocognit,nestif // OIDC logout validation is easier to audit as one flow.
 func (b *Broker) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		if err := r.ParseForm(); err != nil {
@@ -1553,48 +1713,67 @@ func (b *Broker) handleLogout(w http.ResponseWriter, r *http.Request) {
 
 	idTokenHint := strings.TrimSpace(logoutParam(r, "id_token_hint"))
 	clientID := strings.TrimSpace(logoutParam(r, "client_id"))
-	if idTokenHint != "" {
-		hintClientID, err := b.logoutClientIDFromIDTokenHint(idTokenHint)
-		if err != nil && clientID == "" {
-			http.Error(w, "invalid id_token_hint", http.StatusBadRequest)
-			return
-		}
-		if err == nil && hintClientID != "" {
-			if clientID != "" && clientID != hintClientID {
-				http.Error(w, "client_id does not match id_token_hint", http.StatusBadRequest)
-				return
-			}
-			clientID = hintClientID
-		}
+	clientID, ok := b.resolveLogoutClientID(w, clientID, idTokenHint)
+	if !ok {
+		return
 	}
 
 	postLogoutRedirectURI := strings.TrimSpace(logoutParam(r, "post_logout_redirect_uri"))
 	state := logoutParam(r, "state")
 	if postLogoutRedirectURI != "" {
-		client, ok := b.clients[clientID]
-		if !ok || !clientAllowsPostLogoutRedirect(client, postLogoutRedirectURI) {
-			http.Error(w, "invalid post_logout_redirect_uri", http.StatusBadRequest)
-			return
-		}
-		b.clearSession(w, r)
-		u, err := url.Parse(postLogoutRedirectURI)
-		if err != nil {
-			http.Error(w, "invalid post_logout_redirect_uri", http.StatusBadRequest)
-			return
-		}
-		if state != "" {
-			q := u.Query()
-			q.Set("state", state)
-			u.RawQuery = q.Encode()
-		}
-		http.Redirect(w, r, u.String(), http.StatusFound) //nolint:gosec // redirect URI was validated against registered post_logout_redirect_uris.
+		b.handlePostLogoutRedirect(w, r, clientID, postLogoutRedirectURI, state)
 		return
 	}
 
-	b.clearSession(w, r)
+	if err := b.clearSession(w, r); err != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("logged out\n"))
+}
+
+func (b *Broker) handlePostLogoutRedirect(w http.ResponseWriter, r *http.Request, clientID, redirectURI, state string) {
+	client, ok := b.clients[clientID]
+	if !ok || !clientAllowsPostLogoutRedirect(client, redirectURI) {
+		http.Error(w, "invalid post_logout_redirect_uri", http.StatusBadRequest)
+		return
+	}
+	if err := b.clearSession(w, r); err != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	u, err := url.Parse(redirectURI)
+	if err != nil {
+		http.Error(w, "invalid post_logout_redirect_uri", http.StatusBadRequest)
+		return
+	}
+	if state != "" {
+		q := u.Query()
+		q.Set("state", state)
+		u.RawQuery = q.Encode()
+	}
+	http.Redirect(w, r, u.String(), http.StatusFound) //nolint:gosec // redirect URI was validated against registered post_logout_redirect_uris.
+}
+
+func (b *Broker) resolveLogoutClientID(w http.ResponseWriter, clientID, idTokenHint string) (string, bool) {
+	if idTokenHint == "" {
+		return clientID, true
+	}
+	hintClientID, err := b.logoutClientIDFromIDTokenHint(idTokenHint)
+	if err != nil && clientID == "" {
+		http.Error(w, "invalid id_token_hint", http.StatusBadRequest)
+		return "", false
+	}
+	if err != nil || hintClientID == "" {
+		return clientID, true
+	}
+	if clientID != "" && clientID != hintClientID {
+		http.Error(w, "client_id does not match id_token_hint", http.StatusBadRequest)
+		return "", false
+	}
+	return hintClientID, true
 }
 
 func logoutParam(r *http.Request, name string) string {
@@ -1626,10 +1805,11 @@ func clientIDFromTokenClaims(claims map[string]any) string {
 	return ""
 }
 
-func (b *Broker) putAuthRequest(ar AuthorizationRequest) {
+func (b *Broker) putAuthRequest(ar AuthorizationRequest) error {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.authRequests[ar.ID] = ar
-	b.mu.Unlock()
+	return b.persistRuntimeStateLocked()
 }
 
 func (b *Broker) needsTOTP(user *StoredUser) bool {
@@ -1642,12 +1822,18 @@ func (b *Broker) validSession(r *http.Request) (Session, bool) {
 		return Session{}, false
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	s, ok := b.sessions[c.Value]
 	if !ok || time.Now().After(s.ExpiresAt) {
-		delete(b.sessions, c.Value)
+		if ok {
+			delete(b.sessions, c.Value)
+			if err := b.persistRuntimeStateLocked(); err != nil {
+				log.Printf("persist expired session removal: %v", err)
+			}
+		}
+		b.mu.Unlock()
 		return Session{}, false
 	}
+	b.mu.Unlock()
 	return s, true
 }
 
@@ -1667,6 +1853,12 @@ func (b *Broker) maybeExtendSession(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	s, ok := b.sessions[c.Value]
 	if !ok || now.After(s.ExpiresAt) {
+		if ok {
+			delete(b.sessions, c.Value)
+			if err := b.persistRuntimeStateLocked(); err != nil {
+				log.Printf("persist expired session removal: %v", err)
+			}
+		}
 		b.mu.Unlock()
 		return
 	}
@@ -1677,6 +1869,9 @@ func (b *Broker) maybeExtendSession(w http.ResponseWriter, r *http.Request) {
 	s.ExpiresAt = now.Add(ttl)
 	b.sessions[c.Value] = s
 	newExpiry := s.ExpiresAt
+	if err := b.persistRuntimeStateLocked(); err != nil {
+		log.Printf("persist extended session: %v", err)
+	}
 	b.mu.Unlock()
 
 	secure := strings.HasPrefix(b.cfg.Issuer, "https://")
@@ -1694,10 +1889,16 @@ func (b *Broker) maybeExtendSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (b *Broker) clearSession(w http.ResponseWriter, r *http.Request) {
+func (b *Broker) clearSession(w http.ResponseWriter, r *http.Request) error {
 	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
 		b.mu.Lock()
-		delete(b.sessions, c.Value)
+		if _, ok := b.sessions[c.Value]; ok {
+			delete(b.sessions, c.Value)
+			if err := b.persistRuntimeStateLocked(); err != nil {
+				b.mu.Unlock()
+				return err
+			}
+		}
 		b.mu.Unlock()
 	}
 	secure := strings.HasPrefix(b.cfg.Issuer, "https://")
@@ -1713,14 +1914,20 @@ func (b *Broker) clearSession(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
+	return nil
 }
 
-func (b *Broker) createSession(w http.ResponseWriter, userID string) Session {
+func (b *Broker) createSession(w http.ResponseWriter, userID string) (Session, error) {
 	sid := randomB64(32)
 	now := time.Now()
 	sess := Session{UserID: userID, ExpiresAt: now.Add(time.Duration(b.cfg.SessionTTLHrs) * time.Hour), AuthTime: now}
 	b.mu.Lock()
 	b.sessions[sid] = sess
+	if err := b.persistRuntimeStateLocked(); err != nil {
+		delete(b.sessions, sid)
+		b.mu.Unlock()
+		return Session{}, err
+	}
 	b.mu.Unlock()
 	secure := strings.HasPrefix(b.cfg.Issuer, "https://")
 	if b.cfg.CookieSecure != nil {
@@ -1735,10 +1942,10 @@ func (b *Broker) createSession(w http.ResponseWriter, userID string) Session {
 		SameSite: http.SameSiteLaxMode,
 		Expires:  sess.ExpiresAt,
 	})
-	return sess
+	return sess, nil
 }
 
-func (b *Broker) issueCodeRedirect(w http.ResponseWriter, r *http.Request, ar AuthorizationRequest, sess Session) {
+func (b *Broker) issueCodeRedirect(w http.ResponseWriter, r *http.Request, ar AuthorizationRequest, sess Session) error {
 	code := randomB64(32)
 	ac := AuthCode{
 		Code:                code,
@@ -1754,6 +1961,11 @@ func (b *Broker) issueCodeRedirect(w http.ResponseWriter, r *http.Request, ar Au
 	}
 	b.mu.Lock()
 	b.authCodes[code] = ac
+	if err := b.persistRuntimeStateLocked(); err != nil {
+		delete(b.authCodes, code)
+		b.mu.Unlock()
+		return err
+	}
 	b.mu.Unlock()
 
 	u, _ := url.Parse(ar.RedirectURI)
@@ -1764,6 +1976,7 @@ func (b *Broker) issueCodeRedirect(w http.ResponseWriter, r *http.Request, ar Au
 	}
 	u.RawQuery = q.Encode()
 	http.Redirect(w, r, u.String(), http.StatusFound)
+	return nil
 }
 
 func (b *Broker) handleToken(w http.ResponseWriter, r *http.Request) {
@@ -1830,7 +2043,15 @@ func (b *Broker) tokenAuthorizationCode(w http.ResponseWriter, r *http.Request, 
 	if ok {
 		delete(b.authCodes, code)
 	}
+	var persistErr error
+	if ok {
+		persistErr = b.persistRuntimeStateLocked()
+	}
 	b.mu.Unlock()
+	if persistErr != nil {
+		tokenErrorStatus(w, http.StatusInternalServerError, "server_error", persistErr.Error())
+		return
+	}
 
 	if !ok || time.Now().After(ac.ExpiresAt) {
 		tokenError(w, "invalid_grant", "invalid or expired code")
@@ -1868,6 +2089,11 @@ func (b *Broker) tokenRefresh(w http.ResponseWriter, r *http.Request, client Cli
 	}
 	if time.Now().After(old.ExpiresAt) || old.ClientID != client.ClientID {
 		delete(b.refresh, rt)
+		if err := b.persistRuntimeStateLocked(); err != nil {
+			b.mu.Unlock()
+			tokenErrorStatus(w, http.StatusInternalServerError, "server_error", err.Error())
+			return
+		}
 		b.mu.Unlock()
 		tokenError(w, "invalid_grant", "invalid refresh_token")
 		return
@@ -1881,6 +2107,11 @@ func (b *Broker) tokenRefresh(w http.ResponseWriter, r *http.Request, client Cli
 		return
 	}
 	delete(b.refresh, rt) // refresh token rotation
+	if err := b.persistRuntimeStateLocked(); err != nil {
+		b.mu.Unlock()
+		tokenErrorStatus(w, http.StatusInternalServerError, "server_error", err.Error())
+		return
+	}
 	b.mu.Unlock()
 	scope := old.Scope
 	if requestedScope != "" {
@@ -2005,14 +2236,20 @@ func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime
 	}
 	if includeRefresh {
 		rt := randomB64(32)
-		b.mu.Lock()
-		b.refresh[rt] = RefreshToken{
+		refreshToken := RefreshToken{
 			Token:     rt,
 			UserID:    userID,
 			ClientID:  clientID,
 			Scope:     scope,
 			AuthTime:  authTime,
 			ExpiresAt: now.Add(time.Duration(b.cfg.RefreshTokenTTLDays) * 24 * time.Hour),
+		}
+		b.mu.Lock()
+		b.refresh[rt] = refreshToken
+		if err := b.persistRuntimeStateLocked(); err != nil {
+			delete(b.refresh, rt)
+			b.mu.Unlock()
+			return nil, err
 		}
 		b.mu.Unlock()
 		resp["refresh_token"] = rt
@@ -2125,28 +2362,42 @@ func (b *Broker) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tok := r.Form.Get("token")
-	b.mu.Lock()
-	if rt, ok := b.refresh[tok]; ok && rt.ClientID == client.ClientID {
-		delete(b.refresh, tok)
+	if err := b.revokeRefreshToken(tok, client); err != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
 	}
-	b.mu.Unlock()
-	if claims, err := b.verifyJWT(tok); err == nil {
-		if aud, _ := claims["aud"].(string); aud == client.ClientID {
-			if jti, _ := claims["jti"].(string); jti != "" {
-				expUnix := int64(0)
-				switch v := claims["exp"].(type) {
-				case float64:
-					expUnix = int64(v)
-				case json.Number:
-					expUnix, _ = v.Int64()
-				}
-				b.mu.Lock()
-				b.revokedJTIs[jti] = time.Unix(expUnix, 0)
-				b.mu.Unlock()
-			}
-		}
+	if err := b.revokeJWT(tok, client); err != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+func (b *Broker) revokeRefreshToken(tok string, client Client) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if rt, ok := b.refresh[tok]; ok && rt.ClientID == client.ClientID {
+		delete(b.refresh, tok)
+		return b.persistRuntimeStateLocked()
+	}
+	return nil
+}
+
+func (b *Broker) revokeJWT(tok string, client Client) error {
+	claims, err := b.verifyJWT(tok)
+	if err != nil {
+		return nil
+	}
+	aud, _ := claims["aud"].(string)
+	jti, _ := claims["jti"].(string)
+	expUnix, ok := numberClaim(claims["exp"])
+	if aud != client.ClientID || jti == "" || !ok {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.revokedJTIs[jti] = time.Unix(expUnix, 0)
+	return b.persistRuntimeStateLocked()
 }
 
 func (b *Broker) handleTOTPEnroll(w http.ResponseWriter, r *http.Request) {
@@ -2341,7 +2592,10 @@ func (b *Broker) handleWebAuthnLoginFinish(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "invalid assertion: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	b.createSession(w, ch.UserID)
+	if _, err := b.createSession(w, ch.UserID); err != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "authenticated"})
 }
 
@@ -2777,7 +3031,7 @@ func (b *Broker) signJWT(claims map[string]any) (string, error) {
 	return signingInput + "." + base64RawURL(sig), nil
 }
 
-//nolint:gocognit,cyclop,funlen // JWT parsing and claim checks stay together for readability.
+//nolint:cyclop // JWT parsing and claim checks stay together for readability.
 func (b *Broker) verifyJWT(token string) (map[string]any, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
@@ -2824,19 +3078,31 @@ func (b *Broker) verifyJWT(token string) (map[string]any, error) {
 	if nbf, ok := numberClaim(claims["nbf"]); ok && time.Now().Before(time.Unix(nbf, 0).Add(-30*time.Second)) {
 		return nil, fmt.Errorf("token not active")
 	}
-	if jti, _ := claims["jti"].(string); jti != "" {
-		b.mu.Lock()
-		exp, revoked := b.revokedJTIs[jti]
-		if revoked && time.Now().After(exp) {
-			delete(b.revokedJTIs, jti)
-			revoked = false
-		}
-		b.mu.Unlock()
-		if revoked {
-			return nil, fmt.Errorf("token revoked")
-		}
+	if err := b.verifyTokenNotRevoked(claims); err != nil {
+		return nil, err
 	}
 	return claims, nil
+}
+
+func (b *Broker) verifyTokenNotRevoked(claims map[string]any) error {
+	jti, _ := claims["jti"].(string)
+	if jti == "" {
+		return nil
+	}
+	b.mu.Lock()
+	exp, revoked := b.revokedJTIs[jti]
+	if revoked && time.Now().After(exp) {
+		delete(b.revokedJTIs, jti)
+		if err := b.persistRuntimeStateLocked(); err != nil {
+			log.Printf("persist expired revocation removal: %v", err)
+		}
+		revoked = false
+	}
+	b.mu.Unlock()
+	if revoked {
+		return fmt.Errorf("token revoked")
+	}
+	return nil
 }
 
 func numberClaim(v any) (int64, bool) {
@@ -3228,11 +3494,12 @@ func prepareSigningKeys(cfg *Config, dataDir string, forceRotate bool) error {
 	}
 	cfg.SigningKeys = keySet.signingKeyConfigs()
 	cfg.KeyID = keySet.ActiveKeyID
-	if !loaded {
+	switch {
+	case !loaded:
 		log.Printf("generated RSA signing key set at %s", path)
-	} else if changed {
+	case changed:
 		log.Printf("updated RSA signing key set at %s", path)
-	} else {
+	default:
 		log.Printf("loaded RSA signing key set from %s", path)
 	}
 	return nil
@@ -3297,25 +3564,15 @@ func (s *managedSigningKeySet) rotateAndPrune(keyIDPrefix string, rotationDays, 
 	return changed, s.validate()
 }
 
-func (s managedSigningKeySet) validate() error {
+func (s *managedSigningKeySet) validate() error {
 	if strings.TrimSpace(s.ActiveKeyID) == "" {
 		return fmt.Errorf("active signing key id is required")
 	}
 	seen := map[string]bool{}
 	activeSeen := false
 	for i, key := range s.Keys {
-		if strings.TrimSpace(key.KeyID) == "" {
-			return fmt.Errorf("signing key %d: key_id is required", i)
-		}
-		if seen[key.KeyID] {
-			return fmt.Errorf("duplicate signing key id %q", key.KeyID)
-		}
-		seen[key.KeyID] = true
-		if strings.TrimSpace(key.SigningKeyPEM) == "" {
-			return fmt.Errorf("signing key %q: signing_key_pem is required", key.KeyID)
-		}
-		if _, err := parseRSAPrivateKeyPEM([]byte(key.SigningKeyPEM)); err != nil {
-			return fmt.Errorf("parse signing key %q: %w", key.KeyID, err)
+		if err := validateManagedSigningKey(key, i, seen); err != nil {
+			return err
 		}
 		if key.KeyID == s.ActiveKeyID {
 			activeSeen = true
@@ -3330,7 +3587,24 @@ func (s managedSigningKeySet) validate() error {
 	return nil
 }
 
-func (s managedSigningKeySet) activeIndex() int {
+func validateManagedSigningKey(key managedSigningKey, index int, seen map[string]bool) error {
+	if strings.TrimSpace(key.KeyID) == "" {
+		return fmt.Errorf("signing key %d: key_id is required", index)
+	}
+	if seen[key.KeyID] {
+		return fmt.Errorf("duplicate signing key id %q", key.KeyID)
+	}
+	seen[key.KeyID] = true
+	if strings.TrimSpace(key.SigningKeyPEM) == "" {
+		return fmt.Errorf("signing key %q: signing_key_pem is required", key.KeyID)
+	}
+	if _, err := parseRSAPrivateKeyPEM([]byte(key.SigningKeyPEM)); err != nil {
+		return fmt.Errorf("parse signing key %q: %w", key.KeyID, err)
+	}
+	return nil
+}
+
+func (s *managedSigningKeySet) activeIndex() int {
 	for i, key := range s.Keys {
 		if key.KeyID == s.ActiveKeyID {
 			return i
@@ -3368,7 +3642,7 @@ func (s *managedSigningKeySet) prune(retentionDays int, now time.Time) bool {
 	return changed
 }
 
-func (s managedSigningKeySet) signingKeyConfigs() []SigningKeyConfig {
+func (s *managedSigningKeySet) signingKeyConfigs() []SigningKeyConfig {
 	out := make([]SigningKeyConfig, 0, len(s.Keys))
 	for _, key := range s.Keys {
 		out = append(out, SigningKeyConfig{

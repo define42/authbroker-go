@@ -28,32 +28,12 @@ func TestPrepareSigningKeysCreatesAndReusesKeySet(t *testing.T) {
 	if cfg.KeyID != cfg.SigningKeys[0].KeyID {
 		t.Fatalf("cfg.KeyID = %q, want active key %q", cfg.KeyID, cfg.SigningKeys[0].KeyID)
 	}
-	keySetPath := filepath.Join(dataDir, defaultKeysPath)
-	keySetBytes, err := os.ReadFile(keySetPath)
-	if err != nil {
-		t.Fatalf("read generated key set: %v", err)
-	}
-	var keySet managedSigningKeySet
-	if err := json.Unmarshal(keySetBytes, &keySet); err != nil {
-		t.Fatalf("decode generated key set: %v", err)
-	}
+	keySetPath, keySet := readManagedKeySet(t, dataDir)
 	if keySet.ActiveKeyID != cfg.KeyID || len(keySet.Keys) != 1 {
 		t.Fatalf("generated key set = %#v, want one active key", keySet)
 	}
-	key, err := parseRSAPrivateKeyPEM([]byte(cfg.SigningKeys[0].SigningKeyPEM))
-	if err != nil {
-		t.Fatalf("parse generated key: %v", err)
-	}
-	if got := key.N.BitLen(); got != 2048 {
-		t.Fatalf("generated key bits = %d, want 2048", got)
-	}
-	info, err := os.Stat(keySetPath)
-	if err != nil {
-		t.Fatalf("stat generated key set: %v", err)
-	}
-	if mode := info.Mode().Perm(); mode&0o077 != 0 {
-		t.Fatalf("generated key set permissions = %v, want no group/world access", mode)
-	}
+	requireRSAKeyBits(t, cfg.SigningKeys[0].SigningKeyPEM, 2048)
+	requirePrivateFile(t, keySetPath)
 
 	reloadedCfg := Config{}
 	if err := prepareSigningKeys(&reloadedCfg, dataDir, false); err != nil {
@@ -61,6 +41,42 @@ func TestPrepareSigningKeysCreatesAndReusesKeySet(t *testing.T) {
 	}
 	if len(reloadedCfg.SigningKeys) != 1 || reloadedCfg.SigningKeys[0].SigningKeyPEM != cfg.SigningKeys[0].SigningKeyPEM {
 		t.Fatal("prepareSigningKeys did not reuse the existing key set")
+	}
+}
+
+func readManagedKeySet(t *testing.T, dataDir string) (string, managedSigningKeySet) {
+	t.Helper()
+	keySetPath := filepath.Join(dataDir, defaultKeysPath)
+	keySetBytes, err := os.ReadFile(keySetPath) //nolint:gosec // Test reads a file in t.TempDir.
+	if err != nil {
+		t.Fatalf("read generated key set: %v", err)
+	}
+	var keySet managedSigningKeySet
+	if err := json.Unmarshal(keySetBytes, &keySet); err != nil {
+		t.Fatalf("decode generated key set: %v", err)
+	}
+	return keySetPath, keySet
+}
+
+func requireRSAKeyBits(t *testing.T, keyPEM string, bits int) {
+	t.Helper()
+	key, err := parseRSAPrivateKeyPEM([]byte(keyPEM))
+	if err != nil {
+		t.Fatalf("parse generated key: %v", err)
+	}
+	if got := key.N.BitLen(); got != bits {
+		t.Fatalf("generated key bits = %d, want %d", got, bits)
+	}
+}
+
+func requirePrivateFile(t *testing.T, path string) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat generated key set: %v", err)
+	}
+	if mode := info.Mode().Perm(); mode&0o077 != 0 {
+		t.Fatalf("generated key set permissions = %v, want no group/world access", mode)
 	}
 }
 
@@ -109,35 +125,7 @@ func TestBuildSigningKeySetActiveFlagOverridesKeyID(t *testing.T) {
 func TestPrepareSigningKeysRotatesAndKeepsOldJWKSKey(t *testing.T) {
 	now := time.Now()
 	dataDir := t.TempDir()
-	oldKey, err := newManagedSigningKey("test-key", now.AddDate(0, 0, -2))
-	if err != nil {
-		t.Fatalf("create old key: %v", err)
-	}
-	oldSet := managedSigningKeySet{ActiveKeyID: oldKey.KeyID, Keys: []managedSigningKey{oldKey}}
-	if err := saveManagedSigningKeySet(filepath.Join(dataDir, defaultKeysPath), oldSet); err != nil {
-		t.Fatalf("save old key set: %v", err)
-	}
-	oldBroker, err := NewBroker(Config{
-		Issuer: "http://broker.example",
-		KeyID:  oldKey.KeyID,
-		SigningKeys: []SigningKeyConfig{{
-			KeyID:         oldKey.KeyID,
-			SigningKeyPEM: oldKey.SigningKeyPEM,
-			Active:        true,
-		}},
-	}, mustNewStore(t))
-	if err != nil {
-		t.Fatalf("create old broker: %v", err)
-	}
-	oldToken, err := oldBroker.signJWT(map[string]any{
-		"iss": "http://broker.example",
-		"sub": "johndoe",
-		"exp": now.Add(time.Hour).Unix(),
-		"iat": now.Unix(),
-	})
-	if err != nil {
-		t.Fatalf("sign old token: %v", err)
-	}
+	oldKey, oldToken := seedOldSigningKeySet(t, dataDir, now)
 
 	cfg := Config{
 		Issuer:                  "http://broker.example",
@@ -148,12 +136,7 @@ func TestPrepareSigningKeysRotatesAndKeepsOldJWKSKey(t *testing.T) {
 	if err := prepareSigningKeys(&cfg, dataDir, false); err != nil {
 		t.Fatalf("prepare signing keys: %v", err)
 	}
-	if len(cfg.SigningKeys) != 2 {
-		t.Fatalf("signing keys after rotation = %d, want 2", len(cfg.SigningKeys))
-	}
-	if cfg.KeyID == oldKey.KeyID {
-		t.Fatal("active key was not rotated")
-	}
+	requireRotatedSigningKeyConfig(t, cfg, oldKey.KeyID)
 
 	broker, err := NewBroker(cfg, mustNewStore(t))
 	if err != nil {
@@ -176,6 +159,56 @@ func TestPrepareSigningKeysRotatesAndKeepsOldJWKSKey(t *testing.T) {
 	}
 	if len(broker.publicJWKs) != 2 {
 		t.Fatalf("JWKS key count = %d, want 2", len(broker.publicJWKs))
+	}
+}
+
+func seedOldSigningKeySet(t *testing.T, dataDir string, now time.Time) (managedSigningKey, string) {
+	t.Helper()
+	oldKey, err := newManagedSigningKey("test-key", now.AddDate(0, 0, -2))
+	if err != nil {
+		t.Fatalf("create old key: %v", err)
+	}
+	oldSet := managedSigningKeySet{ActiveKeyID: oldKey.KeyID, Keys: []managedSigningKey{oldKey}}
+	if err := saveManagedSigningKeySet(filepath.Join(dataDir, defaultKeysPath), oldSet); err != nil {
+		t.Fatalf("save old key set: %v", err)
+	}
+	oldToken := signTestToken(t, oldKey, now)
+	return oldKey, oldToken
+}
+
+func signTestToken(t *testing.T, key managedSigningKey, now time.Time) string {
+	t.Helper()
+	broker, err := NewBroker(Config{
+		Issuer: "http://broker.example",
+		KeyID:  key.KeyID,
+		SigningKeys: []SigningKeyConfig{{
+			KeyID:         key.KeyID,
+			SigningKeyPEM: key.SigningKeyPEM,
+			Active:        true,
+		}},
+	}, mustNewStore(t))
+	if err != nil {
+		t.Fatalf("create broker: %v", err)
+	}
+	token, err := broker.signJWT(map[string]any{
+		"iss": "http://broker.example",
+		"sub": "johndoe",
+		"exp": now.Add(time.Hour).Unix(),
+		"iat": now.Unix(),
+	})
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+	return token
+}
+
+func requireRotatedSigningKeyConfig(t *testing.T, cfg Config, oldKeyID string) {
+	t.Helper()
+	if len(cfg.SigningKeys) != 2 {
+		t.Fatalf("signing keys after rotation = %d, want 2", len(cfg.SigningKeys))
+	}
+	if cfg.KeyID == oldKeyID {
+		t.Fatal("active key was not rotated")
 	}
 }
 
