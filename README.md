@@ -36,6 +36,8 @@ AUTHBROKER_CONFIG=config.example.json AUTHBROKER_DATA=data go run .
 
 `AUTHBROKER_DATA` points at a data directory. The broker stores users, MFA secrets, WebAuthn credentials and challenge state, sessions, OAuth authorization state, refresh tokens, and revoked token IDs in `data.json` with inter-process file locking and atomic file replacement. Managed signing keys live in `signing-keys.json` inside the same directory and use the same startup lock, so multiple broker instances can share one `AUTHBROKER_DATA` directory when the shared filesystem supports advisory locks and atomic rename.
 
+Browser pages serve first-party CSS/JS under a strict Content-Security-Policy. Login uses a double-submit CSRF cookie, and authenticated browser forms such as logout and app-token generation use the session CSRF token.
+
 Open the OIDC discovery document:
 
 ```bash
@@ -374,8 +376,6 @@ Before production, the remaining hardening work is:
 - app-token issuance audit, revocation strategy, per-app TTL review, and policy for who may generate each token profile
 - rate limiting and brute-force protection
 - audit logs for login, logout, token issuance, MFA, WebAuthn, and admin/config changes
-- CSRF protection for browser form endpoints, especially logout and app-token generation
-- stricter Content-Security-Policy
 - directory-specific group policy validation; LDAP group mapping and nested AD groups are implemented, but nested OpenLDAP group resolution and group lifecycle sync are not
 - OpenID Foundation conformance testing
 - WebAuthn conformance testing and broader attestation support

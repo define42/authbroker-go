@@ -459,12 +459,26 @@ func TestBrokerStandaloneLoginAndLogoutPages(t *testing.T) {
 		t.Fatalf("unauthenticated app token Location = %q, want /login", location)
 	}
 
+	loginPageReq := httptest.NewRequest(http.MethodGet, "/login", nil)
+	loginPageRR := httptest.NewRecorder()
+	broker.routes().ServeHTTP(loginPageRR, loginPageReq)
+	if loginPageRR.Code != http.StatusOK {
+		t.Fatalf("expected login page status 200, got %d: %s", loginPageRR.Code, loginPageRR.Body.String())
+	}
+	loginCSRFToken := csrfTokenFromHTML(t, loginPageRR.Body.String())
+	loginCSRFCookie := findCookie(loginPageRR, csrfCookieName)
+	if loginCSRFCookie == nil {
+		t.Fatalf("login page did not set %s cookie", csrfCookieName)
+	}
+
 	form := url.Values{
-		"username": {"johndoe"},
-		"password": {"dogood"},
+		"username":   {"johndoe"},
+		"password":   {"dogood"},
+		"csrf_token": {loginCSRFToken},
 	}
 	loginReq := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
 	loginReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginReq.AddCookie(loginCSRFCookie)
 	loginRR := httptest.NewRecorder()
 	broker.routes().ServeHTTP(loginRR, loginReq)
 	if loginRR.Code != http.StatusFound {
@@ -488,11 +502,24 @@ func TestBrokerStandaloneLoginAndLogoutPages(t *testing.T) {
 	if !strings.Contains(homeRR.Body.String(), "Signed in as <strong>johndoe</strong>") {
 		t.Fatalf("home page did not show signed-in state: %s", homeRR.Body.String())
 	}
+	if csp := homeRR.Header().Get("Content-Security-Policy"); csp == "" || strings.Contains(csp, "unsafe-inline") {
+		t.Fatalf("home CSP = %q, want strict policy without unsafe-inline", csp)
+	}
 	if !strings.Contains(homeRR.Body.String(), "App tokens") || !strings.Contains(homeRR.Body.String(), "LiteLLM") || !strings.Contains(homeRR.Body.String(), "Internal API") {
 		t.Fatalf("home page did not show configured app token actions: %s", homeRR.Body.String())
 	}
+	sessionCSRFToken := csrfTokenFromHTML(t, homeRR.Body.String())
 
-	tokenReq := httptest.NewRequest(http.MethodPost, "/app-tokens/litellm", nil)
+	badTokenReq := httptest.NewRequest(http.MethodPost, "/app-tokens/litellm", nil)
+	badTokenReq.AddCookie(sessionCookie)
+	badTokenRR := httptest.NewRecorder()
+	broker.routes().ServeHTTP(badTokenRR, badTokenReq)
+	if badTokenRR.Code != http.StatusForbidden {
+		t.Fatalf("expected app token without csrf status 403, got %d: %s", badTokenRR.Code, badTokenRR.Body.String())
+	}
+
+	tokenReq := httptest.NewRequest(http.MethodPost, "/app-tokens/litellm", strings.NewReader(url.Values{"csrf_token": {sessionCSRFToken}}.Encode()))
+	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	tokenReq.AddCookie(sessionCookie)
 	tokenRR := httptest.NewRecorder()
 	broker.routes().ServeHTTP(tokenRR, tokenReq)
@@ -522,7 +549,8 @@ func TestBrokerStandaloneLoginAndLogoutPages(t *testing.T) {
 		t.Fatalf("app token groups = %#v, want [demo_reports]", groups)
 	}
 
-	apiTokenReq := httptest.NewRequest(http.MethodPost, "/app-tokens/internal-api", nil)
+	apiTokenReq := httptest.NewRequest(http.MethodPost, "/app-tokens/internal-api", strings.NewReader(url.Values{"csrf_token": {sessionCSRFToken}}.Encode()))
+	apiTokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	apiTokenReq.AddCookie(sessionCookie)
 	apiTokenRR := httptest.NewRecorder()
 	broker.routes().ServeHTTP(apiTokenRR, apiTokenReq)
@@ -551,8 +579,18 @@ func TestBrokerStandaloneLoginAndLogoutPages(t *testing.T) {
 	if !strings.Contains(logoutPageRR.Body.String(), "Sign out of authbroker") {
 		t.Fatalf("logout page did not render confirmation: %s", logoutPageRR.Body.String())
 	}
+	logoutCSRFToken := csrfTokenFromHTML(t, logoutPageRR.Body.String())
 
-	logoutReq := httptest.NewRequest(http.MethodPost, "/logout", nil)
+	badLogoutReq := httptest.NewRequest(http.MethodPost, "/logout", nil)
+	badLogoutReq.AddCookie(sessionCookie)
+	badLogoutRR := httptest.NewRecorder()
+	broker.routes().ServeHTTP(badLogoutRR, badLogoutReq)
+	if badLogoutRR.Code != http.StatusForbidden {
+		t.Fatalf("expected logout without csrf status 403, got %d: %s", badLogoutRR.Code, badLogoutRR.Body.String())
+	}
+
+	logoutReq := httptest.NewRequest(http.MethodPost, "/logout", strings.NewReader(url.Values{"csrf_token": {logoutCSRFToken}}.Encode()))
+	logoutReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	logoutReq.AddCookie(sessionCookie)
 	logoutRR := httptest.NewRecorder()
 	broker.routes().ServeHTTP(logoutRR, logoutReq)
@@ -687,16 +725,19 @@ func TestLDAPBrokerOAuthIntegration(t *testing.T) {
 
 	t.Run("wrong password is unauthorized and issues no auth code", func(t *testing.T) {
 		requestID := beginAuthorize(ctx, t, client, baseURL)
+		csrfToken, csrfCookie := loginCSRFForRequest(ctx, t, client, baseURL, requestID)
 		form := url.Values{
 			"request_id": {requestID},
 			"username":   {"ingestuser"},
 			"password":   {"wrongpass"},
+			"csrf_token": {csrfToken},
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/login", strings.NewReader(form.Encode()))
 		if err != nil {
 			t.Fatalf("build login request: %v", err)
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.AddCookie(csrfCookie)
 		resp, err := client.Do(req)
 		if err != nil {
 			t.Fatalf("send login request: %v", err)
@@ -727,16 +768,19 @@ func performAuthCodeFlow(ctx context.Context, t *testing.T, client *http.Client,
 	t.Helper()
 
 	requestID := beginAuthorize(ctx, t, client, baseURL)
+	csrfToken, csrfCookie := loginCSRFForRequest(ctx, t, client, baseURL, requestID)
 	form := url.Values{
 		"request_id": {requestID},
 		"username":   {username},
 		"password":   {password},
+		"csrf_token": {csrfToken},
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/login", strings.NewReader(form.Encode()))
 	if err != nil {
 		t.Fatalf("build login request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(csrfCookie)
 	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("send login request: %v", err)
@@ -822,6 +866,30 @@ func beginAuthorize(ctx context.Context, t *testing.T, client *http.Client, base
 		t.Fatalf("authorize redirect missing request_id: %q", location)
 	}
 	return requestID
+}
+
+func loginCSRFForRequest(ctx context.Context, t *testing.T, client *http.Client, baseURL, requestID string) (string, *http.Cookie) {
+	t.Helper()
+
+	loginURL := baseURL + "/login?request_id=" + url.QueryEscape(requestID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, loginURL, nil)
+	if err != nil {
+		t.Fatalf("build login page request: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("send login page request: %v", err)
+	}
+	defer resp.Body.Close()
+	body := readBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected login page status 200, got %d: %s", resp.StatusCode, body)
+	}
+	cookie := findResponseCookie(resp, csrfCookieName)
+	if cookie == nil {
+		t.Fatalf("login page did not set %s cookie", csrfCookieName)
+	}
+	return csrfTokenFromHTML(t, body), cookie
 }
 
 func codeFromRedirect(location string) (string, error) {
@@ -1044,6 +1112,27 @@ func findCookie(rr *httptest.ResponseRecorder, name string) *http.Cookie {
 		}
 	}
 	return nil
+}
+
+func findResponseCookie(resp *http.Response, name string) *http.Cookie {
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == name {
+			return cookie
+		}
+	}
+	return nil
+}
+
+var csrfTokenPattern = regexp.MustCompile(`<input[^>]*name="csrf_token"[^>]*value="([^"]*)"`)
+
+func csrfTokenFromHTML(t *testing.T, body string) string {
+	t.Helper()
+
+	matches := csrfTokenPattern.FindStringSubmatch(body)
+	if len(matches) != 2 || strings.TrimSpace(matches[1]) == "" {
+		t.Fatalf("csrf token input not found in body: %s", body)
+	}
+	return strings.TrimSpace(matches[1])
 }
 
 var appTokenPattern = regexp.MustCompile(`<textarea[^>]*id="app-token-value"[^>]*>([^<]+)</textarea>`)

@@ -44,6 +44,9 @@ import (
 
 const (
 	sessionCookieName = "broker_session"
+	csrfCookieName    = "broker_csrf"
+	csrfFormField     = "csrf_token"
+	csrfHeaderName    = "X-CSRF-Token"
 	bearerPrefix      = "Bearer "
 
 	defaultConfigPath = "config.json"
@@ -1249,9 +1252,10 @@ func signingKeyConfigIsActive(keyCfg SigningKeyConfig, activeFlags, keyCount int
 }
 
 type Session struct {
-	UserID    string
-	ExpiresAt time.Time
-	AuthTime  time.Time
+	UserID    string    `json:"user_id"`
+	ExpiresAt time.Time `json:"expires_at"`
+	AuthTime  time.Time `json:"auth_time"`
+	CSRFToken string    `json:"csrf_token,omitempty"`
 }
 
 type AuthorizationRequest struct {
@@ -1541,6 +1545,8 @@ func validAppTokenID(id string) bool {
 
 func (b *Broker) routes() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /assets/authbroker.css", b.handleStylesheet)
+	mux.HandleFunc("GET /assets/authbroker.js", b.handleScript)
 	mux.HandleFunc("GET /", b.handleHome)
 	mux.HandleFunc("GET /healthz", b.handleHealth)
 	mux.HandleFunc("GET /.well-known/openid-configuration", b.handleDiscovery)
@@ -1569,11 +1575,24 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Content-Security-Policy", authbrokerCSP)
 		// Default to no-store; cacheable endpoints (JWKS, discovery) override
 		// this header explicitly before writing their response.
 		w.Header().Set("Cache-Control", "no-store")
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (b *Broker) handleStylesheet(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	_, _ = w.Write([]byte(authbrokerCSS))
+}
+
+func (b *Broker) handleScript(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	_, _ = w.Write([]byte(authbrokerJS))
 }
 
 func (b *Broker) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -1625,6 +1644,7 @@ type appTokenView struct {
 	ClientID        string
 	Scope           string
 	TokenTTLSeconds int
+	TokenTTLLabel   string
 	JWKSURL         string
 }
 
@@ -1636,13 +1656,15 @@ type issuedAppTokenView struct {
 
 func (b *Broker) homeData(r *http.Request, issued *issuedAppTokenView) map[string]any {
 	data := map[string]any{
-		"Issuer":    b.cfg.Issuer,
-		"AppTokens": b.appTokenViews(),
+		"DisplayName": b.cfg.DisplayName,
+		"Issuer":      b.cfg.Issuer,
+		"AppTokens":   b.appTokenViews(),
 	}
 	if sess, ok := b.validSession(r); ok {
 		data["Authenticated"] = true
 		data["UserID"] = sess.UserID
 		data["ExpiresAt"] = sess.ExpiresAt.Format(time.RFC1123)
+		data["CSRFToken"] = sess.CSRFToken
 	}
 	if issued != nil {
 		data["IssuedAppToken"] = issued
@@ -1666,14 +1688,43 @@ func (b *Broker) appTokenView(cfg AppTokenConfig) appTokenView {
 		ClientID:        cfg.ClientID,
 		Scope:           cfg.Scope,
 		TokenTTLSeconds: cfg.TokenTTLMinutes * 60,
+		TokenTTLLabel:   formatTokenTTL(cfg.TokenTTLMinutes),
 		JWKSURL:         b.cfg.Issuer + "/oauth2/jwks",
 	}
+}
+
+func formatTokenTTL(minutes int) string {
+	switch {
+	case minutes%1440 == 0:
+		days := minutes / 1440
+		return pluralize(days, "day")
+	case minutes%60 == 0:
+		hours := minutes / 60
+		return pluralize(hours, "hour")
+	default:
+		return pluralize(minutes, "minute")
+	}
+}
+
+func pluralize(n int, unit string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, unit)
+	}
+	return fmt.Sprintf("%d %ss", n, unit)
 }
 
 func (b *Broker) handleAppToken(w http.ResponseWriter, r *http.Request) {
 	sess, ok := b.validSession(r)
 	if !ok {
 		http.Redirect(w, r, "/login", http.StatusFound)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	if !verifySessionCSRF(r, sess) {
+		http.Error(w, "invalid csrf token", http.StatusForbidden)
 		return
 	}
 	b.maybeExtendSession(w, r)
@@ -1784,9 +1835,11 @@ func (b *Broker) handleLoginGet(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = loginTemplate.Execute(w, map[string]any{
-		"RequestID": rid,
-		"ClientID":  clientID,
-		"TOTPHint":  b.cfg.MFA.TOTPRequired,
+		"DisplayName": b.cfg.DisplayName,
+		"RequestID":   rid,
+		"ClientID":    clientID,
+		"TOTPHint":    b.cfg.MFA.TOTPRequired,
+		"CSRFToken":   b.anonymousCSRFToken(w, r),
 	})
 }
 
@@ -1794,6 +1847,10 @@ func (b *Broker) handleLoginGet(w http.ResponseWriter, r *http.Request) {
 func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	if !verifyAnonymousCSRF(r) {
+		http.Error(w, "invalid csrf token", http.StatusForbidden)
 		return
 	}
 	rid := r.Form.Get("request_id")
@@ -1883,11 +1940,22 @@ func (b *Broker) handleLocalLogoutGet(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = brokerLogoutTemplate.Execute(w, map[string]any{
-		"UserID": sess.UserID,
+		"DisplayName": b.cfg.DisplayName,
+		"UserID":      sess.UserID,
+		"CSRFToken":   sess.CSRFToken,
 	})
 }
 
 func (b *Broker) handleLocalLogoutPost(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	sess, ok := b.validSession(r)
+	if ok && !verifySessionCSRF(r, sess) {
+		http.Error(w, "invalid csrf token", http.StatusForbidden)
+		return
+	}
 	if err := b.clearSession(w, r); err != nil {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
@@ -2010,6 +2078,54 @@ func (b *Broker) needsTOTP(user *StoredUser) bool {
 	return b.cfg.MFA.TOTPRequired || (user != nil && user.TOTPSecretBase32 != "")
 }
 
+func (b *Broker) anonymousCSRFToken(w http.ResponseWriter, r *http.Request) string {
+	if c, err := r.Cookie(csrfCookieName); err == nil && c.Value != "" {
+		return c.Value
+	}
+	token := randomB64(32)
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure is controlled by issuer/config for local HTTP demos and HTTPS deployments.
+		Name:     csrfCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   b.cookieSecure(),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int((24 * time.Hour).Seconds()),
+	})
+	return token
+}
+
+func verifyAnonymousCSRF(r *http.Request) bool {
+	c, err := r.Cookie(csrfCookieName)
+	if err != nil {
+		return false
+	}
+	return csrfTokenMatches(r.Form.Get(csrfFormField), c.Value)
+}
+
+func verifySessionCSRF(r *http.Request, sess Session) bool {
+	token := r.Form.Get(csrfFormField)
+	if token == "" {
+		token = r.Header.Get(csrfHeaderName)
+	}
+	return csrfTokenMatches(token, sess.CSRFToken)
+}
+
+func csrfTokenMatches(got, want string) bool {
+	if got == "" || want == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+func (b *Broker) cookieSecure() bool {
+	secure := strings.HasPrefix(b.cfg.Issuer, "https://")
+	if b.cfg.CookieSecure != nil {
+		secure = *b.cfg.CookieSecure
+	}
+	return secure
+}
+
 func (b *Broker) validSession(r *http.Request) (Session, bool) {
 	c, err := r.Cookie(sessionCookieName)
 	if err != nil || c.Value == "" {
@@ -2027,6 +2143,12 @@ func (b *Broker) validSession(r *http.Request) (Session, bool) {
 		}
 		if time.Now().After(s.ExpiresAt) {
 			delete(state.Sessions, c.Value)
+			return true, nil
+		}
+		if s.CSRFToken == "" {
+			s.CSRFToken = randomB64(32)
+			state.Sessions[c.Value] = s
+			valid = true
 			return true, nil
 		}
 		valid = true
@@ -2084,16 +2206,12 @@ func (b *Broker) maybeExtendSession(w http.ResponseWriter, r *http.Request) {
 	}
 	b.mu.Unlock()
 
-	secure := strings.HasPrefix(b.cfg.Issuer, "https://")
-	if b.cfg.CookieSecure != nil {
-		secure = *b.cfg.CookieSecure
-	}
 	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure is controlled by issuer/config for local HTTP demos and HTTPS deployments.
 		Name:     sessionCookieName,
 		Value:    c.Value,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   secure,
+		Secure:   b.cookieSecure(),
 		SameSite: http.SameSiteLaxMode,
 		Expires:  newExpiry,
 	})
@@ -2114,16 +2232,12 @@ func (b *Broker) clearSession(w http.ResponseWriter, r *http.Request) error {
 			return err
 		}
 	}
-	secure := strings.HasPrefix(b.cfg.Issuer, "https://")
-	if b.cfg.CookieSecure != nil {
-		secure = *b.cfg.CookieSecure
-	}
 	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure is controlled by issuer/config for local HTTP demos and HTTPS deployments.
 		Name:     sessionCookieName,
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   secure,
+		Secure:   b.cookieSecure(),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
@@ -2133,7 +2247,7 @@ func (b *Broker) clearSession(w http.ResponseWriter, r *http.Request) error {
 func (b *Broker) createSession(w http.ResponseWriter, userID string) (Session, error) {
 	sid := randomB64(32)
 	now := time.Now()
-	sess := Session{UserID: userID, ExpiresAt: now.Add(time.Duration(b.cfg.SessionTTLHrs) * time.Hour), AuthTime: now}
+	sess := Session{UserID: userID, ExpiresAt: now.Add(time.Duration(b.cfg.SessionTTLHrs) * time.Hour), AuthTime: now, CSRFToken: randomB64(32)}
 	b.mu.Lock()
 	if err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
 		state.Sessions[sid] = sess
@@ -2143,16 +2257,12 @@ func (b *Broker) createSession(w http.ResponseWriter, userID string) (Session, e
 		return Session{}, err
 	}
 	b.mu.Unlock()
-	secure := strings.HasPrefix(b.cfg.Issuer, "https://")
-	if b.cfg.CookieSecure != nil {
-		secure = *b.cfg.CookieSecure
-	}
 	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure is controlled by issuer/config for local HTTP demos and HTTPS deployments.
 		Name:     sessionCookieName,
 		Value:    sid,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   secure,
+		Secure:   b.cookieSecure(),
 		SameSite: http.SameSiteLaxMode,
 		Expires:  sess.ExpiresAt,
 	})
@@ -3475,77 +3585,565 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+const authbrokerCSP = "default-src 'none'; base-uri 'none'; connect-src 'self'; font-src 'self'; form-action 'self'; frame-ancestors 'none'; frame-src 'none'; img-src 'self'; manifest-src 'none'; object-src 'none'; script-src 'self'; style-src 'self'"
+
+const authbrokerCSS = `
+:root {
+  color-scheme: light;
+  --page: #f5f7fb;
+  --panel: #ffffff;
+  --panel-soft: #f8fafc;
+  --text: #182230;
+  --muted: #5f6b7a;
+  --line: #d9e0ea;
+  --line-strong: #c5cedb;
+  --brand: #0f766e;
+  --brand-strong: #0b5f59;
+  --accent: #245bdb;
+  --danger: #b42318;
+  --shadow: 0 12px 32px rgba(24, 34, 48, 0.08);
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    linear-gradient(180deg, rgba(15, 118, 110, 0.08), rgba(36, 91, 219, 0.03) 38%, transparent 72%),
+    var(--page);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+code,
+textarea {
+  font-family: var(--mono);
+}
+
+.shell {
+  width: min(1120px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 28px 0 48px;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 22px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 8px;
+  background: var(--brand);
+  color: #ffffff;
+  font-weight: 800;
+}
+
+.brand-title {
+  margin: 0;
+  font-size: 22px;
+  line-height: 1.15;
+}
+
+.brand-subtitle,
+.muted {
+  color: var(--muted);
+}
+
+.brand-subtitle {
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #ffffff;
+  color: var(--muted);
+  font-weight: 650;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 18px;
+  align-items: start;
+}
+
+.panel,
+.token-row,
+.login-panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.panel {
+  padding: 22px;
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: start;
+  margin-bottom: 18px;
+}
+
+.panel-title {
+  margin: 0;
+  font-size: 18px;
+}
+
+.section-kicker {
+  margin: 0 0 4px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.token-list {
+  display: grid;
+  gap: 12px;
+}
+
+.token-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  padding: 16px;
+  box-shadow: none;
+}
+
+.token-name {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+
+.meta-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 14px;
+}
+
+.meta-label {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.meta-value {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.side-stack {
+  display: grid;
+  gap: 14px;
+}
+
+.identity-block {
+  display: grid;
+  gap: 8px;
+}
+
+.identity-line {
+  margin: 0;
+}
+
+.issued-token {
+  margin-top: 18px;
+  border-top: 1px solid var(--line);
+  padding-top: 18px;
+}
+
+.token-output {
+  display: block;
+  width: 100%;
+  min-height: 160px;
+  resize: vertical;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: 12px;
+  background: #0f172a;
+  color: #dbeafe;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+}
+
+.button,
+button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 38px;
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: var(--brand);
+  color: #ffffff;
+  font: inherit;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.button:hover,
+button:hover {
+  background: var(--brand-strong);
+  text-decoration: none;
+}
+
+.button.secondary,
+button.secondary {
+  border-color: var(--line-strong);
+  background: #ffffff;
+  color: var(--text);
+}
+
+.button.secondary:hover,
+button.secondary:hover {
+  background: var(--panel-soft);
+}
+
+button.danger {
+  background: var(--danger);
+}
+
+.copy-status {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.empty-state,
+.login-panel {
+  max-width: 480px;
+  margin: 0 auto;
+  padding: 28px;
+}
+
+.empty-state {
+  text-align: center;
+}
+
+.empty-state h2,
+.login-panel h1 {
+  margin: 0 0 8px;
+  font-size: 24px;
+}
+
+.form-grid {
+  display: grid;
+  gap: 16px;
+}
+
+.field {
+  display: grid;
+  gap: 7px;
+}
+
+.field span {
+  font-weight: 700;
+}
+
+.field input {
+  width: 100%;
+  min-height: 42px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: 0 12px;
+  color: var(--text);
+  font: inherit;
+  background: #ffffff;
+}
+
+.field input:focus,
+.token-output:focus {
+  outline: 3px solid rgba(36, 91, 219, 0.18);
+  border-color: var(--accent);
+}
+
+.logout-panel {
+  max-width: 560px;
+  margin: 40px auto 0;
+}
+
+.logout-actions {
+  margin-top: 18px;
+}
+
+@media (max-width: 800px) {
+  .shell {
+    width: min(100% - 20px, 1120px);
+    padding-top: 18px;
+  }
+
+  .topbar,
+  .panel-header,
+  .token-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .layout,
+  .meta-grid,
+  .token-row {
+    grid-template-columns: 1fr;
+  }
+
+  .status-pill {
+    width: fit-content;
+  }
+}
+`
+
+const authbrokerJS = `
+document.addEventListener("click", function (event) {
+  var button = event.target.closest("[data-copy-target]");
+  if (!button) {
+    return;
+  }
+  var target = document.getElementById(button.getAttribute("data-copy-target"));
+  if (!target || !navigator.clipboard) {
+    return;
+  }
+  navigator.clipboard.writeText(target.value).then(function () {
+    var status = document.querySelector("[data-copy-status]");
+    if (status) {
+      status.textContent = "Copied";
+      window.setTimeout(function () {
+        status.textContent = "";
+      }, 1800);
+    }
+  });
+});
+`
+
 //nolint:gochecknoglobals // Parsed templates are immutable and shared by handlers.
 var brokerHomeTemplate = template.Must(template.New("broker-home").Parse(`<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>Authbroker</title></head>
-<body style="font-family: sans-serif; max-width: 42rem; margin: 3rem auto; line-height: 1.45;">
-  <h1>Authbroker</h1>
-  <p style="color:#555">Issuer: <code>{{.Issuer}}</code></p>
-  {{if .Authenticated}}
-    <p>Signed in as <strong>{{.UserID}}</strong>.</p>
-    <p style="color:#555">Session expires: {{.ExpiresAt}}</p>
-    {{if .AppTokens}}
-      <section style="border:1px solid #ddd; border-radius:8px; padding:1rem; margin:1.5rem 0;">
-        <h2 style="margin-top:0; font-size:1.15rem;">App tokens</h2>
-        {{range .AppTokens}}
-          <div style="border-top:1px solid #eee; padding-top:1rem; margin-top:1rem;">
-            <h3 style="margin:.25rem 0; font-size:1rem;">{{.DisplayName}}</h3>
-            <p style="color:#555">Audience: <code>{{.Audience}}</code> · Client ID: <code>{{.ClientID}}</code> · JWKS: <code>{{.JWKSURL}}</code></p>
-            <p style="color:#555">Scope: <code>{{.Scope}}</code> · Expires in {{.TokenTTLSeconds}} seconds</p>
-            <form method="post" action="/app-tokens/{{.ID}}">
-              <button type="submit">Generate JWT</button>
-            </form>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.DisplayName}}</title>
+  <link rel="stylesheet" href="/assets/authbroker.css">
+  <script defer src="/assets/authbroker.js"></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">AB</div>
+        <div>
+          <h1 class="brand-title">{{.DisplayName}}</h1>
+          <div class="brand-subtitle">{{.Issuer}}</div>
+        </div>
+      </div>
+      {{if .Authenticated}}<div class="status-pill">Signed in</div>{{else}}<div class="status-pill">Signed out</div>{{end}}
+    </header>
+
+    {{if .Authenticated}}
+      <div class="layout">
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="section-kicker">Access</p>
+              <h2 class="panel-title">App tokens</h2>
+            </div>
           </div>
-        {{end}}
-        {{with .IssuedAppToken}}
-          <div style="border-top:1px solid #ddd; padding-top:1rem; margin-top:1rem;">
-            <h3 style="margin:.25rem 0; font-size:1rem;">{{.DisplayName}} JWT</h3>
-            <p style="color:#555">Expires in {{.TokenTTLSeconds}} seconds. Use it as a bearer token.</p>
-            <textarea id="app-token-value" readonly spellcheck="false" autocomplete="off" style="width:100%; min-height:9rem; box-sizing:border-box; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;">{{.Token}}</textarea>
-            <p><button type="button" onclick="navigator.clipboard.writeText(document.getElementById('app-token-value').value)">Copy JWT</button></p>
-          </div>
-        {{end}}
+          {{if .AppTokens}}
+            <div class="token-list">
+              {{range .AppTokens}}
+                <article class="token-row">
+                  <div>
+                    <h3 class="token-name">{{.DisplayName}}</h3>
+                    <div class="meta-grid">
+                      <div><span class="meta-label">Audience</span><code class="meta-value">{{.Audience}}</code></div>
+                      <div><span class="meta-label">Client ID</span><code class="meta-value">{{.ClientID}}</code></div>
+                      <div><span class="meta-label">Scope</span><code class="meta-value">{{.Scope}}</code></div>
+                      <div><span class="meta-label">TTL</span><span class="meta-value">{{.TokenTTLLabel}}</span></div>
+                    </div>
+                  </div>
+                  <form method="post" action="/app-tokens/{{.ID}}">
+                    <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                    <button type="submit">Generate JWT</button>
+                  </form>
+                </article>
+              {{end}}
+            </div>
+          {{else}}
+            <p class="muted">No app token profiles are configured.</p>
+          {{end}}
+
+          {{with .IssuedAppToken}}
+            <section class="issued-token">
+              <p class="section-kicker">Issued token</p>
+              <h2 class="panel-title">{{.DisplayName}} JWT</h2>
+              <p class="muted">Expires in {{.TokenTTLLabel}}.</p>
+              <textarea id="app-token-value" class="token-output" readonly spellcheck="false" autocomplete="off">{{.Token}}</textarea>
+              <div class="actions">
+                <button type="button" class="secondary" data-copy-target="app-token-value">Copy JWT</button>
+                <span class="copy-status" data-copy-status></span>
+              </div>
+            </section>
+          {{end}}
+        </section>
+
+        <aside class="side-stack">
+          <section class="panel identity-block">
+            <p class="section-kicker">Session</p>
+            <p class="identity-line">Signed in as <strong>{{.UserID}}</strong>.</p>
+            <p class="muted identity-line">Expires {{.ExpiresAt}}</p>
+          </section>
+          <section class="panel">
+            <p class="section-kicker">Discovery</p>
+            <p class="muted">JWKS</p>
+            <code class="meta-value">{{.Issuer}}/oauth2/jwks</code>
+          </section>
+          <form method="get" action="/logout">
+            <button type="submit" class="secondary">Sign out</button>
+          </form>
+        </aside>
+      </div>
+    {{else}}
+      <section class="empty-state panel">
+        <h2>You are not signed in</h2>
+        <p class="muted">Use your directory account to continue.</p>
+        <div class="actions">
+          <a class="button" href="/login">Sign in</a>
+        </div>
       </section>
     {{end}}
-    <form method="get" action="/logout">
-      <button type="submit">Sign out</button>
-    </form>
-  {{else}}
-    <p>You are not signed in to authbroker.</p>
-    <p><a href="/login">Sign in</a></p>
-  {{end}}
+  </main>
 </body>
 </html>`))
 
 //nolint:gochecknoglobals // Parsed templates are immutable and shared by handlers.
 var brokerLogoutTemplate = template.Must(template.New("broker-logout").Parse(`<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>Logout</title></head>
-<body style="font-family: sans-serif; max-width: 36rem; margin: 3rem auto; line-height: 1.45;">
-  <h1>Logout</h1>
-  <p>Signed in as <strong>{{.UserID}}</strong>.</p>
-  <form method="post" action="/logout">
-    <button type="submit">Sign out of authbroker</button>
-    <a href="/" style="margin-left:1rem">Cancel</a>
-  </form>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign out</title>
+  <link rel="stylesheet" href="/assets/authbroker.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">AB</div>
+        <div>
+          <h1 class="brand-title">{{.DisplayName}}</h1>
+          <div class="brand-subtitle">Session control</div>
+        </div>
+      </div>
+    </header>
+    <section class="panel logout-panel">
+      <p class="section-kicker">Sign out</p>
+      <h2 class="panel-title">End this broker session?</h2>
+      <p>Signed in as <strong>{{.UserID}}</strong>.</p>
+      <form method="post" action="/logout" class="actions logout-actions">
+        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+        <button type="submit" class="danger">Sign out of authbroker</button>
+        <a class="button secondary" href="/">Cancel</a>
+      </form>
+    </section>
+  </main>
 </body>
 </html>`))
 
 //nolint:gochecknoglobals // Parsed templates are immutable and shared by handlers.
 var loginTemplate = template.Must(template.New("login").Parse(`<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>Login</title></head>
-<body style="font-family: sans-serif; max-width: 36rem; margin: 3rem auto;">
-  <h1>Login</h1>
-  <p>Client: <strong>{{.ClientID}}</strong></p>
-  <form method="post" action="/login">
-    <input type="hidden" name="request_id" value="{{.RequestID}}" />
-    <label>Username<br><input name="username" autocomplete="username" required style="width:100%"></label><br><br>
-    <label>Password<br><input name="password" type="password" autocomplete="current-password" required style="width:100%"></label><br><br>
-    <label>TOTP code {{if not .TOTPHint}}(if enrolled){{end}}<br><input name="otp" inputmode="numeric" autocomplete="one-time-code" style="width:100%"></label><br><br>
-    <button type="submit">Continue</button>
-  </form>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in</title>
+  <link rel="stylesheet" href="/assets/authbroker.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">AB</div>
+        <div>
+          <h1 class="brand-title">{{.DisplayName}}</h1>
+          <div class="brand-subtitle">Client: {{.ClientID}}</div>
+        </div>
+      </div>
+      <div class="status-pill">Sign in</div>
+    </header>
+    <section class="login-panel">
+      <p class="section-kicker">Directory login</p>
+      <h1>Sign in</h1>
+      <form method="post" action="/login" class="form-grid">
+        <input type="hidden" name="request_id" value="{{.RequestID}}">
+        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+        <label class="field">
+          <span>Username</span>
+          <input name="username" autocomplete="username" required>
+        </label>
+        <label class="field">
+          <span>Password</span>
+          <input name="password" type="password" autocomplete="current-password" required>
+        </label>
+        <label class="field">
+          <span>TOTP code {{if not .TOTPHint}}(if enrolled){{end}}</span>
+          <input name="otp" inputmode="numeric" autocomplete="one-time-code">
+        </label>
+        <div class="actions">
+          <button type="submit">Continue</button>
+        </div>
+      </form>
+    </section>
+  </main>
 </body>
 </html>`))
 
