@@ -1,0 +1,54 @@
+{
+  "issuer": "http://localhost:8080",
+  "listen": ":8080",
+  "key_id": "authbroker-dev-key-1",
+  "cookie_secure": false,
+  "access_token_ttl_minutes": 15,
+  "id_token_ttl_minutes": 15,
+  "refresh_token_ttl_days": 14,
+  "auth_code_ttl_seconds": 120,
+  "session_ttl_hours": 8,
+
+  "ldap": {
+    "url": "ldaps://dc01.example.com:636",
+    "domain_suffix": "@example.com",
+    "user_dn_template": "",
+    "insecure_skip_verify": false,
+    "timeout_seconds": 5
+  },
+
+  "dev_users": [
+    {
+      "username": "devuser",
+      "password": "dev-password",
+      "email": "devuser@example.com",
+      "name": "devuser"
+    }
+  ],
+
+  "mfa": {
+    "totp_required": false
+  },
+
+  "webauthn": {
+    "rp_id": "localhost",
+    "rp_display_name": "Go Auth Broker",
+    "origins": ["http://localhost:8080"]
+  },
+
+  "clients": [
+    {
+      "client_id": "demo-web",
+      "client_secret": "demo-secret",
+      "redirect_uris": ["http://localhost:3000/callback"],
+      "public": false,
+      "require_pkce": true
+    },
+    {
+      "client_id": "demo-spa",
+      "redirect_uris": ["http://localhost:3000/callback"],
+      "public": true,
+      "require_pkce": true
+    }
+  ]
+}
