@@ -35,6 +35,28 @@ JWKS:
 curl http://localhost:8080/oauth2/jwks
 ```
 
+## Docker Compose demo
+
+The compose stack starts:
+
+- `glauth` as the LDAPS server, using the users in `testldap/default-config.cfg`
+- `authbroker` on <http://localhost:8080>
+- `test-web-ui` on <http://localhost:8090>
+
+```bash
+docker compose up --build
+```
+
+Open <http://localhost:8090> and sign in through authbroker. Useful test users:
+
+```text
+ingestuser / dogood
+johndoe / dogood
+serviceuser / mysecret
+```
+
+The compose broker config lives in `compose/authbroker.config.json`. The test UI uses `http://localhost:8080` for browser redirects and `http://authbroker:8080` for server-side token and UserInfo calls inside the Docker network.
+
 ## Generate a persistent signing key
 
 By default the server generates an ephemeral RSA key on startup. For real use, generate a stable key:

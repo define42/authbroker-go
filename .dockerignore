@@ -1,0 +1,10 @@
+.git
+.gitignore
+*.swp
+*.tmp
+data.json
+data/
+coverage.*
+*.coverprofile
+*.test
+test-web-ui

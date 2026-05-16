@@ -1,0 +1,54 @@
+services:
+  glauth:
+    image: glauth/glauth:latest
+    environment:
+      GLAUTH_CONFIG: /app/config/config.cfg
+    volumes:
+      - ./testldap/default-config.cfg:/app/config/config.cfg:ro
+      - ./testldap/cert.pem:/app/config/cert.pem:ro
+      - ./testldap/key.pem:/app/config/key.pem:ro
+    ports:
+      - "3890:389"
+
+  authbroker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - -config
+      - /etc/authbroker/config.json
+      - -data
+      - /tmp/authbroker-data/data.json
+    depends_on:
+      - glauth
+    volumes:
+      - ./compose/authbroker.config.json:/etc/authbroker/config.json:ro
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  test-web-ui:
+    build:
+      context: ./test-web-ui
+      dockerfile: Dockerfile
+    environment:
+      WEB_UI_LISTEN: ":8090"
+      PUBLIC_BASE_URL: "http://localhost:8090"
+      AUTHBROKER_PUBLIC_URL: "http://localhost:8080"
+      AUTHBROKER_INTERNAL_URL: "http://authbroker:8080"
+      OAUTH_CLIENT_ID: "test-web-ui"
+      OAUTH_CLIENT_SECRET: "test-web-ui-secret"
+    depends_on:
+      authbroker:
+        condition: service_healthy
+    ports:
+      - "8090:8090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8090/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20

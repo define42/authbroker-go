@@ -1,0 +1,43 @@
+{
+  "issuer": "http://localhost:8080",
+  "listen": ":8080",
+  "key_id": "authbroker-compose-key-1",
+  "cookie_secure": false,
+  "access_token_ttl_minutes": 15,
+  "id_token_ttl_minutes": 15,
+  "refresh_token_ttl_days": 1,
+  "auth_code_ttl_seconds": 120,
+  "session_ttl_hours": 8,
+
+  "ldap": {
+    "url": "ldaps://glauth:389",
+    "domain_suffix": "@example.com",
+    "base_dn": "dc=glauth,dc=com",
+    "user_filter": "(mail={login})",
+    "email_attribute": "mail",
+    "name_attribute": "cn",
+    "start_tls": false,
+    "insecure_skip_verify": true,
+    "timeout_seconds": 5
+  },
+
+  "mfa": {
+    "totp_required": false
+  },
+
+  "webauthn": {
+    "rp_id": "localhost",
+    "rp_display_name": "Go Auth Broker",
+    "origins": ["http://localhost:8080"]
+  },
+
+  "clients": [
+    {
+      "client_id": "test-web-ui",
+      "client_secret": "test-web-ui-secret",
+      "redirect_uris": ["http://localhost:8090/callback"],
+      "public": false,
+      "require_pkce": true
+    }
+  ]
+}
