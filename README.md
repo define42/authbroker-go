@@ -55,7 +55,7 @@ johndoe / dogood
 serviceuser / mysecret
 ```
 
-The compose broker config lives in `compose/authbroker.config.json`. The test UI uses `http://localhost:8080` for browser redirects and `http://authbroker:8080` for server-side token and UserInfo calls inside the Docker network, then displays the LDAP-backed profile and groups.
+The compose broker config lives in `compose/authbroker.config.json`. The test UI uses `http://localhost:8080` for browser redirects and `http://authbroker:8080` for server-side token and UserInfo calls inside the Docker network, then displays the LDAP-backed profile and client-mapped groups.
 
 ## Generate a persistent signing key
 
@@ -110,6 +110,23 @@ printf '%s' 'demo-secret' | sha256sum
 
 Use the resulting first field as `client_secret_sha256`. The client still sends the original secret (`demo-secret`) to `/oauth2/token`; the broker hashes it and compares it with the configured digest.
 
+Groups are also configured per client. LDAP/AD may return a large `memberOf` list, but the broker only emits groups that the client maps:
+
+```json
+{
+  "client_id": "demo-web",
+  "client_secret_sha256": "cd577fe2561ebff23505db0bb006300c7cdecbd46bc0e03c449afafaca2c25bf",
+  "redirect_uris": ["http://localhost:3000/callback"],
+  "require_pkce": true,
+  "group_mappings": {
+    "CN=Demo App Users,OU=Groups,DC=example,DC=com": "demo-user",
+    "CN=Demo App Admins,OU=Groups,DC=example,DC=com": "demo-admin"
+  }
+}
+```
+
+Mapping keys can be raw LDAP DNs or the normalized group names returned by the broker. Only mapped groups are included in access tokens, ID tokens, and UserInfo, and only when the authorization request includes the `groups` scope.
+
 ## LDAP/AD backend
 
 Configure LDAP/AD as the authentication backend.
@@ -139,13 +156,15 @@ The broker will bind as:
 <username>@example.com
 ```
 
-It then searches below `base_dn`, escapes the `{login}` value, and copies the configured LDAP attributes into OIDC `email`, `name`, and `groups` claims.
+It then searches below `base_dn`, escapes the `{login}` value, and copies the configured LDAP attributes into the broker profile. OIDC `groups` claims are filtered through each client's `group_mappings`.
 
 Group support:
 
 - Direct LDAP groups from `groups_attribute`: yes
 - Nested AD groups: yes, when `nested_groups` is `true`
 - Nested OpenLDAP groups: no
+
+Collected LDAP groups are stored on the broker-side profile and are not forwarded wholesale. Add `group_mappings` to each client that should receive group claims.
 
 For OpenLDAP DN-template bind:
 

@@ -85,11 +85,12 @@ type LDAPConfig struct {
 }
 
 type Client struct {
-	ClientID           string   `json:"client_id"`
-	ClientSecretSHA256 string   `json:"client_secret_sha256,omitempty"`
-	RedirectURIs       []string `json:"redirect_uris"`
-	Public             bool     `json:"public"`
-	RequirePKCE        bool     `json:"require_pkce"`
+	ClientID           string            `json:"client_id"`
+	ClientSecretSHA256 string            `json:"client_secret_sha256,omitempty"`
+	RedirectURIs       []string          `json:"redirect_uris"`
+	Public             bool              `json:"public"`
+	RequirePKCE        bool              `json:"require_pkce"`
+	GroupMappings      map[string]string `json:"group_mappings,omitempty"`
 }
 
 type MFAConfig struct {
@@ -537,6 +538,66 @@ func mergeStrings(values ...[]string) []string {
 	return out
 }
 
+func normalizeClientGroupMappings(in map[string]string) (map[string]string, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	out := map[string]string{}
+	seenSources := map[string]string{}
+	for source, target := range in {
+		normalizedSource := ldapGroupName(source)
+		sourceKey := strings.ToLower(normalizedSource)
+		target = strings.TrimSpace(target)
+		if sourceKey == "" {
+			return nil, fmt.Errorf("group_mappings source cannot be blank")
+		}
+		if target == "" {
+			return nil, fmt.Errorf("group_mappings target for %q cannot be blank", source)
+		}
+		if existing, ok := seenSources[sourceKey]; ok && existing != target {
+			return nil, fmt.Errorf("group_mappings has duplicate source %q with different targets", normalizedSource)
+		}
+		seenSources[sourceKey] = target
+		out[normalizedSource] = target
+	}
+	return out, nil
+}
+
+func mappedClientGroups(client Client, userGroups []string) []string {
+	if len(userGroups) == 0 || len(client.GroupMappings) == 0 {
+		return nil
+	}
+	mappings := map[string]string{}
+	for source, target := range client.GroupMappings {
+		sourceName := ldapGroupName(source)
+		if sourceName == "" || strings.TrimSpace(target) == "" {
+			continue
+		}
+		mappings[strings.ToLower(sourceName)] = strings.TrimSpace(target)
+	}
+	seen := map[string]bool{}
+	groups := []string{}
+	for _, group := range userGroups {
+		target := mappings[strings.ToLower(ldapGroupName(group))]
+		if target == "" || seen[target] {
+			continue
+		}
+		seen[target] = true
+		groups = append(groups, target)
+	}
+	sort.Strings(groups)
+	return groups
+}
+
+func scopeIncludes(scope, wanted string) bool {
+	for _, part := range strings.Fields(scope) {
+		if part == wanted {
+			return true
+		}
+	}
+	return false
+}
+
 func escapeLDAPDN(s string) string {
 	replacer := strings.NewReplacer(
 		"\\", "\\5c",
@@ -641,6 +702,11 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 		if c.ClientID == "" {
 			return nil, fmt.Errorf("client_id is required")
 		}
+		groupMappings, err := normalizeClientGroupMappings(c.GroupMappings)
+		if err != nil {
+			return nil, fmt.Errorf("client %q: %w", c.ClientID, err)
+		}
+		c.GroupMappings = groupMappings
 		clientMap[c.ClientID] = c
 	}
 
@@ -1120,8 +1186,10 @@ func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime
 	if user != nil {
 		accessClaims["email"] = user.Email
 		accessClaims["name"] = displayName(user)
-		if len(user.Groups) > 0 {
-			accessClaims["groups"] = user.Groups
+		if scopeIncludes(scope, "groups") {
+			if groups := b.mappedGroupsForClient(clientID, user); len(groups) > 0 {
+				accessClaims["groups"] = groups
+			}
 		}
 	}
 	access, err := b.signJWT(accessClaims)
@@ -1144,8 +1212,10 @@ func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime
 	if user != nil {
 		idClaims["email"] = user.Email
 		idClaims["name"] = displayName(user)
-		if len(user.Groups) > 0 {
-			idClaims["groups"] = user.Groups
+		if scopeIncludes(scope, "groups") {
+			if groups := b.mappedGroupsForClient(clientID, user); len(groups) > 0 {
+				idClaims["groups"] = groups
+			}
 		}
 	}
 	idToken, err := b.signJWT(idClaims)
@@ -1187,6 +1257,17 @@ func displayName(u *StoredUser) string {
 	return u.Username
 }
 
+func (b *Broker) mappedGroupsForClient(clientID string, user *StoredUser) []string {
+	if user == nil {
+		return nil
+	}
+	client, ok := b.clients[clientID]
+	if !ok {
+		return nil
+	}
+	return mappedClientGroups(client, user.Groups)
+}
+
 func (b *Broker) handleUserInfo(w http.ResponseWriter, r *http.Request) {
 	token := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), bearerPrefix))
 	if token == r.Header.Get("Authorization") || token == "" {
@@ -1199,6 +1280,11 @@ func (b *Broker) handleUserInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sub, _ := claims["sub"].(string)
+	clientID, _ := claims["client_id"].(string)
+	if clientID == "" {
+		clientID, _ = claims["aud"].(string)
+	}
+	scope, _ := claims["scope"].(string)
 	user, _ := b.store.GetUser(sub)
 	resp := map[string]any{
 		"sub":                sub,
@@ -1207,8 +1293,10 @@ func (b *Broker) handleUserInfo(w http.ResponseWriter, r *http.Request) {
 	if user != nil {
 		resp["email"] = user.Email
 		resp["name"] = displayName(user)
-		if len(user.Groups) > 0 {
-			resp["groups"] = user.Groups
+		if scopeIncludes(scope, "groups") {
+			if groups := b.mappedGroupsForClient(clientID, user); len(groups) > 0 {
+				resp["groups"] = groups
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)

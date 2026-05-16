@@ -150,6 +150,54 @@ func TestMergeStrings(t *testing.T) {
 	}
 }
 
+func TestMappedClientGroups(t *testing.T) {
+	client := Client{GroupMappings: map[string]string{
+		"app_elk_team10_ingest":                         "elk-ingest",
+		"CN=Finance Admins,OU=Groups,DC=example,DC=com": "finance-admin",
+	}}
+	groupMappings, err := normalizeClientGroupMappings(client.GroupMappings)
+	if err != nil {
+		t.Fatalf("normalizeClientGroupMappings(): %v", err)
+	}
+	client.GroupMappings = groupMappings
+
+	got := mappedClientGroups(client, []string{
+		"APP_ELK_TEAM10_INGEST",
+		"cn=Finance Admins,ou=Groups,dc=example,dc=com",
+		"unmapped-directory-group",
+	})
+	want := []string{"elk-ingest", "finance-admin"}
+	assertStringSlicesEqual(t, got, want)
+
+	if got := mappedClientGroups(Client{}, []string{"app_elk_team10_ingest"}); len(got) != 0 {
+		t.Fatalf("mappedClientGroups() with no mapping = %#v, want no groups", got)
+	}
+}
+
+func TestNormalizeClientGroupMappingsValidation(t *testing.T) {
+	if _, err := normalizeClientGroupMappings(map[string]string{"": "app-user"}); err == nil {
+		t.Fatalf("blank group mapping source should fail")
+	}
+	if _, err := normalizeClientGroupMappings(map[string]string{"app-source": ""}); err == nil {
+		t.Fatalf("blank group mapping target should fail")
+	}
+	if _, err := normalizeClientGroupMappings(map[string]string{
+		"CN=Ops,OU=Groups,DC=example,DC=com": "ops",
+		"ops":                                "other-ops",
+	}); err == nil {
+		t.Fatalf("duplicate normalized group mapping source should fail")
+	}
+}
+
+func TestScopeIncludes(t *testing.T) {
+	if !scopeIncludes("openid profile email groups", "groups") {
+		t.Fatalf("expected groups scope to be detected")
+	}
+	if scopeIncludes("openid profile groupish", "groups") {
+		t.Fatalf("partial scope name should not match")
+	}
+}
+
 func TestClientSecretMatchesSHA256(t *testing.T) {
 	client := Client{
 		ClientID:           "demo-web",
@@ -207,7 +255,8 @@ func TestLDAPBrokerOAuthIntegration(t *testing.T) {
 		assertStringClaim(t, accessClaims, "sub", "ingestuser")
 		assertStringClaim(t, accessClaims, "email", "ingestuser@example.com")
 		assertStringClaim(t, accessClaims, "name", "ingestuser")
-		assertStringSliceClaimContains(t, accessClaims, "groups", "app_elk_team10_ingest")
+		assertStringSliceClaimContains(t, accessClaims, "groups", "elk-ingest")
+		assertStringSliceClaimNotContains(t, accessClaims, "groups", "app_elk_team10_ingest")
 
 		idClaims, err := broker.verifyJWT(tokens.IDToken)
 		if err != nil {
@@ -216,7 +265,8 @@ func TestLDAPBrokerOAuthIntegration(t *testing.T) {
 		assertStringClaim(t, idClaims, "sub", "ingestuser")
 		assertStringClaim(t, idClaims, "email", "ingestuser@example.com")
 		assertStringClaim(t, idClaims, "name", "ingestuser")
-		assertStringSliceClaimContains(t, idClaims, "groups", "app_elk_team10_ingest")
+		assertStringSliceClaimContains(t, idClaims, "groups", "elk-ingest")
+		assertStringSliceClaimNotContains(t, idClaims, "groups", "app_elk_team10_ingest")
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/oauth2/userinfo", nil)
 		if err != nil {
@@ -239,7 +289,8 @@ func TestLDAPBrokerOAuthIntegration(t *testing.T) {
 		assertStringClaim(t, userinfo, "sub", "ingestuser")
 		assertStringClaim(t, userinfo, "email", "ingestuser@example.com")
 		assertStringClaim(t, userinfo, "name", "ingestuser")
-		assertStringSliceClaimContains(t, userinfo, "groups", "app_elk_team10_ingest")
+		assertStringSliceClaimContains(t, userinfo, "groups", "elk-ingest")
+		assertStringSliceClaimNotContains(t, userinfo, "groups", "app_elk_team10_ingest")
 	})
 
 	t.Run("wrong password is unauthorized and issues no auth code", func(t *testing.T) {
@@ -422,6 +473,9 @@ func startTestBroker(ctx context.Context, t *testing.T, ldapCfg LDAPConfig) (str
 					baseURL + "/callback",
 				},
 				RequirePKCE: true,
+				GroupMappings: map[string]string{
+					"app_elk_team10_ingest": "elk-ingest",
+				},
 			},
 		},
 	}
@@ -485,6 +539,30 @@ func assertStringSliceClaimContains(t *testing.T, claims map[string]any, name, w
 		}
 	}
 	t.Fatalf("claim %s = %#v, want it to contain %q", name, claims[name], want)
+}
+
+func assertStringSliceClaimNotContains(t *testing.T, claims map[string]any, name, unwanted string) {
+	t.Helper()
+
+	values := stringSliceClaim(claims[name])
+	for _, value := range values {
+		if value == unwanted {
+			t.Fatalf("claim %s = %#v, should not contain %q", name, claims[name], unwanted)
+		}
+	}
+}
+
+func assertStringSlicesEqual(t *testing.T, got, want []string) {
+	t.Helper()
+
+	if len(got) != len(want) {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %#v, want %#v", got, want)
+		}
+	}
 }
 
 func stringSliceClaim(value any) []string {

@@ -355,7 +355,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
         <dt>Username</dt><dd>{{.Profile.PreferredUsername}}</dd>
         <dt>Email</dt><dd>{{.Profile.Email}}</dd>
         <dt>Name</dt><dd>{{.Profile.Name}}</dd>
-        <dt>Groups</dt><dd>{{range $i, $group := .Profile.Groups}}{{if $i}}, {{end}}{{$group}}{{else}}none{{end}}</dd>
+        <dt>Mapped groups</dt><dd>{{range $i, $group := .Profile.Groups}}{{if $i}}, {{end}}{{$group}}{{else}}none{{end}}</dd>
       </dl>
       <form method="post" action="/logout"><button type="submit">Sign out</button></form>
     {{else}}
