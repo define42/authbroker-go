@@ -50,7 +50,7 @@ func adminSession(t *testing.T, broker *Broker, username string, isAdmin bool) (
 	if _, err := broker.store.UpsertProfile(UserProfile{Subject: username, Groups: groups}); err != nil {
 		t.Fatalf("upsert profile: %v", err)
 	}
-	sess, err := broker.createSession(httptest.NewRecorder(), username, true)
+	sess, err := broker.createSession(httptest.NewRecorder(), username, true, nil)
 	if err != nil {
 		t.Fatalf("create session: %v", err)
 	}

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -53,7 +54,7 @@ func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sess, hasSession := b.validSession(r)
-	errCode, errDesc, err := b.checkPrompt(q.Get("prompt"), sess, hasSession, client, authReq.Scope)
+	errCode, errDesc, forceLogin, err := b.checkPrompt(q.Get("prompt"), q.Get("max_age"), sess, hasSession, client, authReq.Scope)
 	if err != nil {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
@@ -63,7 +64,7 @@ func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if hasSession {
+	if hasSession && !forceLogin {
 		b.maybeExtendSession(w, r)
 		if err := b.proceedAfterAuthn(w, r, authReq, sess); err != nil {
 			http.Error(w, "store error", http.StatusInternalServerError)
@@ -78,33 +79,60 @@ func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/login?request_id="+url.QueryEscape(authReq.ID), http.StatusFound)
 }
 
-// checkPrompt implements OIDC Core §3.1.2.1 prompt handling. It parses the
-// space-separated `prompt` parameter, rejects `none` combined with any other
-// value, and applies the silent-auth pre-checks when only `none` was
-// requested. The returned (code, desc) is the OIDC error to redirect to the
-// client, or empty strings if the request may proceed.
-func (b *Broker) checkPrompt(raw string, sess Session, hasSession bool, client Client, scope string) (string, string, error) {
+// checkPrompt implements OIDC Core §3.1.2.1 freshness handling for the
+// /authorize endpoint. It parses the space-separated `prompt` parameter and
+// the `max_age` parameter, rejects `none` combined with any other prompt
+// value, applies the silent-auth pre-checks when `none` was requested, and
+// signals (via forceLogin=true) that an existing SSO session must be
+// bypassed in favor of a fresh login when `login` was requested or when
+// `max_age` shows that the session's auth_time is too stale. The returned
+// (errCode, errDesc) is the OIDC error to redirect to the client, or empty
+// strings if the request may proceed.
+func (b *Broker) checkPrompt(promptRaw, maxAgeRaw string, sess Session, hasSession bool, client Client, scope string) (errCode, errDesc string, forceLogin bool, err error) {
 	prompts := map[string]bool{}
-	for _, p := range strings.Fields(raw) {
+	for _, p := range strings.Fields(promptRaw) {
 		prompts[p] = true
 	}
 	if prompts["none"] && len(prompts) > 1 {
-		return "invalid_request", "prompt=none cannot be combined with other prompt values", nil
+		return "invalid_request", "prompt=none cannot be combined with other prompt values", false, nil
 	}
-	if !prompts["none"] {
-		return "", "", nil
+	stale, parseErr := authTimeStale(sess, hasSession, maxAgeRaw)
+	if parseErr != nil {
+		return "invalid_request", parseErr.Error(), false, nil
+	}
+	if prompts["none"] {
+		if !hasSession || stale {
+			return "login_required", "prompt=none but the user is not authenticated within max_age", false, nil
+		}
+		needConsent, cerr := b.consentMissingForRequest(sess.UserID, client, scope)
+		if cerr != nil {
+			return "", "", false, cerr
+		}
+		if needConsent {
+			return "consent_required", "prompt=none but consent has not been granted", false, nil
+		}
+		return "", "", false, nil
+	}
+	return "", "", prompts["login"] || stale, nil
+}
+
+// authTimeStale reports whether the active session's auth_time is older than
+// the OIDC max_age window. When max_age is unset or malformed in a benign way
+// (empty), returns false; when malformed (negative or non-numeric), returns
+// an error so handleAuthorize can surface invalid_request.
+func authTimeStale(sess Session, hasSession bool, maxAgeRaw string) (bool, error) {
+	maxAgeRaw = strings.TrimSpace(maxAgeRaw)
+	if maxAgeRaw == "" {
+		return false, nil
+	}
+	maxAge, err := strconv.Atoi(maxAgeRaw)
+	if err != nil || maxAge < 0 {
+		return false, fmt.Errorf("max_age must be a non-negative integer")
 	}
 	if !hasSession {
-		return "login_required", "prompt=none but no active session", nil
+		return false, nil
 	}
-	needConsent, err := b.consentMissingForRequest(sess.UserID, client, scope)
-	if err != nil {
-		return "", "", err
-	}
-	if needConsent {
-		return "consent_required", "prompt=none but consent has not been granted", nil
-	}
-	return "", "", nil
+	return time.Since(sess.AuthTime) > time.Duration(maxAge)*time.Second, nil
 }
 
 // consentMissingForRequest reports whether prompt=none must error with
@@ -239,7 +267,7 @@ func (b *Broker) tokenAuthorizationCode(w http.ResponseWriter, r *http.Request, 
 	// offline_access scope. Browsers can still re-establish tokens via a
 	// silent /oauth2/authorize using the SSO session cookie.
 	includeRefresh := scopeIncludes(ac.Scope, "offline_access")
-	resp, err := b.issueUserTokens(ac.UserID, client.ClientID, ac.Scope, ac.Nonce, ac.AuthTime, includeRefresh)
+	resp, err := b.issueUserTokens(ac.UserID, client.ClientID, ac.Scope, ac.Nonce, ac.AuthTime, ac.AMR, includeRefresh)
 	if err != nil {
 		tokenServerError(w, "issue tokens for authorization_code grant", err)
 		return
@@ -315,7 +343,7 @@ func (b *Broker) tokenRefresh(w http.ResponseWriter, r *http.Request, client Cli
 	if requestedScope != "" {
 		scope = requestedScope
 	}
-	resp, err := b.issueUserTokens(old.UserID, client.ClientID, scope, "", old.AuthTime, true)
+	resp, err := b.issueUserTokens(old.UserID, client.ClientID, scope, "", old.AuthTime, old.AMR, true)
 	if err != nil {
 		tokenServerError(w, "issue tokens for refresh_token grant", err)
 		return
@@ -382,8 +410,19 @@ func (b *Broker) tokenClientCredentials(w http.ResponseWriter, r *http.Request, 
 	})
 }
 
+// OIDC `amr` values recorded for each authentication method we support, per
+// RFC 8176. `pwd` is password authentication; `otp` covers TOTP; `hwk` marks
+// WebAuthn (proof-of-possession of a hardware/software key); `mfa` is added
+// whenever more than one factor was used at this login.
+const (
+	amrPassword = "pwd"
+	amrOTP      = "otp"
+	amrWebAuthn = "hwk"
+	amrMFA      = "mfa"
+)
+
 //nolint:gocognit,funlen // Access and ID token claims are intentionally assembled together.
-func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime time.Time, includeRefresh bool) (map[string]any, error) {
+func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime time.Time, amr []string, includeRefresh bool) (map[string]any, error) {
 	user, _ := b.store.GetUser(userID)
 	now := time.Now()
 	accessJTI := randomB64(16)
@@ -425,6 +464,9 @@ func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime
 		"preferred_username": userID,
 		"at_hash":            base64RawURL(atHashSum[:sha256.Size/2]),
 	}
+	if len(amr) > 0 {
+		idClaims["amr"] = amr
+	}
 	if nonce != "" {
 		idClaims["nonce"] = nonce
 	}
@@ -457,6 +499,7 @@ func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime
 			Scope:     scope,
 			AuthTime:  authTime,
 			ExpiresAt: now.Add(time.Duration(b.cfg.RefreshTokenTTLDays) * 24 * time.Hour),
+			AMR:       amr,
 		}
 		if err := b.store.PutRefreshToken(hashSecret(rt), refreshToken); err != nil {
 			return nil, err
@@ -523,9 +566,34 @@ func (b *Broker) mappedGroupsForClient(clientID string, user *StoredUser) []stri
 	return mappedClientGroups(client, user.Groups)
 }
 
+// userInfoBearerToken extracts the access token per RFC 6750. The
+// Authorization: Bearer header takes precedence; for POST requests with a
+// form-encoded body, the `access_token` parameter is also accepted, as
+// required by OIDC Core §5.3.1.
+func userInfoBearerToken(w http.ResponseWriter, r *http.Request) string {
+	authz := r.Header.Get("Authorization")
+	token := strings.TrimSpace(strings.TrimPrefix(authz, bearerPrefix))
+	if token != "" && token != authz {
+		return token
+	}
+	if r.Method != http.MethodPost {
+		return ""
+	}
+	ct := strings.ToLower(strings.TrimSpace(strings.SplitN(r.Header.Get("Content-Type"), ";", 2)[0]))
+	if ct != "application/x-www-form-urlencoded" {
+		return ""
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxUserInfoBodyBytes)
+	if err := r.ParseForm(); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(r.PostForm.Get("access_token"))
+}
+
 func (b *Broker) handleUserInfo(w http.ResponseWriter, r *http.Request) {
-	token := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), bearerPrefix))
-	if token == r.Header.Get("Authorization") || token == "" {
+	token := userInfoBearerToken(w, r)
+	if token == "" {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="userinfo"`)
 		http.Error(w, "missing bearer token", http.StatusUnauthorized)
 		return
 	}

@@ -225,7 +225,7 @@ func (b *Broker) handleWebAuthnLoginFinish(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	b.loginLimiter.recordSuccess(rateKey)
-	if _, err := b.createSession(w, ch.UserID, true); err != nil {
+	if _, err := b.createSession(w, ch.UserID, true, []string{amrWebAuthn}); err != nil {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}

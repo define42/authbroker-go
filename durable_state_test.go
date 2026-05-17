@@ -86,7 +86,7 @@ func TestBrokerPersistsRuntimeStateMutations(t *testing.T) {
 	}
 
 	sessionRecorder := httptest.NewRecorder()
-	sess, err := broker.createSession(sessionRecorder, "johndoe", true)
+	sess, err := broker.createSession(sessionRecorder, "johndoe", true, nil)
 	if err != nil {
 		t.Fatalf("create session: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestBrokerPersistsRuntimeStateMutations(t *testing.T) {
 	if err := broker.issueCodeRedirect(redirectRecorder, redirectReq, authReq, sess); err != nil {
 		t.Fatalf("issue code redirect: %v", err)
 	}
-	if _, err := broker.issueUserTokens("johndoe", "demo-web", "openid offline_access", "", sess.AuthTime, true); err != nil {
+	if _, err := broker.issueUserTokens("johndoe", "demo-web", "openid offline_access", "", sess.AuthTime, nil, true); err != nil {
 		t.Fatalf("issue user tokens: %v", err)
 	}
 	if err := store.Close(); err != nil {

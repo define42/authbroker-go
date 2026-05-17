@@ -26,6 +26,10 @@ type Session struct {
 	// TOTP enroll and WebAuthn register endpoints require this to be set
 	// within reAuthValidity to mutate second-factor material.
 	ReAuthAt time.Time `json:"re_auth_at,omitempty"`
+	// AMR records the OIDC `amr` (Authentication Methods References) values
+	// for the most recent authentication. Values follow RFC 8176 (e.g.,
+	// "pwd", "otp", "hwk", "mfa") and are emitted in the id_token.
+	AMR []string `json:"amr,omitempty"`
 }
 
 type AuthorizationRequest struct {
@@ -53,6 +57,7 @@ type AuthCode struct {
 	CodeChallengeMethod string
 	AuthTime            time.Time
 	ExpiresAt           time.Time
+	AMR                 []string
 }
 
 // RefreshToken is keyed in the RefreshTokens map by hashSecret(token).
@@ -62,6 +67,7 @@ type RefreshToken struct {
 	Scope     string
 	AuthTime  time.Time
 	ExpiresAt time.Time
+	AMR       []string
 }
 
 type ChallengeRecord struct {
@@ -368,6 +374,7 @@ func (b *Broker) routes() http.Handler {
 	mux.HandleFunc("POST /app-tokens/{id}", b.handleAppToken)
 	mux.HandleFunc("POST /oauth2/token", b.handleToken)
 	mux.HandleFunc("GET /oauth2/userinfo", b.handleUserInfo)
+	mux.HandleFunc("POST /oauth2/userinfo", b.handleUserInfo)
 	mux.HandleFunc("POST /oauth2/revoke", b.handleRevoke)
 	mux.HandleFunc("GET /oauth2/logout", b.handleLogout)
 	mux.HandleFunc("POST /oauth2/logout", b.handleLogout)

@@ -362,7 +362,7 @@ func TestSanitizeKeyIDPrefixStripsInvalidChars(t *testing.T) {
 
 func TestResolveLogoutClientIDFromIDTokenHint(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid", "", time.Now(), false)
+	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid", "", time.Now(), nil, false)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -380,7 +380,7 @@ func TestResolveLogoutClientIDFromIDTokenHint(t *testing.T) {
 
 func TestResolveLogoutClientIDMismatchFails(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid", "", time.Now(), false)
+	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid", "", time.Now(), nil, false)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -749,7 +749,7 @@ func TestUserInfoSurfacesGroupsForOwningClient(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
-	tokens, err := broker.issueUserTokens("alice", "demo-web", "openid groups", "", time.Now(), false)
+	tokens, err := broker.issueUserTokens("alice", "demo-web", "openid groups", "", time.Now(), nil, false)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -917,7 +917,7 @@ func TestHandleLoginPostRateLimited(t *testing.T) {
 
 func TestHandleReAuthRateLimited(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	sess, err := broker.createSession(httptest.NewRecorder(), "alice", false)
+	sess, err := broker.createSession(httptest.NewRecorder(), "alice", false, nil)
 	if err != nil {
 		t.Fatalf("createSession: %v", err)
 	}

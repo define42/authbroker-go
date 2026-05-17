@@ -135,7 +135,11 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	b.loginLimiter.recordSuccess(rateKey)
-	sess, err := b.createSession(w, user.Username, true)
+	amr := []string{amrPassword}
+	if b.needsTOTP(user) {
+		amr = append(amr, amrOTP, amrMFA)
+	}
+	sess, err := b.createSession(w, user.Username, true, amr)
 	if err != nil {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
@@ -583,11 +587,13 @@ func (b *Broker) clearSession(w http.ResponseWriter, r *http.Request) error {
 // createSession persists a new session, sets the cookie, and optionally marks
 // the session as freshly re-authenticated. Direct password / passkey logins
 // pass freshlyAuthenticated=true so the user can immediately enroll TOTP /
-// register a passkey without an extra re-auth round-trip.
-func (b *Broker) createSession(w http.ResponseWriter, userID string, freshlyAuthenticated bool) (Session, error) {
+// register a passkey without an extra re-auth round-trip. The amr slice
+// records the RFC 8176 authentication methods used at this login so the
+// id_token may include the OIDC `amr` claim.
+func (b *Broker) createSession(w http.ResponseWriter, userID string, freshlyAuthenticated bool, amr []string) (Session, error) {
 	sid := randomB64(32)
 	now := time.Now()
-	sess := Session{UserID: userID, ExpiresAt: now.Add(time.Duration(b.cfg.SessionTTLHrs) * time.Hour), AuthTime: now, CSRFToken: randomB64(32)}
+	sess := Session{UserID: userID, ExpiresAt: now.Add(time.Duration(b.cfg.SessionTTLHrs) * time.Hour), AuthTime: now, CSRFToken: randomB64(32), AMR: amr}
 	if freshlyAuthenticated {
 		sess.ReAuthAt = now
 	}
@@ -618,6 +624,7 @@ func (b *Broker) issueCodeRedirect(w http.ResponseWriter, r *http.Request, ar Au
 		CodeChallengeMethod: ar.CodeChallengeMethod,
 		AuthTime:            sess.AuthTime,
 		ExpiresAt:           time.Now().Add(time.Duration(b.cfg.AuthCodeTTLSeconds) * time.Second),
+		AMR:                 sess.AMR,
 	}
 	if err := b.store.PutAuthCode(hashSecret(code), ac); err != nil {
 		return err

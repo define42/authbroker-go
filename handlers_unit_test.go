@@ -269,6 +269,67 @@ func TestAuthorizePromptNoneConsentRequired(t *testing.T) {
 	}
 }
 
+// TestAuthorizePromptLoginForcesReauthentication exercises OIDC Core
+// §3.1.2.1: prompt=login MUST force a fresh login even when the SSO session
+// is still valid, so the broker must redirect to the login page instead of
+// issuing a code directly from the existing session.
+func TestAuthorizePromptLoginForcesReauthentication(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	sid := "sess-prompt-login"
+	if err := broker.store.PutSession(sid, Session{
+		UserID:    "johndoe",
+		ExpiresAt: time.Now().Add(time.Hour),
+		AuthTime:  time.Now().Add(-time.Hour),
+		CSRFToken: "csrf",
+	}); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {"demo-web"},
+		"redirect_uri":          {"http://app.example/callback"},
+		"code_challenge":        {"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"},
+		"code_challenge_method": {"S256"},
+		"state":                 {"abc"},
+		"prompt":                {"login"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/authorize?"+q.Encode(), nil)
+	addSessionCookie(req, sid)
+	rr := httptest.NewRecorder()
+	broker.handleAuthorize(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	loc := rr.Header().Get("Location")
+	if !strings.HasPrefix(loc, "/login?request_id=") {
+		t.Fatalf("location = %q, want /login redirect (prompt=login must bypass existing session)", loc)
+	}
+}
+
+// TestAuthorizePromptLoginWithoutSessionStillRedirectsToLogin verifies the
+// degenerate case: prompt=login when no session exists behaves like the
+// default unauthenticated flow.
+func TestAuthorizePromptLoginWithoutSessionStillRedirectsToLogin(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {"demo-web"},
+		"redirect_uri":          {"http://app.example/callback"},
+		"code_challenge":        {"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"},
+		"code_challenge_method": {"S256"},
+		"prompt":                {"login"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/authorize?"+q.Encode(), nil)
+	rr := httptest.NewRecorder()
+	broker.handleAuthorize(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if loc := rr.Header().Get("Location"); !strings.HasPrefix(loc, "/login?request_id=") {
+		t.Fatalf("location = %q, want /login redirect", loc)
+	}
+}
+
 // TestAuthorizePromptNoneRejectsCombination enforces the §3.1.2.1 rule that
 // the "none" value MUST NOT appear alongside any other prompt value; the
 // broker must surface invalid_request.
@@ -295,6 +356,198 @@ func TestAuthorizePromptNoneRejectsCombination(t *testing.T) {
 	}
 	if got := u.Query().Get("error"); got != "invalid_request" {
 		t.Fatalf("error = %q, want invalid_request", got)
+	}
+}
+
+// TestAuthorizeMaxAgeStaleForcesReauthentication exercises OIDC Core
+// §3.1.2.1 max_age: when the session's auth_time is older than max_age
+// seconds, the broker must re-authenticate the user rather than silently
+// reuse the existing session.
+func TestAuthorizeMaxAgeStaleForcesReauthentication(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	sid := "sess-stale"
+	if err := broker.store.PutSession(sid, Session{
+		UserID:    "johndoe",
+		ExpiresAt: time.Now().Add(time.Hour),
+		AuthTime:  time.Now().Add(-2 * time.Hour),
+		CSRFToken: "csrf",
+	}); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {"demo-web"},
+		"redirect_uri":          {"http://app.example/callback"},
+		"code_challenge":        {"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"},
+		"code_challenge_method": {"S256"},
+		"max_age":               {"60"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/authorize?"+q.Encode(), nil)
+	addSessionCookie(req, sid)
+	rr := httptest.NewRecorder()
+	broker.handleAuthorize(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if loc := rr.Header().Get("Location"); !strings.HasPrefix(loc, "/login?request_id=") {
+		t.Fatalf("location = %q, want /login redirect (stale auth_time must force reauth)", loc)
+	}
+}
+
+// TestAuthorizeMaxAgeFreshAllowsExistingSession covers the inverse path: a
+// session within the max_age window must continue to short-circuit to a code.
+func TestAuthorizeMaxAgeFreshAllowsExistingSession(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	sid := "sess-fresh"
+	if err := broker.store.PutSession(sid, Session{
+		UserID:    "johndoe",
+		ExpiresAt: time.Now().Add(time.Hour),
+		AuthTime:  time.Now(),
+		CSRFToken: "csrf",
+	}); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {"demo-web"},
+		"redirect_uri":          {"http://app.example/callback"},
+		"code_challenge":        {"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"},
+		"code_challenge_method": {"S256"},
+		"max_age":               {"3600"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/authorize?"+q.Encode(), nil)
+	addSessionCookie(req, sid)
+	rr := httptest.NewRecorder()
+	broker.handleAuthorize(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	u, err := url.Parse(rr.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse location: %v", err)
+	}
+	if got := u.Query().Get("code"); got == "" {
+		t.Fatalf("missing code in %q", u.String())
+	}
+}
+
+// TestAuthorizeMaxAgeRejectsMalformed covers the parser: a non-numeric
+// max_age must produce invalid_request rather than be silently ignored.
+func TestAuthorizeMaxAgeRejectsMalformed(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {"demo-web"},
+		"redirect_uri":          {"http://app.example/callback"},
+		"code_challenge":        {"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"},
+		"code_challenge_method": {"S256"},
+		"max_age":               {"not-a-number"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/authorize?"+q.Encode(), nil)
+	rr := httptest.NewRecorder()
+	broker.handleAuthorize(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	u, _ := url.Parse(rr.Header().Get("Location"))
+	if got := u.Query().Get("error"); got != "invalid_request" {
+		t.Fatalf("error = %q, want invalid_request", got)
+	}
+}
+
+// TestIssueUserTokensEmitsAMRClaim verifies the id_token carries the OIDC
+// `amr` array reflecting the authentication methods used at this login.
+func TestIssueUserTokensEmitsAMRClaim(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid", "",
+		time.Now(), []string{amrPassword, amrOTP, amrMFA}, false)
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	idToken, _ := tokens["id_token"].(string)
+	claims, err := broker.verifyJWT(idToken)
+	if err != nil {
+		t.Fatalf("verify id_token: %v", err)
+	}
+	rawAMR, ok := claims["amr"].([]any)
+	if !ok {
+		t.Fatalf("amr claim missing or wrong type: %#v", claims["amr"])
+	}
+	got := make([]string, len(rawAMR))
+	for i, v := range rawAMR {
+		got[i], _ = v.(string)
+	}
+	want := []string{amrPassword, amrOTP, amrMFA}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("amr = %v, want %v", got, want)
+	}
+}
+
+// TestIssueUserTokensOmitsAMRWhenEmpty checks that we don't emit an empty
+// `amr` claim — the id_token simply omits it when no method was recorded.
+func TestIssueUserTokensOmitsAMRWhenEmpty(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid", "", time.Now(), nil, false)
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	claims, err := broker.verifyJWT(tokens["id_token"].(string))
+	if err != nil {
+		t.Fatalf("verify id_token: %v", err)
+	}
+	if _, present := claims["amr"]; present {
+		t.Fatalf("amr must be absent when no methods recorded, got %#v", claims["amr"])
+	}
+}
+
+// TestUserInfoAcceptsPOSTWithBearerHeader checks the §5.3 requirement that
+// /oauth2/userinfo accepts POST with the access token in the Authorization
+// header.
+func TestUserInfoAcceptsPOSTWithBearerHeader(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	if _, err := broker.store.UpsertProfile(UserProfile{Subject: "johndoe", Email: "j@e", Name: "John"}); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid", "", time.Now(), nil, false)
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	access := tokens["access_token"].(string)
+	req := httptest.NewRequest(http.MethodPost, "/oauth2/userinfo", nil)
+	req.Header.Set("Authorization", bearerPrefix+access)
+	rr := httptest.NewRecorder()
+	broker.routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["sub"] != "johndoe" {
+		t.Fatalf("sub = %v", resp["sub"])
+	}
+}
+
+// TestUserInfoAcceptsPOSTWithFormToken covers the RFC 6750 §2.2 form-encoded
+// body method: the access token may also be supplied in the request body of
+// a POST.
+func TestUserInfoAcceptsPOSTWithFormToken(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	if _, err := broker.store.UpsertProfile(UserProfile{Subject: "johndoe", Email: "j@e", Name: "John"}); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid", "", time.Now(), nil, false)
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	form := url.Values{"access_token": {tokens["access_token"].(string)}}
+	req := httptest.NewRequest(http.MethodPost, "/oauth2/userinfo", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	broker.routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -493,7 +746,7 @@ func TestHandleRevokeFlow(t *testing.T) {
 
 func TestHandleRevokeAccessTokenAddsJTI(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid", "", time.Now(), false)
+	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid", "", time.Now(), nil, false)
 	if err != nil {
 		t.Fatalf("issue tokens: %v", err)
 	}
@@ -565,7 +818,7 @@ func TestUserInfoRequiresBearer(t *testing.T) {
 
 func TestUserInfoRejectsIDToken(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid groups", "", time.Now(), false)
+	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid groups", "", time.Now(), nil, false)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -584,7 +837,7 @@ func TestUserInfoOnAccessToken(t *testing.T) {
 	if _, err := broker.store.UpsertProfile(UserProfile{Subject: "johndoe", Email: "j@e", Name: "John"}); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
-	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid", "", time.Now(), false)
+	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid", "", time.Now(), nil, false)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -611,7 +864,7 @@ func TestUserInfoOnAccessToken(t *testing.T) {
 // the ID Token is signed with RS256.
 func TestIssueUserTokensSetsAtHash(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid", "", time.Now(), false)
+	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid", "", time.Now(), nil, false)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -735,7 +988,7 @@ func TestHandleLoginPostOAuthFlow(t *testing.T) {
 func TestHandleReAuth(t *testing.T) {
 	broker := newLogoutTestBroker(t)
 	broker.authn = staticAuthenticator{profile: UserProfile{Subject: "alice"}}
-	sess, err := broker.createSession(httptest.NewRecorder(), "alice", false)
+	sess, err := broker.createSession(httptest.NewRecorder(), "alice", false, nil)
 	if err != nil {
 		t.Fatalf("create session: %v", err)
 	}
@@ -780,7 +1033,7 @@ func TestHandleReAuthNotAuthenticated(t *testing.T) {
 func TestHandleReAuthBadPassword(t *testing.T) {
 	broker := newLogoutTestBroker(t)
 	broker.authn = staticAuthenticator{err: errors.New("nope")}
-	sess, _ := broker.createSession(httptest.NewRecorder(), "alice", false)
+	sess, _ := broker.createSession(httptest.NewRecorder(), "alice", false, nil)
 	var sid string
 	for id := range broker.store.RuntimeSnapshot().Sessions {
 		sid = id
@@ -847,7 +1100,7 @@ func TestHandleTOTPEnrollRequiresAuth(t *testing.T) {
 
 func TestHandleTOTPEnrollRequiresReAuth(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	_, _ = broker.createSession(httptest.NewRecorder(), "alice", false)
+	_, _ = broker.createSession(httptest.NewRecorder(), "alice", false, nil)
 	var sid string
 	for id := range broker.store.RuntimeSnapshot().Sessions {
 		sid = id
@@ -863,7 +1116,7 @@ func TestHandleTOTPEnrollRequiresReAuth(t *testing.T) {
 
 func TestHandleTOTPEnrollSuccess(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true)
+	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true, nil)
 	var sid string
 	for id := range broker.store.RuntimeSnapshot().Sessions {
 		sid = id
@@ -903,7 +1156,7 @@ func TestHandleWebAuthnRegisterBeginRequiresAuth(t *testing.T) {
 
 func TestHandleWebAuthnRegisterBeginSuccess(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true)
+	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true, nil)
 	var sid string
 	for id := range broker.store.RuntimeSnapshot().Sessions {
 		sid = id
@@ -927,7 +1180,7 @@ func TestHandleWebAuthnRegisterBeginSuccess(t *testing.T) {
 
 func TestHandleWebAuthnRegisterFinishBadJSON(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true)
+	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true, nil)
 	var sid string
 	for id := range broker.store.RuntimeSnapshot().Sessions {
 		sid = id
@@ -1366,7 +1619,7 @@ func TestRedirectOAuthErrorEscapesCRLFInState(t *testing.T) {
 
 func TestHandleTOTPEnrollVerifyCommitsPendingSecret(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true)
+	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true, nil)
 	var sid string
 	for id := range broker.store.RuntimeSnapshot().Sessions {
 		sid = id
@@ -1418,7 +1671,7 @@ func TestHandleTOTPEnrollVerifyCommitsPendingSecret(t *testing.T) {
 
 func TestHandleTOTPEnrollVerifyRejectsBadCode(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true)
+	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true, nil)
 	var sid string
 	for id := range broker.store.RuntimeSnapshot().Sessions {
 		sid = id
@@ -1446,7 +1699,7 @@ func TestHandleTOTPEnrollVerifyRejectsBadCode(t *testing.T) {
 
 func TestHandleTOTPEnrollVerifyWithoutPendingReturnsGone(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true)
+	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true, nil)
 	var sid string
 	for id := range broker.store.RuntimeSnapshot().Sessions {
 		sid = id
@@ -1464,7 +1717,7 @@ func TestHandleTOTPEnrollVerifyWithoutPendingReturnsGone(t *testing.T) {
 
 func TestHandleTOTPEnrollVerifyAcceptsJSONBody(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true)
+	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true, nil)
 	var sid string
 	for id := range broker.store.RuntimeSnapshot().Sessions {
 		sid = id
@@ -1491,7 +1744,7 @@ func TestHandleTOTPEnrollVerifyAcceptsJSONBody(t *testing.T) {
 
 func TestHandleTOTPEnrollVerifyRequiresReAuth(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	_, _ = broker.createSession(httptest.NewRecorder(), "alice", false)
+	_, _ = broker.createSession(httptest.NewRecorder(), "alice", false, nil)
 	var sid string
 	for id := range broker.store.RuntimeSnapshot().Sessions {
 		sid = id

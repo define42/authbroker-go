@@ -113,7 +113,7 @@ func buildAttestationObject(authData []byte) []byte {
 
 func enrollSessionFor(t *testing.T, broker *Broker, userID string) string {
 	t.Helper()
-	if _, err := broker.createSession(httptest.NewRecorder(), userID, true); err != nil {
+	if _, err := broker.createSession(httptest.NewRecorder(), userID, true, nil); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
 	for id, sess := range broker.store.RuntimeSnapshot().Sessions {

@@ -368,7 +368,7 @@ func TestBrokerLogoutClearsSessionAndRedirects(t *testing.T) {
 		t.Fatalf("seed session: %v", err)
 	}
 
-	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid", "", time.Now(), false)
+	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid", "", time.Now(), nil, false)
 	if err != nil {
 		t.Fatalf("issue tokens: %v", err)
 	}
