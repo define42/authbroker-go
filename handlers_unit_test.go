@@ -374,6 +374,28 @@ func TestHandleRevokeAccessTokenAddsJTI(t *testing.T) {
 	if _, err := broker.verifyJWT(access); err == nil {
 		t.Fatal("revoked token should fail verification")
 	}
+
+	parts := strings.Split(access, ".")
+	if len(parts) != 3 {
+		t.Fatalf("malformed access token")
+	}
+	claims, err := decodeJWTClaims(parts[1])
+	if err != nil {
+		t.Fatalf("decode revoked token: %v", err)
+	}
+	jti, _ := claims["jti"].(string)
+	if jti == "" {
+		t.Fatal("revoked token missing jti")
+	}
+	stored, ok, err := broker.store.GetRevokedJTI(jti)
+	if err != nil || !ok {
+		t.Fatalf("get revoked jti: ok=%v err=%v", ok, err)
+	}
+	expUnix, _ := numberClaim(claims["exp"])
+	wantMin := time.Unix(expUnix, 0).Add(jwtClockSkew)
+	if stored.Before(wantMin) {
+		t.Fatalf("revoked tombstone must survive the verification skew window: stored=%v want>=%v", stored, wantMin)
+	}
 }
 
 func TestHandleRevokeBadClient(t *testing.T) {

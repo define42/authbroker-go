@@ -554,7 +554,7 @@ func (b *Broker) revokeJWT(tok string, client Client) error {
 	if aud != client.ClientID || jti == "" || !ok {
 		return nil
 	}
-	return b.store.PutRevokedJTI(jti, time.Unix(expUnix, 0))
+	return b.store.PutRevokedJTI(jti, time.Unix(expUnix, 0).Add(jwtClockSkew))
 }
 
 func clientAllowsRedirect(c Client, redirectURI string) bool {
