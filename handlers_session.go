@@ -252,7 +252,7 @@ func (b *Broker) handlePostLogoutRedirect(w http.ResponseWriter, r *http.Request
 		q.Set("state", state)
 		u.RawQuery = q.Encode()
 	}
-	http.Redirect(w, r, u.String(), http.StatusFound) //nolint:gosec // redirect URI was validated against registered post_logout_redirect_uris.
+	http.Redirect(w, r, u.String(), http.StatusFound)
 }
 
 func (b *Broker) resolveLogoutClientID(w http.ResponseWriter, clientID, idTokenHint string) (string, bool) {

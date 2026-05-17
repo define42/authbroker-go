@@ -1,0 +1,218 @@
+package main
+
+import (
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func newTestStore(t *testing.T) *Store {
+	t.Helper()
+	store, err := NewStore(filepath.Join(t.TempDir(), defaultDataFile))
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+func TestStoreRejectsEmptyPath(t *testing.T) {
+	if _, err := NewStore(""); err == nil {
+		t.Fatal("NewStore must reject empty path")
+	}
+}
+
+func TestStoreSetTOTP(t *testing.T) {
+	store := newTestStore(t)
+	if err := store.SetTOTP("alice", "ABC123"); err != nil {
+		t.Fatalf("SetTOTP new user: %v", err)
+	}
+	user, ok := store.GetUser("alice")
+	if !ok || user.TOTPSecretBase32 != "ABC123" {
+		t.Fatalf("after SetTOTP: user=%#v ok=%v", user, ok)
+	}
+	if err := store.SetTOTP("alice", "XYZ456"); err != nil {
+		t.Fatalf("SetTOTP overwrite: %v", err)
+	}
+	user, _ = store.GetUser("alice")
+	if user.TOTPSecretBase32 != "XYZ456" {
+		t.Fatalf("TOTP overwrite = %q", user.TOTPSecretBase32)
+	}
+}
+
+func TestStoreAddWebAuthnCredential(t *testing.T) {
+	store := newTestStore(t)
+	cred := WebAuthnCredential{IDBase64URL: "cred-1", Alg: "ES256"}
+	if err := store.AddWebAuthnCredential("bob", cred); err != nil {
+		t.Fatalf("first add: %v", err)
+	}
+	if err := store.AddWebAuthnCredential("bob", cred); err == nil {
+		t.Fatal("duplicate add should fail")
+	}
+	if err := store.AddWebAuthnCredential("bob", WebAuthnCredential{IDBase64URL: "cred-2"}); err != nil {
+		t.Fatalf("second cred add: %v", err)
+	}
+	user, _ := store.GetUser("bob")
+	if len(user.WebAuthnCredentials) != 2 {
+		t.Fatalf("got %d creds", len(user.WebAuthnCredentials))
+	}
+}
+
+func TestStoreUpdateWebAuthnSignCount(t *testing.T) {
+	store := newTestStore(t)
+	if err := store.UpdateWebAuthnSignCount("ghost", "id", 1); err == nil {
+		t.Fatal("missing user should error")
+	}
+	cred := WebAuthnCredential{IDBase64URL: "cred-1", Alg: "ES256", SignCount: 5}
+	if err := store.AddWebAuthnCredential("carol", cred); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := store.UpdateWebAuthnSignCount("carol", "missing", 9); err == nil {
+		t.Fatal("missing credential should error")
+	}
+	if err := store.UpdateWebAuthnSignCount("carol", "cred-1", 9); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	user, _ := store.GetUser("carol")
+	if user.WebAuthnCredentials[0].SignCount != 9 {
+		t.Fatalf("sign count = %d", user.WebAuthnCredentials[0].SignCount)
+	}
+}
+
+func TestStoreRefreshTokenRoundTrip(t *testing.T) {
+	store := newTestStore(t)
+	rt := RefreshToken{UserID: "u", ClientID: "c", Scope: "openid", ExpiresAt: time.Now().Add(time.Hour)}
+	if err := store.PutRefreshToken("k", rt); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	got, ok, err := store.GetRefreshToken("k")
+	if err != nil || !ok || got.UserID != "u" {
+		t.Fatalf("get: %#v ok=%v err=%v", got, ok, err)
+	}
+	deleted, err := store.DeleteRefreshToken("k")
+	if err != nil || !deleted {
+		t.Fatalf("delete: deleted=%v err=%v", deleted, err)
+	}
+	deleted, err = store.DeleteRefreshToken("k")
+	if err != nil || deleted {
+		t.Fatalf("second delete: deleted=%v err=%v", deleted, err)
+	}
+	if _, ok, _ := store.GetRefreshToken("missing"); ok {
+		t.Fatal("missing key should return ok=false")
+	}
+}
+
+func TestStoreRevokedJTI(t *testing.T) {
+	store := newTestStore(t)
+	exp := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	if err := store.PutRevokedJTI("jti", exp); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	got, ok, err := store.GetRevokedJTI("jti")
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	if !got.Equal(exp) {
+		t.Fatalf("got %v want %v", got, exp)
+	}
+	if err := store.DeleteRevokedJTI("jti"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, ok, _ := store.GetRevokedJTI("jti"); ok {
+		t.Fatal("entry should be gone")
+	}
+}
+
+func TestStoreWebAuthnChallenges(t *testing.T) {
+	store := newTestStore(t)
+	rec := ChallengeRecord{UserID: "u", Challenge: "abc", ExpiresAt: time.Now().Add(time.Minute)}
+	if err := store.PutWebAuthnRegistration("abc", rec); err != nil {
+		t.Fatalf("put reg: %v", err)
+	}
+	got, ok, err := store.ConsumeWebAuthnRegistration("abc")
+	if err != nil || !ok || got.UserID != "u" {
+		t.Fatalf("consume reg: got=%#v ok=%v err=%v", got, ok, err)
+	}
+	// Idempotent consume returns ok=false.
+	if _, ok, _ := store.ConsumeWebAuthnRegistration("abc"); ok {
+		t.Fatal("second consume should return ok=false")
+	}
+
+	if err := store.PutWebAuthnLogin("login-1", rec); err != nil {
+		t.Fatalf("put login: %v", err)
+	}
+	got, ok, err = store.ConsumeWebAuthnLogin("login-1")
+	if err != nil || !ok || got.UserID != "u" {
+		t.Fatalf("consume login: got=%#v ok=%v err=%v", got, ok, err)
+	}
+}
+
+func TestStoreSweepExpiredAcrossBuckets(t *testing.T) {
+	store := newTestStore(t)
+	past := time.Now().Add(-time.Hour)
+	future := time.Now().Add(time.Hour)
+
+	if err := store.PutSession("expired", Session{UserID: "u", ExpiresAt: past}); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	if err := store.PutSession("active", Session{UserID: "u", ExpiresAt: future}); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	if err := store.PutRefreshToken("expired", RefreshToken{ExpiresAt: past}); err != nil {
+		t.Fatalf("seed refresh: %v", err)
+	}
+	if err := store.PutRevokedJTI("expired", past); err != nil {
+		t.Fatalf("seed jti: %v", err)
+	}
+	if err := store.PutWebAuthnLogin("expired", ChallengeRecord{ExpiresAt: past}); err != nil {
+		t.Fatalf("seed challenge: %v", err)
+	}
+
+	removed, err := store.SweepExpired(time.Now())
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if removed < 4 {
+		t.Fatalf("removed = %d, want >=4", removed)
+	}
+	snap := store.RuntimeSnapshot()
+	if _, ok := snap.Sessions["expired"]; ok {
+		t.Fatal("expired session survived sweep")
+	}
+	if _, ok := snap.Sessions["active"]; !ok {
+		t.Fatal("active session was swept")
+	}
+}
+
+func TestHashSecretStable(t *testing.T) {
+	a := hashSecret("token-1")
+	b := hashSecret("token-1")
+	if a != b || len(a) != 64 {
+		t.Fatalf("hashSecret unstable or wrong len: %q %q", a, b)
+	}
+	if hashSecret("token-1") == hashSecret("token-2") {
+		t.Fatal("distinct inputs collided")
+	}
+}
+
+func TestCloseHandlesNil(t *testing.T) {
+	var s *Store
+	if err := s.Close(); err != nil {
+		t.Fatalf("nil close returned %v", err)
+	}
+}
+
+func TestStoreUpsertProfileMerges(t *testing.T) {
+	store := newTestStore(t)
+	if _, err := store.UpsertProfile(UserProfile{Subject: "p", Email: "p@e", Name: "P"}); err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+	// Empty email/name should not erase existing values.
+	if _, err := store.UpsertProfile(UserProfile{Subject: "p", Groups: []string{"g"}}); err != nil {
+		t.Fatalf("merge upsert: %v", err)
+	}
+	user, _ := store.GetUser("p")
+	if user.Email != "p@e" || user.Name != "P" || len(user.Groups) != 1 {
+		t.Fatalf("merged user = %#v", user)
+	}
+}
