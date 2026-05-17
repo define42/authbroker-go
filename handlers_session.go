@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -51,6 +52,9 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	rateKey := loginRateKey(r, username)
 	if ok, retry := b.loginLimiter.allow(rateKey); !ok {
 		writeRetryAfter(w, retry)
+		b.auditEvent(r, auditEventLogin, auditOutcomeFailure,
+			slog.String("user_id", username),
+			slog.String("reason", "rate_limited"))
 		http.Error(w, "too many login attempts; try again later", http.StatusTooManyRequests)
 		return
 	}
@@ -81,6 +85,10 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 				log.Printf("restore auth request after login failure: %v", err)
 			}
 		}
+		b.auditEvent(r, auditEventLogin, auditOutcomeFailure,
+			slog.String("user_id", username),
+			slog.String("client_id", ar.ClientID),
+			slog.String("reason", "invalid_credentials"))
 		http.Error(w, "invalid username or password", http.StatusUnauthorized)
 		return
 	}
@@ -99,6 +107,10 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 					log.Printf("restore auth request after missing totp enrollment: %v", err)
 				}
 			}
+			b.auditEvent(r, auditEventLogin, auditOutcomeFailure,
+				slog.String("user_id", user.Username),
+				slog.String("client_id", ar.ClientID),
+				slog.String("reason", "totp_not_enrolled"))
 			http.Error(w, "invalid username or password", http.StatusUnauthorized)
 			return
 		}
@@ -109,6 +121,10 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 					log.Printf("restore auth request after totp failure: %v", err)
 				}
 			}
+			b.auditEvent(r, auditEventLogin, auditOutcomeFailure,
+				slog.String("user_id", user.Username),
+				slog.String("client_id", ar.ClientID),
+				slog.String("reason", "invalid_totp"))
 			http.Error(w, "invalid username or password", http.StatusUnauthorized)
 			return
 		}
@@ -120,6 +136,11 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
+	b.auditEvent(r, auditEventLogin, auditOutcomeSuccess,
+		slog.String("user_id", user.Username),
+		slog.String("client_id", ar.ClientID),
+		slog.Bool("oauth_flow", oauthLogin),
+		slog.Bool("totp_used", b.needsTOTP(user)))
 	if oauthLogin {
 		if err := b.issueCodeRedirect(w, r, ar, sess); err != nil {
 			http.Error(w, "store error", http.StatusInternalServerError)
@@ -152,11 +173,17 @@ func (b *Broker) handleReAuth(w http.ResponseWriter, r *http.Request) {
 	rateKey := loginRateKey(r, sess.UserID)
 	if ok, retry := b.loginLimiter.allow(rateKey); !ok {
 		writeRetryAfter(w, retry)
+		b.auditEvent(r, auditEventReAuth, auditOutcomeFailure,
+			slog.String("user_id", sess.UserID),
+			slog.String("reason", "rate_limited"))
 		http.Error(w, "too many login attempts; try again later", http.StatusTooManyRequests)
 		return
 	}
 	if _, err := b.authn.Authenticate(r.Context(), sess.UserID, password); err != nil {
 		b.loginLimiter.recordFailure(rateKey)
+		b.auditEvent(r, auditEventReAuth, auditOutcomeFailure,
+			slog.String("user_id", sess.UserID),
+			slog.String("reason", "invalid_credentials"))
 		http.Error(w, "invalid password", http.StatusUnauthorized)
 		return
 	}
@@ -165,6 +192,8 @@ func (b *Broker) handleReAuth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
+	b.auditEvent(r, auditEventReAuth, auditOutcomeSuccess,
+		slog.String("user_id", sess.UserID))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -197,6 +226,11 @@ func (b *Broker) handleLocalLogoutPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
+	if ok {
+		b.auditEvent(r, auditEventLogout, auditOutcomeSuccess,
+			slog.String("user_id", sess.UserID),
+			slog.String("source", "local"))
+	}
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
@@ -223,9 +257,16 @@ func (b *Broker) handleLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	priorSess, hadSession := b.validSession(r)
 	if err := b.clearSession(w, r); err != nil {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
+	}
+	if hadSession {
+		b.auditEvent(r, auditEventLogout, auditOutcomeSuccess,
+			slog.String("user_id", priorSess.UserID),
+			slog.String("client_id", clientID),
+			slog.String("source", "rp_initiated"))
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -238,6 +279,7 @@ func (b *Broker) handlePostLogoutRedirect(w http.ResponseWriter, r *http.Request
 		http.Error(w, "invalid post_logout_redirect_uri", http.StatusBadRequest)
 		return
 	}
+	priorSess, hadSession := b.validSession(r)
 	if err := b.clearSession(w, r); err != nil {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
@@ -251,6 +293,12 @@ func (b *Broker) handlePostLogoutRedirect(w http.ResponseWriter, r *http.Request
 		q := u.Query()
 		q.Set("state", state)
 		u.RawQuery = q.Encode()
+	}
+	if hadSession {
+		b.auditEvent(r, auditEventLogout, auditOutcomeSuccess,
+			slog.String("user_id", priorSess.UserID),
+			slog.String("client_id", clientID),
+			slog.String("source", "rp_initiated"))
 	}
 	http.Redirect(w, r, u.String(), http.StatusFound)
 }

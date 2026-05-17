@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"strings"
@@ -106,13 +107,22 @@ func (b *Broker) handleWebAuthnRegisterFinish(w http.ResponseWriter, r *http.Req
 
 	cred, err := b.verifyWebAuthnAttestation(req, ch.Challenge)
 	if err != nil {
+		b.auditEvent(r, auditEventWebAuthnRegister, auditOutcomeFailure,
+			slog.String("user_id", sess.UserID),
+			slog.String("reason", "invalid_attestation"))
 		http.Error(w, "invalid attestation: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	if err := b.store.AddWebAuthnCredential(sess.UserID, cred); err != nil {
+		b.auditEvent(r, auditEventWebAuthnRegister, auditOutcomeFailure,
+			slog.String("user_id", sess.UserID),
+			slog.String("reason", "store_error"))
 		http.Error(w, "store error: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	b.auditEvent(r, auditEventWebAuthnRegister, auditOutcomeSuccess,
+		slog.String("user_id", sess.UserID),
+		slog.String("credential_id", cred.IDBase64URL))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "registered"})
 }
 
@@ -190,16 +200,25 @@ func (b *Broker) handleWebAuthnLoginFinish(w http.ResponseWriter, r *http.Reques
 	rateKey := loginRateKey(r, ch.UserID)
 	if allowed, retry := b.loginLimiter.allow(rateKey); !allowed {
 		writeRetryAfter(w, retry)
+		b.auditEvent(r, auditEventWebAuthnLogin, auditOutcomeFailure,
+			slog.String("user_id", ch.UserID),
+			slog.String("reason", "rate_limited"))
 		http.Error(w, "too many login attempts; try again later", http.StatusTooManyRequests)
 		return
 	}
 	if !ok || time.Now().After(ch.ExpiresAt) || ch.UserID == "" {
 		b.loginLimiter.recordFailure(rateKey)
+		b.auditEvent(r, auditEventWebAuthnLogin, auditOutcomeFailure,
+			slog.String("user_id", ch.UserID),
+			slog.String("reason", "challenge_expired"))
 		http.Error(w, "login challenge expired", http.StatusBadRequest)
 		return
 	}
 	if err := b.verifyWebAuthnAssertion(req, ch.UserID, ch.Challenge, clientDataBytes, cd); err != nil {
 		b.loginLimiter.recordFailure(rateKey)
+		b.auditEvent(r, auditEventWebAuthnLogin, auditOutcomeFailure,
+			slog.String("user_id", ch.UserID),
+			slog.String("reason", "invalid_assertion"))
 		http.Error(w, "invalid assertion: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -208,6 +227,8 @@ func (b *Broker) handleWebAuthnLoginFinish(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
+	b.auditEvent(r, auditEventWebAuthnLogin, auditOutcomeSuccess,
+		slog.String("user_id", ch.UserID))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "authenticated"})
 }
 

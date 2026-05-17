@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"time"
 )
@@ -79,6 +80,8 @@ type Broker struct {
 	appTokens map[string]AppTokenConfig
 
 	loginLimiter *loginRateLimiter
+
+	audit *slog.Logger
 }
 
 const (
@@ -166,6 +169,7 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 		clients:      clientMap,
 		appTokens:    appTokenMap,
 		loginLimiter: newLoginRateLimiter(loginRateLimitWindow, loginRateLimitMaxAttempts, loginRateLockout),
+		audit:        newAuditLogger(nil),
 	}
 	b.sweepExpired(time.Now())
 	return b, nil

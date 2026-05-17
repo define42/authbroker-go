@@ -132,7 +132,50 @@ func newConfiguredBroker(opts cliOptions) (*Broker, string, error) {
 	if err != nil {
 		return nil, "", fmt.Errorf("new broker: %w", err)
 	}
+	warnIfCookieInsecure(broker)
 	return broker, dataDir, nil
+}
+
+// warnIfCookieInsecure logs a startup warning when session cookies will be
+// issued without the Secure attribute and the broker is reachable beyond the
+// loopback interface. The most common cause is configuring issuer with an
+// http:// scheme behind a TLS-terminating proxy; in that case CookieSecure
+// must be set explicitly to true so browsers attach the cookie only over TLS.
+func warnIfCookieInsecure(broker *Broker) {
+	if broker.cookieSecure() {
+		return
+	}
+	if !broker.cfg.ACME.Enabled && listenIsLocalhostOnly(broker.cfg.Listen) {
+		return
+	}
+	log.Printf("WARNING: session cookies will be issued without the Secure attribute (issuer=%q, listen=%q). Set cookie_secure=true when terminating TLS at a proxy.", broker.cfg.Issuer, broker.cfg.Listen)
+}
+
+// listenIsLocalhostOnly reports whether addr binds exclusively to a loopback
+// interface (127.0.0.1, ::1, or "localhost"). An empty host (":8080") or a
+// wildcard host (0.0.0.0, ::) is treated as non-localhost.
+func listenIsLocalhostOnly(addr string) bool {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return false
+	}
+	host, _, splitErr := net.SplitHostPort(addr)
+	if splitErr != nil {
+		host = addr
+	}
+	host = strings.TrimSpace(host)
+	host = strings.Trim(host, "[]")
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback()
 }
 
 // runACME serves the broker over HTTPS using certmagic-managed certificates,

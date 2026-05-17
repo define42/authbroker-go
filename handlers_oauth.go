@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -148,16 +149,29 @@ func (b *Broker) tokenAuthorizationCode(w http.ResponseWriter, r *http.Request, 
 	}
 
 	if !ok || time.Now().After(ac.ExpiresAt) {
+		b.auditEvent(r, auditEventTokenIssue, auditOutcomeFailure,
+			slog.String("client_id", client.ClientID),
+			slog.String("grant_type", "authorization_code"),
+			slog.String("reason", "invalid_or_expired_code"))
 		tokenError(w, "invalid_grant", "invalid or expired code")
 		return
 	}
 	if ac.ClientID != client.ClientID || ac.RedirectURI != redirectURI {
+		b.auditEvent(r, auditEventTokenIssue, auditOutcomeFailure,
+			slog.String("client_id", client.ClientID),
+			slog.String("grant_type", "authorization_code"),
+			slog.String("reason", "client_or_redirect_mismatch"))
 		tokenError(w, "invalid_grant", "client or redirect_uri mismatch")
 		return
 	}
 	if ac.CodeChallenge != "" {
 		verifier := r.Form.Get("code_verifier")
 		if !verifyPKCE(ac.CodeChallenge, ac.CodeChallengeMethod, verifier) {
+			b.auditEvent(r, auditEventTokenIssue, auditOutcomeFailure,
+				slog.String("client_id", client.ClientID),
+				slog.String("user_id", ac.UserID),
+				slog.String("grant_type", "authorization_code"),
+				slog.String("reason", "pkce_failed"))
 			tokenError(w, "invalid_grant", "PKCE verification failed")
 			return
 		}
@@ -172,9 +186,16 @@ func (b *Broker) tokenAuthorizationCode(w http.ResponseWriter, r *http.Request, 
 		tokenServerError(w, "issue tokens for authorization_code grant", err)
 		return
 	}
+	b.auditEvent(r, auditEventTokenIssue, auditOutcomeSuccess,
+		slog.String("client_id", client.ClientID),
+		slog.String("user_id", ac.UserID),
+		slog.String("grant_type", "authorization_code"),
+		slog.String("scope", ac.Scope),
+		slog.Bool("refresh_token", includeRefresh))
 	writeJSON(w, http.StatusOK, resp)
 }
 
+//nolint:funlen // Each failure branch must emit its own audit event with the matching reason.
 func (b *Broker) tokenRefresh(w http.ResponseWriter, r *http.Request, client Client) {
 	rt := r.Form.Get("refresh_token")
 	rtKey := hashSecret(rt)
@@ -185,6 +206,10 @@ func (b *Broker) tokenRefresh(w http.ResponseWriter, r *http.Request, client Cli
 		return
 	}
 	if !ok {
+		b.auditEvent(r, auditEventTokenIssue, auditOutcomeFailure,
+			slog.String("client_id", client.ClientID),
+			slog.String("grant_type", "refresh_token"),
+			slog.String("reason", "unknown_refresh_token"))
 		tokenError(w, "invalid_grant", "invalid refresh_token")
 		return
 	}
@@ -193,6 +218,11 @@ func (b *Broker) tokenRefresh(w http.ResponseWriter, r *http.Request, client Cli
 			tokenServerError(w, "burn refresh token", err)
 			return
 		}
+		b.auditEvent(r, auditEventTokenIssue, auditOutcomeFailure,
+			slog.String("client_id", client.ClientID),
+			slog.String("user_id", old.UserID),
+			slog.String("grant_type", "refresh_token"),
+			slog.String("reason", "expired_or_client_mismatch"))
 		tokenError(w, "invalid_grant", "invalid refresh_token")
 		return
 	}
@@ -200,6 +230,11 @@ func (b *Broker) tokenRefresh(w http.ResponseWriter, r *http.Request, client Cli
 	// but never one that exceeds the original grant. Reject scope expansion
 	// without consuming the refresh token so the legitimate client can retry.
 	if requestedScope != "" && !scopeSubset(requestedScope, old.Scope) {
+		b.auditEvent(r, auditEventTokenIssue, auditOutcomeFailure,
+			slog.String("client_id", client.ClientID),
+			slog.String("user_id", old.UserID),
+			slog.String("grant_type", "refresh_token"),
+			slog.String("reason", "scope_expansion"))
 		tokenError(w, "invalid_scope", "requested scope exceeds original grant")
 		return
 	}
@@ -210,6 +245,11 @@ func (b *Broker) tokenRefresh(w http.ResponseWriter, r *http.Request, client Cli
 		return
 	}
 	if !deleted {
+		b.auditEvent(r, auditEventTokenIssue, auditOutcomeFailure,
+			slog.String("client_id", client.ClientID),
+			slog.String("user_id", old.UserID),
+			slog.String("grant_type", "refresh_token"),
+			slog.String("reason", "race_lost"))
 		tokenError(w, "invalid_grant", "invalid refresh_token")
 		return
 	}
@@ -222,6 +262,12 @@ func (b *Broker) tokenRefresh(w http.ResponseWriter, r *http.Request, client Cli
 		tokenServerError(w, "issue tokens for refresh_token grant", err)
 		return
 	}
+	b.auditEvent(r, auditEventTokenIssue, auditOutcomeSuccess,
+		slog.String("client_id", client.ClientID),
+		slog.String("user_id", old.UserID),
+		slog.String("grant_type", "refresh_token"),
+		slog.String("scope", scope),
+		slog.Bool("refresh_token", true))
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -240,10 +286,15 @@ func scopeSubset(requested, granted string) bool {
 
 func (b *Broker) tokenClientCredentials(w http.ResponseWriter, r *http.Request, client Client) {
 	if client.Public {
+		b.auditEvent(r, auditEventTokenIssue, auditOutcomeFailure,
+			slog.String("client_id", client.ClientID),
+			slog.String("grant_type", "client_credentials"),
+			slog.String("reason", "public_client"))
 		tokenError(w, "unauthorized_client", "public clients cannot use client_credentials")
 		return
 	}
 	now := time.Now()
+	scope := r.Form.Get("scope")
 	claims := map[string]any{
 		"iss":       b.cfg.Issuer,
 		"sub":       client.ClientID,
@@ -253,7 +304,7 @@ func (b *Broker) tokenClientCredentials(w http.ResponseWriter, r *http.Request, 
 		"exp":       now.Add(time.Duration(b.cfg.AccessTokenTTLMinutes) * time.Minute).Unix(),
 		"jti":       randomB64(16),
 		"client_id": client.ClientID,
-		"scope":     r.Form.Get("scope"),
+		"scope":     scope,
 		"token_use": "access",
 	}
 	access, err := b.signJWT(claims)
@@ -261,11 +312,15 @@ func (b *Broker) tokenClientCredentials(w http.ResponseWriter, r *http.Request, 
 		tokenServerError(w, "sign client_credentials access token", err)
 		return
 	}
+	b.auditEvent(r, auditEventTokenIssue, auditOutcomeSuccess,
+		slog.String("client_id", client.ClientID),
+		slog.String("grant_type", "client_credentials"),
+		slog.String("scope", scope))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token": access,
 		"token_type":   "Bearer",
 		"expires_in":   b.cfg.AccessTokenTTLMinutes * 60,
-		"scope":        r.Form.Get("scope"),
+		"scope":        scope,
 	})
 }
 
@@ -453,6 +508,8 @@ func (b *Broker) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	client, err := b.authenticateClient(r)
 	if err != nil {
 		// RFC 7009 expects client authentication; still avoid token oracle details.
+		b.auditEvent(r, auditEventTokenRevoke, auditOutcomeFailure,
+			slog.String("reason", "unauthenticated_client"))
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
@@ -465,6 +522,8 @@ func (b *Broker) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
+	b.auditEvent(r, auditEventTokenRevoke, auditOutcomeSuccess,
+		slog.String("client_id", client.ClientID))
 	w.WriteHeader(http.StatusOK)
 }
 

@@ -405,7 +405,7 @@ Before production, the remaining hardening work is:
 - consent screens, client administration, and app-token profile administration
 - app-token issuance audit, revocation strategy, per-app TTL review, and policy for who may generate each token profile
 - rate limiting and brute-force protection
-- audit logs for login, logout, token issuance, MFA, WebAuthn, and admin/config changes
+- audit log forwarding/retention: a structured JSON audit stream is emitted via `log/slog` for login, reauth, logout, TOTP enroll, WebAuthn register/login, token issuance, and revocation; deployments still need to ship and retain it
 - directory-specific group policy validation; LDAP group mapping and nested AD groups are implemented, but nested OpenLDAP group resolution and group lifecycle sync are not
 - OpenID Foundation conformance testing
 - WebAuthn conformance testing and broader attestation support

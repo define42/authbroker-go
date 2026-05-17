@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 )
@@ -155,14 +156,27 @@ func (b *Broker) handleAppToken(w http.ResponseWriter, r *http.Request) {
 	tokenID := r.PathValue("id")
 	tokenCfg, ok := b.appTokens[tokenID]
 	if !ok {
+		b.auditEvent(r, auditEventAppTokenIssue, auditOutcomeFailure,
+			slog.String("user_id", sess.UserID),
+			slog.String("app_token_id", tokenID),
+			slog.String("reason", "unknown_app_token"))
 		http.NotFound(w, r)
 		return
 	}
 	token, err := b.issueAppToken(sess, tokenCfg)
 	if err != nil {
+		b.auditEvent(r, auditEventAppTokenIssue, auditOutcomeFailure,
+			slog.String("user_id", sess.UserID),
+			slog.String("app_token_id", tokenCfg.ID),
+			slog.String("reason", "signing_error"))
 		http.Error(w, "could not issue app token", http.StatusInternalServerError)
 		return
 	}
+	b.auditEvent(r, auditEventAppTokenIssue, auditOutcomeSuccess,
+		slog.String("user_id", sess.UserID),
+		slog.String("app_token_id", tokenCfg.ID),
+		slog.String("audience", tokenCfg.Audience),
+		slog.String("client_id", tokenCfg.ClientID))
 	issued := &issuedAppTokenView{
 		appTokenView: b.appTokenView(tokenCfg),
 		Token:        token,

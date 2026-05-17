@@ -8,6 +8,7 @@ import (
 	"encoding/base32"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -29,14 +30,22 @@ func (b *Broker) handleTOTPEnroll(w http.ResponseWriter, r *http.Request) {
 	b.maybeExtendSession(w, r)
 	secretBytes := make([]byte, 20)
 	if _, err := rand.Read(secretBytes); err != nil {
+		b.auditEvent(r, auditEventTOTPEnroll, auditOutcomeFailure,
+			slog.String("user_id", sess.UserID),
+			slog.String("reason", "random_error"))
 		http.Error(w, "random error", http.StatusInternalServerError)
 		return
 	}
 	secret := strings.TrimRight(base32.StdEncoding.EncodeToString(secretBytes), "=")
 	if err := b.store.SetTOTP(sess.UserID, secret); err != nil {
+		b.auditEvent(r, auditEventTOTPEnroll, auditOutcomeFailure,
+			slog.String("user_id", sess.UserID),
+			slog.String("reason", "store_error"))
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
+	b.auditEvent(r, auditEventTOTPEnroll, auditOutcomeSuccess,
+		slog.String("user_id", sess.UserID))
 	issuerName := strings.TrimSpace(b.cfg.DisplayName)
 	if issuerName == "" {
 		issuerName = "Authbroker"
