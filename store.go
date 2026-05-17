@@ -21,12 +21,13 @@ type Store struct {
 }
 
 type StoredUser struct {
-	Username            string               `json:"username"`
-	Email               string               `json:"email,omitempty"`
-	Name                string               `json:"name,omitempty"`
-	Groups              []string             `json:"groups,omitempty"`
-	TOTPSecretBase32    string               `json:"totp_secret_base32,omitempty"`
-	WebAuthnCredentials []WebAuthnCredential `json:"webauthn_credentials,omitempty"`
+	Username                string               `json:"username"`
+	Email                   string               `json:"email,omitempty"`
+	Name                    string               `json:"name,omitempty"`
+	Groups                  []string             `json:"groups,omitempty"`
+	TOTPSecretBase32        string               `json:"totp_secret_base32,omitempty"`
+	PendingTOTPSecretBase32 string               `json:"pending_totp_secret_base32,omitempty"`
+	WebAuthnCredentials     []WebAuthnCredential `json:"webauthn_credentials,omitempty"`
 }
 
 type WebAuthnCredential struct {
@@ -164,6 +165,61 @@ func (s *Store) SetTOTP(username, secret string) error {
 			u = &StoredUser{Username: username}
 		}
 		u.TOTPSecretBase32 = secret
+		u.PendingTOTPSecretBase32 = ""
+		return putJSON(b, []byte(username), u)
+	})
+}
+
+// SetPendingTOTP stages a freshly generated TOTP secret on the user without
+// touching the active TOTPSecretBase32. The pending secret is only committed
+// (via CommitPendingTOTP) after the user proves they can produce a valid
+// code, so an abandoned QR scan does not lock the user out at next login.
+func (s *Store) SetPendingTOTP(username, secret string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := bucket(tx, bucketUsers)
+		u, err := getUserTx(b, username)
+		if err != nil {
+			return err
+		}
+		if u == nil {
+			u = &StoredUser{Username: username}
+		}
+		u.PendingTOTPSecretBase32 = secret
+		return putJSON(b, []byte(username), u)
+	})
+}
+
+// CommitPendingTOTP promotes the user's pending TOTP secret to the active
+// TOTPSecretBase32 slot in a single transaction. Returns an error if there
+// is no pending secret to commit.
+func (s *Store) CommitPendingTOTP(username string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := bucket(tx, bucketUsers)
+		u, err := getUserTx(b, username)
+		if err != nil {
+			return err
+		}
+		if u == nil || u.PendingTOTPSecretBase32 == "" {
+			return fmt.Errorf("no pending totp secret")
+		}
+		u.TOTPSecretBase32 = u.PendingTOTPSecretBase32
+		u.PendingTOTPSecretBase32 = ""
+		return putJSON(b, []byte(username), u)
+	})
+}
+
+// ClearPendingTOTP discards a staged-but-uncommitted pending TOTP secret.
+func (s *Store) ClearPendingTOTP(username string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := bucket(tx, bucketUsers)
+		u, err := getUserTx(b, username)
+		if err != nil {
+			return err
+		}
+		if u == nil || u.PendingTOTPSecretBase32 == "" {
+			return nil
+		}
+		u.PendingTOTPSecretBase32 = ""
 		return putJSON(b, []byte(username), u)
 	})
 }

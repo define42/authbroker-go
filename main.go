@@ -454,6 +454,7 @@ func dumpRoutes() {
 		"/oauth2/revoke",
 		"/oauth2/logout",
 		"/mfa/totp/enroll",
+		"/mfa/totp/verify",
 		"/webauthn/register/begin",
 		"/webauthn/register/finish",
 		"/webauthn/login/begin",

@@ -42,6 +42,7 @@ const (
 	maxWebAuthnBodyBytes     = 64 << 10
 	maxAppTokenFormBodyBytes = 4 << 10
 	maxTOTPEnrollBodyBytes   = 4 << 10
+	maxTOTPVerifyBodyBytes   = 1 << 10
 )
 
 // Config is intentionally small. It is enough to run a modern LDAP-backed

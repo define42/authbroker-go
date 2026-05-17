@@ -234,6 +234,7 @@ func (b *Broker) routes() http.Handler {
 	mux.HandleFunc("GET /oauth2/logout", b.handleLogout)
 	mux.HandleFunc("POST /oauth2/logout", b.handleLogout)
 	mux.HandleFunc("POST /mfa/totp/enroll", b.handleTOTPEnroll)
+	mux.HandleFunc("POST /mfa/totp/verify", b.handleTOTPEnrollVerify)
 	mux.HandleFunc("POST /webauthn/register/begin", b.handleWebAuthnRegisterBegin)
 	mux.HandleFunc("POST /webauthn/register/finish", b.handleWebAuthnRegisterFinish)
 	mux.HandleFunc("POST /webauthn/login/begin", b.handleWebAuthnLoginBegin)

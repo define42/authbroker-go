@@ -689,8 +689,11 @@ func TestHandleTOTPEnrollSuccess(t *testing.T) {
 		t.Fatalf("body = %#v", body)
 	}
 	user, _ := broker.store.GetUser("alice")
-	if user.TOTPSecretBase32 == "" {
-		t.Fatal("totp secret was not persisted")
+	if user.PendingTOTPSecretBase32 == "" {
+		t.Fatal("pending totp secret was not persisted")
+	}
+	if user.TOTPSecretBase32 != "" {
+		t.Fatal("active totp secret should not be set before verify-enrollment")
 	}
 }
 
@@ -1113,6 +1116,185 @@ func TestRandomDecoder(t *testing.T) {
 	}
 	if string(got) != "hello" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+// TestRedirectOAuthErrorEscapesCRLFInState ensures that the OAuth error
+// redirect helper does not allow attacker-controlled state values to inject
+// CR/LF into the Location header (HTTP response splitting). url.Values.Encode
+// percent-encodes \r and \n, so the literal bytes must never appear in the
+// rendered Location header.
+func TestRedirectOAuthErrorEscapesCRLFInState(t *testing.T) {
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	hostile := "xyz\r\nSet-Cookie: pwn=1"
+	redirectOAuthError(rr, req, "https://client.example/cb", hostile, "invalid_request", "boom")
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	loc := rr.Header().Get("Location")
+	if strings.ContainsAny(loc, "\r\n") {
+		t.Fatalf("Location header contains raw CR/LF: %q", loc)
+	}
+	u, err := url.Parse(loc)
+	if err != nil {
+		t.Fatalf("parse Location: %v", err)
+	}
+	if got := u.Query().Get("state"); got != hostile {
+		t.Fatalf("round-tripped state = %q want %q", got, hostile)
+	}
+}
+
+func TestHandleTOTPEnrollVerifyCommitsPendingSecret(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true)
+	var sid string
+	for id := range broker.store.RuntimeSnapshot().Sessions {
+		sid = id
+	}
+
+	enrollReq := httptest.NewRequest(http.MethodPost, "/mfa/totp/enroll", nil)
+	addSessionCookie(enrollReq, sid)
+	enrollRR := httptest.NewRecorder()
+	broker.handleTOTPEnroll(enrollRR, enrollReq)
+	if enrollRR.Code != http.StatusOK {
+		t.Fatalf("enroll status = %d body=%s", enrollRR.Code, enrollRR.Body.String())
+	}
+	var body map[string]string
+	if err := json.Unmarshal(enrollRR.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode enroll: %v", err)
+	}
+	secret := body["secret_base32"]
+	if secret == "" {
+		t.Fatal("missing pending secret in enroll response")
+	}
+
+	user, _ := broker.store.GetUser("alice")
+	if user.TOTPSecretBase32 != "" {
+		t.Fatal("active TOTP secret should be empty before verify")
+	}
+	if user.PendingTOTPSecretBase32 != secret {
+		t.Fatalf("pending secret mismatch: store=%q response=%q", user.PendingTOTPSecretBase32, secret)
+	}
+
+	code := totpCode(secret, time.Now().Unix()/30)
+	form := url.Values{"otp": {code}}
+	verifyReq := httptest.NewRequest(http.MethodPost, "/mfa/totp/verify", strings.NewReader(form.Encode()))
+	verifyReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	addSessionCookie(verifyReq, sid)
+	verifyRR := httptest.NewRecorder()
+	broker.handleTOTPEnrollVerify(verifyRR, verifyReq)
+	if verifyRR.Code != http.StatusNoContent {
+		t.Fatalf("verify status = %d body=%s", verifyRR.Code, verifyRR.Body.String())
+	}
+
+	user, _ = broker.store.GetUser("alice")
+	if user.TOTPSecretBase32 != secret {
+		t.Fatalf("active TOTP secret = %q want %q", user.TOTPSecretBase32, secret)
+	}
+	if user.PendingTOTPSecretBase32 != "" {
+		t.Fatal("pending TOTP secret should be cleared after verify")
+	}
+}
+
+func TestHandleTOTPEnrollVerifyRejectsBadCode(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true)
+	var sid string
+	for id := range broker.store.RuntimeSnapshot().Sessions {
+		sid = id
+	}
+	if err := broker.store.SetPendingTOTP("alice", "JBSWY3DPEHPK3PXP"); err != nil {
+		t.Fatalf("seed pending: %v", err)
+	}
+	form := url.Values{"otp": {"000000"}}
+	req := httptest.NewRequest(http.MethodPost, "/mfa/totp/verify", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	addSessionCookie(req, sid)
+	rr := httptest.NewRecorder()
+	broker.handleTOTPEnrollVerify(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	user, _ := broker.store.GetUser("alice")
+	if user.TOTPSecretBase32 != "" {
+		t.Fatal("active secret must remain empty on bad code")
+	}
+	if user.PendingTOTPSecretBase32 == "" {
+		t.Fatal("pending secret should remain available for retry")
+	}
+}
+
+func TestHandleTOTPEnrollVerifyWithoutPendingReturnsGone(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true)
+	var sid string
+	for id := range broker.store.RuntimeSnapshot().Sessions {
+		sid = id
+	}
+	form := url.Values{"otp": {"123456"}}
+	req := httptest.NewRequest(http.MethodPost, "/mfa/totp/verify", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	addSessionCookie(req, sid)
+	rr := httptest.NewRecorder()
+	broker.handleTOTPEnrollVerify(rr, req)
+	if rr.Code != http.StatusGone {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandleTOTPEnrollVerifyAcceptsJSONBody(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true)
+	var sid string
+	for id := range broker.store.RuntimeSnapshot().Sessions {
+		sid = id
+	}
+	secret := "JBSWY3DPEHPK3PXP" //nolint:gosec // Standard RFC 6238 test vector.
+	if err := broker.store.SetPendingTOTP("alice", secret); err != nil {
+		t.Fatalf("seed pending: %v", err)
+	}
+	code := totpCode(secret, time.Now().Unix()/30)
+	bodyJSON := fmt.Sprintf(`{"otp":%q}`, code)
+	req := httptest.NewRequest(http.MethodPost, "/mfa/totp/verify", strings.NewReader(bodyJSON))
+	req.Header.Set("Content-Type", "application/json")
+	addSessionCookie(req, sid)
+	rr := httptest.NewRecorder()
+	broker.handleTOTPEnrollVerify(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	user, _ := broker.store.GetUser("alice")
+	if user.TOTPSecretBase32 != secret {
+		t.Fatalf("active secret = %q want %q", user.TOTPSecretBase32, secret)
+	}
+}
+
+func TestHandleTOTPEnrollVerifyRequiresReAuth(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	_, _ = broker.createSession(httptest.NewRecorder(), "alice", false)
+	var sid string
+	for id := range broker.store.RuntimeSnapshot().Sessions {
+		sid = id
+	}
+	form := url.Values{"otp": {"123456"}}
+	req := httptest.NewRequest(http.MethodPost, "/mfa/totp/verify", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	addSessionCookie(req, sid)
+	rr := httptest.NewRecorder()
+	broker.handleTOTPEnrollVerify(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandleTOTPEnrollVerifyRequiresAuth(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	req := httptest.NewRequest(http.MethodPost, "/mfa/totp/verify", strings.NewReader(""))
+	rr := httptest.NewRecorder()
+	broker.handleTOTPEnrollVerify(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d", rr.Code)
 	}
 }
 

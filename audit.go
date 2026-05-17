@@ -17,6 +17,7 @@ const (
 	auditEventReAuth           = "reauth"
 	auditEventLogout           = "logout"
 	auditEventTOTPEnroll       = "totp_enroll"
+	auditEventTOTPEnrollVerify = "totp_enroll_verify"
 	auditEventWebAuthnRegister = "webauthn_register"
 	auditEventWebAuthnLogin    = "webauthn_login"
 	auditEventTokenIssue       = "token_issue"

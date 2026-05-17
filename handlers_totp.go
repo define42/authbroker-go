@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"encoding/base32"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -15,6 +16,13 @@ import (
 	"time"
 )
 
+// handleTOTPEnroll stages a freshly generated TOTP secret on the user as
+// PendingTOTPSecretBase32 and returns it (plus the otpauth:// URI) so the
+// client can render a QR code. The user must then prove possession of the
+// shared secret by POSTing a valid code to /mfa/totp/verify, which is what
+// actually commits the secret as their active TOTPSecretBase32. Until that
+// verify call succeeds, the user's existing TOTP (if any) keeps working —
+// abandoning the enrollment does not lock anyone out.
 func (b *Broker) handleTOTPEnroll(w http.ResponseWriter, r *http.Request) {
 	sess, ok := b.validSession(r)
 	if !ok {
@@ -37,7 +45,7 @@ func (b *Broker) handleTOTPEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	secret := strings.TrimRight(base32.StdEncoding.EncodeToString(secretBytes), "=")
-	if err := b.store.SetTOTP(sess.UserID, secret); err != nil {
+	if err := b.store.SetPendingTOTP(sess.UserID, secret); err != nil {
 		b.auditEvent(r, auditEventTOTPEnroll, auditOutcomeFailure,
 			slog.String("user_id", sess.UserID),
 			slog.String("reason", "store_error"))
@@ -56,12 +64,93 @@ func (b *Broker) handleTOTPEnroll(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"secret_base32": secret, "otpauth_uri": otpauth})
 }
 
+// handleTOTPEnrollVerify commits the user's pending TOTP secret only after
+// they prove they can produce a valid code from it. Accepts either an
+// application/x-www-form-urlencoded body (otp=...) or a JSON body
+// ({"otp":"..."}). A 410 Gone is returned if no pending secret is staged.
+func (b *Broker) handleTOTPEnrollVerify(w http.ResponseWriter, r *http.Request) {
+	sess, ok := b.validSession(r)
+	if !ok {
+		http.Error(w, "not authenticated", http.StatusUnauthorized)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxTOTPVerifyBodyBytes)
+	if !b.requireRecentReAuth(w, sess) {
+		return
+	}
+	b.maybeExtendSession(w, r)
+
+	code, err := readTOTPVerifyCode(r)
+	if err != nil {
+		b.auditEvent(r, auditEventTOTPEnrollVerify, auditOutcomeFailure,
+			slog.String("user_id", sess.UserID),
+			slog.String("reason", "bad_request"))
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	user, found := b.store.GetUser(sess.UserID)
+	if !found || user.PendingTOTPSecretBase32 == "" {
+		b.auditEvent(r, auditEventTOTPEnrollVerify, auditOutcomeFailure,
+			slog.String("user_id", sess.UserID),
+			slog.String("reason", "no_pending_enrollment"))
+		http.Error(w, "no pending totp enrollment", http.StatusGone)
+		return
+	}
+	if !verifyTOTP(user.PendingTOTPSecretBase32, code, time.Now(), 1) {
+		b.auditEvent(r, auditEventTOTPEnrollVerify, auditOutcomeFailure,
+			slog.String("user_id", sess.UserID),
+			slog.String("reason", "invalid_code"))
+		http.Error(w, "invalid code", http.StatusUnauthorized)
+		return
+	}
+	if err := b.store.CommitPendingTOTP(sess.UserID); err != nil {
+		b.auditEvent(r, auditEventTOTPEnrollVerify, auditOutcomeFailure,
+			slog.String("user_id", sess.UserID),
+			slog.String("reason", "store_error"))
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	b.auditEvent(r, auditEventTOTPEnrollVerify, auditOutcomeSuccess,
+		slog.String("user_id", sess.UserID))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func readTOTPVerifyCode(r *http.Request) (string, error) {
+	ct := r.Header.Get("Content-Type")
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	ct = strings.TrimSpace(ct)
+	if ct == "application/json" {
+		var body struct {
+			OTP string `json:"otp"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			return "", fmt.Errorf("bad json")
+		}
+		code := strings.TrimSpace(body.OTP)
+		if code == "" {
+			return "", fmt.Errorf("missing otp")
+		}
+		return code, nil
+	}
+	if err := r.ParseForm(); err != nil {
+		return "", fmt.Errorf("bad form")
+	}
+	code := strings.TrimSpace(r.Form.Get("otp"))
+	if code == "" {
+		return "", fmt.Errorf("missing otp")
+	}
+	return code, nil
+}
+
 // TOTP, RFC 6238 style, HMAC-SHA1/6 digits/30 sec.
 func verifyTOTP(secretBase32, code string, now time.Time, window int) bool {
+	code = strings.TrimSpace(code)
 	if len(code) != 6 {
 		return false
 	}
-	code = strings.TrimSpace(code)
 	step := now.Unix() / 30
 	for i := -window; i <= window; i++ {
 		if subtle.ConstantTimeCompare([]byte(totpCode(secretBase32, step+int64(i))), []byte(code)) == 1 {

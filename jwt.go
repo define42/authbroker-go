@@ -28,8 +28,14 @@ func makePublicJWK(keyID string, pub *rsa.PublicKey) map[string]any {
 
 func (b *Broker) signJWT(claims map[string]any) (string, error) {
 	header := map[string]any{"typ": "JWT", "alg": "RS256", "kid": b.activeKey.keyID}
-	hb, _ := json.Marshal(header)
-	cb, _ := json.Marshal(claims)
+	hb, err := json.Marshal(header)
+	if err != nil {
+		return "", fmt.Errorf("marshal jwt header: %w", err)
+	}
+	cb, err := json.Marshal(claims)
+	if err != nil {
+		return "", fmt.Errorf("marshal jwt claims: %w", err)
+	}
 	signingInput := base64RawURL(hb) + "." + base64RawURL(cb)
 	h := sha256.Sum256([]byte(signingInput))
 	sig, err := rsa.SignPKCS1v15(rand.Reader, b.activeKey.privateKey, crypto.SHA256, h[:])
@@ -134,14 +140,18 @@ func (b *Broker) validateJWTClaims(claims map[string]any, opts jwtVerifyOptions)
 	return b.verifyTokenNotRevoked(claims)
 }
 
+// jwtClockSkew tolerates small drift between the issuer and the verifier on
+// both the nbf and exp boundaries.
+const jwtClockSkew = 30 * time.Second
+
 func jwtExpired(claims map[string]any, now time.Time) bool {
 	exp, ok := numberClaim(claims["exp"])
-	return ok && now.After(time.Unix(exp, 0))
+	return ok && now.After(time.Unix(exp, 0).Add(jwtClockSkew))
 }
 
 func jwtNotActive(claims map[string]any, now time.Time) bool {
 	nbf, ok := numberClaim(claims["nbf"])
-	return ok && now.Before(time.Unix(nbf, 0).Add(-30*time.Second))
+	return ok && now.Before(time.Unix(nbf, 0).Add(-jwtClockSkew))
 }
 
 func (b *Broker) verifyTokenNotRevoked(claims map[string]any) error {

@@ -40,6 +40,64 @@ func TestStoreSetTOTP(t *testing.T) {
 	}
 }
 
+//nolint:gocognit,cyclop // Test exercises the full lifecycle in one function on purpose.
+func TestStorePendingTOTPLifecycle(t *testing.T) {
+	store := newTestStore(t)
+	if err := store.SetPendingTOTP("alice", "PENDING1"); err != nil {
+		t.Fatalf("SetPendingTOTP: %v", err)
+	}
+	user, _ := store.GetUser("alice")
+	if user.PendingTOTPSecretBase32 != "PENDING1" {
+		t.Fatalf("pending = %q", user.PendingTOTPSecretBase32)
+	}
+	if user.TOTPSecretBase32 != "" {
+		t.Fatalf("active should be empty, got %q", user.TOTPSecretBase32)
+	}
+	if err := store.CommitPendingTOTP("alice"); err != nil {
+		t.Fatalf("CommitPendingTOTP: %v", err)
+	}
+	user, _ = store.GetUser("alice")
+	if user.TOTPSecretBase32 != "PENDING1" {
+		t.Fatalf("active after commit = %q", user.TOTPSecretBase32)
+	}
+	if user.PendingTOTPSecretBase32 != "" {
+		t.Fatalf("pending should be cleared, got %q", user.PendingTOTPSecretBase32)
+	}
+	if err := store.CommitPendingTOTP("alice"); err == nil {
+		t.Fatal("CommitPendingTOTP without pending must fail")
+	}
+
+	if err := store.SetPendingTOTP("alice", "PENDING2"); err != nil {
+		t.Fatalf("SetPendingTOTP again: %v", err)
+	}
+	if err := store.ClearPendingTOTP("alice"); err != nil {
+		t.Fatalf("ClearPendingTOTP: %v", err)
+	}
+	user, _ = store.GetUser("alice")
+	if user.PendingTOTPSecretBase32 != "" {
+		t.Fatal("pending should be cleared after ClearPendingTOTP")
+	}
+	if user.TOTPSecretBase32 != "PENDING1" {
+		t.Fatalf("active should be preserved, got %q", user.TOTPSecretBase32)
+	}
+	if err := store.SetTOTP("alice", "FINAL"); err != nil {
+		t.Fatalf("SetTOTP after lifecycle: %v", err)
+	}
+	if err := store.SetPendingTOTP("alice", "DANGLE"); err != nil {
+		t.Fatalf("seed dangling pending: %v", err)
+	}
+	if err := store.SetTOTP("alice", "FINAL2"); err != nil {
+		t.Fatalf("SetTOTP must clear dangling pending: %v", err)
+	}
+	user, _ = store.GetUser("alice")
+	if user.PendingTOTPSecretBase32 != "" {
+		t.Fatalf("SetTOTP should clear pending, got %q", user.PendingTOTPSecretBase32)
+	}
+	if user.TOTPSecretBase32 != "FINAL2" {
+		t.Fatalf("active = %q", user.TOTPSecretBase32)
+	}
+}
+
 func TestStoreAddWebAuthnCredential(t *testing.T) {
 	store := newTestStore(t)
 	cred := WebAuthnCredential{IDBase64URL: "cred-1", Alg: "ES256"}
