@@ -30,17 +30,21 @@ type compiledGroupMappings struct {
 	regex  []regexGroupMapping
 }
 
+// compileGroupMappings parses the already-normalized client/app-token group
+// mapping map into the matcher form used at token issuance. Inputs have
+// already passed normalizeClientGroupMappings during config load, so parse
+// errors are not expected here — any err is treated as "skip this entry".
 func compileGroupMappings(in map[string]string) *compiledGroupMappings {
 	if len(in) == 0 {
 		return nil
 	}
 	compiled := &compiledGroupMappings{direct: map[string]string{}}
 	for source, target := range in {
-		if regexMapping, ok, err := parseRegexGroupMapping(source, target); err == nil && ok {
+		if regexMapping, ok, _ := parseRegexGroupMapping(source, target); ok {
 			compiled.regex = append(compiled.regex, regexMapping)
 			continue
 		}
-		if scoped, ok, err := parseScopedGroupMapping(source, target); err == nil && ok {
+		if scoped, ok, _ := parseScopedGroupMapping(source, target); ok {
 			compiled.scoped = append(compiled.scoped, scoped)
 			continue
 		}

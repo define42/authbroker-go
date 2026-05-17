@@ -125,8 +125,12 @@ var brokerLogoutTemplate = template.Must(template.New("broker-logout").Parse(`<!
       <p class="section-kicker">Sign out</p>
       <h2 class="panel-title">End this broker session?</h2>
       <p>Signed in as <strong>{{.UserID}}</strong>.</p>
-      <form method="post" action="/logout" class="actions logout-actions">
+      <form method="post" action="{{.Action}}" class="actions logout-actions">
         <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+        {{if .IDTokenHint}}<input type="hidden" name="id_token_hint" value="{{.IDTokenHint}}">{{end}}
+        {{if .ClientID}}<input type="hidden" name="client_id" value="{{.ClientID}}">{{end}}
+        {{if .PostLogoutRedirectURI}}<input type="hidden" name="post_logout_redirect_uri" value="{{.PostLogoutRedirectURI}}">{{end}}
+        {{if .State}}<input type="hidden" name="state" value="{{.State}}">{{end}}
         <button type="submit" class="danger">Sign out of authbroker</button>
         <a class="button secondary" href="/">Cancel</a>
       </form>

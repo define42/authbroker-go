@@ -152,6 +152,12 @@ func (b *Broker) handleAppToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid csrf token", http.StatusForbidden)
 		return
 	}
+	// Re-auth required: app tokens default to 8h TTL and ship user identity
+	// claims (groups, email, name). A stolen session must not be able to
+	// silently mint one.
+	if !b.requireRecentReAuth(w, sess) {
+		return
+	}
 	b.maybeExtendSession(w, r)
 	tokenID := r.PathValue("id")
 	tokenCfg, ok := b.appTokens[tokenID]

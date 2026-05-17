@@ -48,7 +48,11 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	username := strings.TrimSpace(r.Form.Get("username"))
+	// Lowercase the username at the boundary so the rate-limit key, LDAP
+	// bind, store key, and audit user_id agree on a single identifier.
+	// AD/OpenLDAP are case-insensitive in practice; oscillating case used to
+	// surface as different audit user_id strings for the same account.
+	username := strings.ToLower(strings.TrimSpace(r.Form.Get("username")))
 	rateKey := loginRateKey(r, username)
 	if ok, retry := b.loginLimiter.allow(rateKey); !ok {
 		writeRetryAfter(w, retry)
@@ -87,7 +91,7 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		}
 		b.auditEvent(r, auditEventLogin, auditOutcomeFailure,
 			slog.String("user_id", username),
-			slog.String("client_id", ar.ClientID),
+			slog.String("client_id", loginAuditClientID(ar)),
 			slog.String("reason", "invalid_credentials"))
 		http.Error(w, "invalid username or password", http.StatusUnauthorized)
 		return
@@ -109,7 +113,7 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 			}
 			b.auditEvent(r, auditEventLogin, auditOutcomeFailure,
 				slog.String("user_id", user.Username),
-				slog.String("client_id", ar.ClientID),
+				slog.String("client_id", loginAuditClientID(ar)),
 				slog.String("reason", "totp_not_enrolled"))
 			http.Error(w, "invalid username or password", http.StatusUnauthorized)
 			return
@@ -123,7 +127,7 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 			}
 			b.auditEvent(r, auditEventLogin, auditOutcomeFailure,
 				slog.String("user_id", user.Username),
-				slog.String("client_id", ar.ClientID),
+				slog.String("client_id", loginAuditClientID(ar)),
 				slog.String("reason", "invalid_totp"))
 			http.Error(w, "invalid username or password", http.StatusUnauthorized)
 			return
@@ -208,6 +212,7 @@ func (b *Broker) handleLocalLogoutGet(w http.ResponseWriter, r *http.Request) {
 		"DisplayName": b.cfg.DisplayName,
 		"UserID":      sess.UserID,
 		"CSRFToken":   sess.CSRFToken,
+		"Action":      "/logout",
 	})
 }
 
@@ -252,6 +257,19 @@ func (b *Broker) handleLogout(w http.ResponseWriter, r *http.Request) {
 
 	postLogoutRedirectURI := strings.TrimSpace(logoutParam(r, "post_logout_redirect_uri"))
 	state := logoutParam(r, "state")
+
+	// Per OIDC RP-Initiated Logout 1.0 §3, the broker SHOULD confirm the
+	// end-user's logout intent before clearing the SSO session. Render an
+	// interstitial for GET requests carrying an active session so that
+	// <a>/<img>/redirect-driven CSRF cannot drop the session in one round-trip.
+	// RP-initiated POSTs proceed directly, as in spec-compliant flows.
+	if r.Method == http.MethodGet {
+		if sess, hasSession := b.validSession(r); hasSession {
+			b.renderRPLogoutConfirm(w, sess, idTokenHint, clientID, postLogoutRedirectURI, state)
+			return
+		}
+	}
+
 	if postLogoutRedirectURI != "" {
 		b.handlePostLogoutRedirect(w, r, clientID, postLogoutRedirectURI, state)
 		return
@@ -271,6 +289,25 @@ func (b *Broker) handleLogout(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("logged out\n"))
+}
+
+// renderRPLogoutConfirm shows a confirmation page for RP-initiated logout
+// when the request arrives as a GET. The form re-submits to /oauth2/logout
+// via POST and carries the original id_token_hint / client_id /
+// post_logout_redirect_uri / state so the resulting logout matches the
+// caller's intent.
+func (b *Broker) renderRPLogoutConfirm(w http.ResponseWriter, sess Session, idTokenHint, clientID, postLogoutRedirectURI, state string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = brokerLogoutTemplate.Execute(w, map[string]any{
+		"DisplayName":           b.cfg.DisplayName,
+		"UserID":                sess.UserID,
+		"CSRFToken":             sess.CSRFToken,
+		"Action":                "/oauth2/logout",
+		"IDTokenHint":           idTokenHint,
+		"ClientID":              clientID,
+		"PostLogoutRedirectURI": postLogoutRedirectURI,
+		"State":                 state,
+	})
 }
 
 func (b *Broker) handlePostLogoutRedirect(w http.ResponseWriter, r *http.Request, clientID, redirectURI, state string) {
@@ -342,6 +379,15 @@ func (b *Broker) logoutClientIDFromIDTokenHint(idTokenHint string) (string, erro
 }
 
 func clientIDFromTokenClaims(claims map[string]any) string {
+	// Per OIDC Core §3.1.3.7, azp (authorized party) is the authoritative
+	// client identifier when an ID token has multiple audiences. Prefer it,
+	// then the explicit client_id claim, then aud — accepting either a string
+	// or a single-element list. Multi-audience aud without azp is ambiguous
+	// and yields "" so logout falls through to the no-client path rather than
+	// guessing.
+	if azp, _ := claims["azp"].(string); azp != "" {
+		return azp
+	}
 	if clientID, _ := claims["client_id"].(string); clientID != "" {
 		return clientID
 	}
@@ -586,6 +632,17 @@ func (b *Broker) issueCodeRedirect(w http.ResponseWriter, r *http.Request, ar Au
 	u.RawQuery = q.Encode()
 	http.Redirect(w, r, u.String(), http.StatusFound)
 	return nil
+}
+
+// loginAuditClientID returns the client_id label used in login audit events.
+// Falls back to "authbroker" for direct logins (no OAuth request_id) so audit
+// consumers can filter consistently between OAuth and direct sign-in flows
+// — matching the value handleLoginGet supplies to the login template.
+func loginAuditClientID(ar AuthorizationRequest) string {
+	if ar.ClientID != "" {
+		return ar.ClientID
+	}
+	return "authbroker"
 }
 
 // loginRateKey scopes the limiter by client IP and (when known) the username

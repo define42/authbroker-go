@@ -652,6 +652,9 @@ func bucket(tx *bolt.Tx, name string) *bolt.Bucket {
 	return tx.Bucket([]byte(name))
 }
 
+// getUserTx loads a user inside a bbolt transaction. Returns (nil, nil) when
+// the username is not present — callers must check for u == nil before
+// dereferencing.
 func getUserTx(b *bolt.Bucket, username string) (*StoredUser, error) {
 	v := b.Get([]byte(username))
 	if v == nil {

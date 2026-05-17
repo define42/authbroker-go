@@ -122,25 +122,6 @@ func TestLDAPEntryAttributeValuesMergeCaseVariants(t *testing.T) {
 	assertStringSlicesEqual(t, got, want)
 }
 
-func TestLDAPGroupNames(t *testing.T) {
-	got := ldapGroupNames([]string{
-		"cn=app_elk_team10_ingest,ou=groups,dc=glauth,dc=com",
-		"ou=app_elk_team10_user,ou=groups,dc=glauth,dc=com",
-		"plain-group",
-		"cn=app_elk_team10_ingest,ou=groups,dc=glauth,dc=com",
-		"",
-	})
-	want := []string{"app_elk_team10_ingest", "app_elk_team10_user", "plain-group"}
-	if len(got) != len(want) {
-		t.Fatalf("ldapGroupNames() = %#v, want %#v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("ldapGroupNames() = %#v, want %#v", got, want)
-		}
-	}
-}
-
 func TestLDAPGroupIdentifiers(t *testing.T) {
 	got := ldapGroupIdentifiers([]string{
 		"cn=app_elk_team10_ingest,ou=groups,dc=glauth,dc=com",
@@ -395,12 +376,16 @@ func TestBrokerLogoutClearsSessionAndRedirects(t *testing.T) {
 	if idToken == "" {
 		t.Fatalf("missing id token in %#v", tokens)
 	}
-	q := url.Values{
+	form := url.Values{
 		"id_token_hint":            {idToken},
 		"post_logout_redirect_uri": {"http://app.example/"},
 		"state":                    {"logout-state"},
 	}
-	req := httptest.NewRequest(http.MethodGet, "/oauth2/logout?"+q.Encode(), nil)
+	// GET with an active session intentionally renders an interstitial
+	// (CSRF defense). The actual session clear and redirect run on POST
+	// from the confirmation form.
+	req := httptest.NewRequest(http.MethodPost, "/oauth2/logout", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "logout-session"}) //nolint:gosec // Test attaches a synthetic session cookie.
 	rr := httptest.NewRecorder()
 	broker.handleLogout(rr, req)

@@ -132,7 +132,9 @@ func (b *Broker) handleWebAuthnLoginBegin(w http.ResponseWriter, r *http.Request
 		Username string `json:"username"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	req.Username = strings.TrimSpace(req.Username)
+	// Match handleLoginPost: normalize case so users registered as "alice"
+	// can sign in as "Alice" without missing the store lookup.
+	req.Username = strings.ToLower(strings.TrimSpace(req.Username))
 	if req.Username == "" {
 		http.Error(w, "username is required", http.StatusBadRequest)
 		return
@@ -294,7 +296,7 @@ func (b *Broker) verifyWebAuthnAttestation(req webauthnAttestationResponse, expe
 	}, nil
 }
 
-//nolint:gocognit,cyclop // WebAuthn assertion checks are intentionally explicit and ordered.
+//nolint:gocognit,cyclop,funlen // WebAuthn assertion checks are intentionally explicit and ordered.
 func (b *Broker) verifyWebAuthnAssertion(req webauthnAssertionResponse, username, expectedChallenge string, clientDataBytes []byte, cd webauthnClientData) error {
 	if cd.Type != "webauthn.get" {
 		return fmt.Errorf("wrong clientData type")
@@ -308,6 +310,21 @@ func (b *Broker) verifyWebAuthnAssertion(req webauthnAssertionResponse, username
 	rawID, err := decodeB64URL(req.RawID)
 	if err != nil || len(rawID) == 0 {
 		return fmt.Errorf("bad rawId")
+	}
+	// Per WebAuthn §7.2 step 6, when the authenticator returns a userHandle
+	// it MUST match the user the RP intended to authenticate. The current
+	// flow already binds username via the challenge record, but discoverable
+	// (passkey) credentials may surface a userHandle that the RP did not
+	// originally supply — reject if it disagrees. We expect the handle to be
+	// the b64url-encoded UTF-8 of the username (matching register/begin).
+	if handle := strings.TrimSpace(req.Response.UserHandle); handle != "" {
+		handleBytes, err := decodeB64URL(handle)
+		if err != nil {
+			return fmt.Errorf("bad userHandle")
+		}
+		if string(handleBytes) != username {
+			return fmt.Errorf("userHandle does not match expected user")
+		}
 	}
 	credID := base64RawURL(rawID)
 	user, ok := b.store.GetUser(username)

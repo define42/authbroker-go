@@ -140,7 +140,7 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 			return nil, fmt.Errorf("app_tokens[%d].id is required", i)
 		}
 		if !validAppTokenID(tokenCfg.ID) {
-			return nil, fmt.Errorf("app token %q: id may only contain letters, digits, dot, underscore, and hyphen", tokenCfg.ID)
+			return nil, fmt.Errorf("app token %q: id must be 1-%d chars of letters, digits, dot, underscore, or hyphen", tokenCfg.ID, maxAppTokenIDLen)
 		}
 		groupMappings, err := normalizeClientGroupMappings(tokenCfg.GroupMappings)
 		if err != nil {
@@ -203,14 +203,22 @@ func (b *Broker) startBackgroundSweeper(ctx context.Context, interval time.Durat
 	}
 }
 
+// maxAppTokenIDLen caps the app-token id length. The id is reflected in URL
+// paths, HTML, and JWT claims; HTML escaping and exact path matching make
+// this cap defensive insurance rather than a security boundary.
+const maxAppTokenIDLen = 64
+
 func validAppTokenID(id string) bool {
+	if id == "" || len(id) > maxAppTokenIDLen {
+		return false
+	}
 	for _, r := range id {
 		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
 			continue
 		}
 		return false
 	}
-	return id != ""
+	return true
 }
 
 func (b *Broker) routes() http.Handler {

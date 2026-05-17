@@ -620,6 +620,12 @@ func TestClientIDFromTokenClaims(t *testing.T) {
 	if got := clientIDFromTokenClaims(map[string]any{"aud": []any{"a", "b"}}); got != "" {
 		t.Fatalf("multi aud should yield empty, got %q", got)
 	}
+	if got := clientIDFromTokenClaims(map[string]any{"azp": "via-azp", "aud": []any{"a", "b"}}); got != "via-azp" {
+		t.Fatalf("azp should win over multi aud, got %q", got)
+	}
+	if got := clientIDFromTokenClaims(map[string]any{"azp": "via-azp", "client_id": "via-claim"}); got != "via-azp" {
+		t.Fatalf("azp should win over client_id, got %q", got)
+	}
 }
 
 // --- handlers_webauthn.go: register/login finish error paths ---
@@ -1123,6 +1129,7 @@ func TestHandleAppTokenIssues(t *testing.T) {
 		UserID:    "alice",
 		ExpiresAt: now.Add(time.Hour),
 		AuthTime:  now,
+		ReAuthAt:  now,
 		CSRFToken: "csrf-token",
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -1148,6 +1155,7 @@ func TestHandleAppTokenUnknownIDReturns404(t *testing.T) {
 	if err := broker.store.PutSession(sid, Session{
 		UserID:    "alice",
 		ExpiresAt: time.Now().Add(time.Hour),
+		ReAuthAt:  time.Now(),
 		CSRFToken: "csrf-token",
 	}); err != nil {
 		t.Fatalf("seed: %v", err)

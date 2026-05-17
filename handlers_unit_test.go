@@ -1083,7 +1083,11 @@ func TestHandleLogoutWithoutHintClearsSession(t *testing.T) {
 	if err := broker.store.PutSession(sid, Session{UserID: "u", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	req := httptest.NewRequest(http.MethodGet, "/oauth2/logout", nil)
+	// POST is the form-completion side of the RP-initiated logout flow;
+	// GET with an active session intentionally renders an interstitial
+	// rather than clearing the cookie in one round-trip.
+	req := httptest.NewRequest(http.MethodPost, "/oauth2/logout", strings.NewReader(""))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	addSessionCookie(req, sid)
 	rr := httptest.NewRecorder()
 	broker.handleLogout(rr, req)
@@ -1092,6 +1096,27 @@ func TestHandleLogoutWithoutHintClearsSession(t *testing.T) {
 	}
 	if _, ok := broker.store.RuntimeSnapshot().Sessions[sid]; ok {
 		t.Fatal("session was not cleared")
+	}
+}
+
+func TestHandleLogoutGetWithSessionShowsConfirm(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	sid := "sess-confirm"
+	if err := broker.store.PutSession(sid, Session{UserID: "u", ExpiresAt: time.Now().Add(time.Hour), CSRFToken: "csrf-confirm"}); err != nil { //nolint:gosec // Test seeds a synthetic CSRF token.
+		t.Fatalf("seed: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/logout?post_logout_redirect_uri=http://app.example/", nil)
+	addSessionCookie(req, sid)
+	rr := httptest.NewRecorder()
+	broker.handleLogout(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "End this broker session") {
+		t.Fatalf("expected interstitial body, got %s", rr.Body.String())
+	}
+	if _, ok := broker.store.RuntimeSnapshot().Sessions[sid]; !ok {
+		t.Fatal("session should remain until user confirms")
 	}
 }
 

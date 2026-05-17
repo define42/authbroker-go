@@ -206,21 +206,6 @@ func (a *LDAPAuthenticator) bindName(username string) string {
 	return a.loginName(username)
 }
 
-func ldapGroupNames(values []string) []string {
-	seen := map[string]bool{}
-	groups := []string{}
-	for _, value := range values {
-		value = ldapGroupName(value)
-		if value == "" || seen[value] {
-			continue
-		}
-		seen[value] = true
-		groups = append(groups, value)
-	}
-	sort.Strings(groups)
-	return groups
-}
-
 func ldapGroupIdentifiers(values []string) []string {
 	seen := map[string]bool{}
 	groups := []string{}
