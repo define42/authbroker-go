@@ -356,6 +356,7 @@ func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime
 		return nil, err
 	}
 
+	atHashSum := sha256.Sum256([]byte(access))
 	idClaims := map[string]any{
 		"iss":                b.cfg.Issuer,
 		"sub":                userID,
@@ -364,6 +365,7 @@ func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime
 		"exp":                now.Add(time.Duration(b.cfg.IDTokenTTLMinutes) * time.Minute).Unix(),
 		"auth_time":          authTime.Unix(),
 		"preferred_username": userID,
+		"at_hash":            base64RawURL(atHashSum[:sha256.Size/2]),
 	}
 	if nonce != "" {
 		idClaims["nonce"] = nonce
