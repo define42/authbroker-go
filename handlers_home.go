@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"time"
 )
 
@@ -89,6 +90,8 @@ func (b *Broker) homeData(r *http.Request, issued *issuedAppTokenView) map[strin
 		data["UserID"] = sess.UserID
 		data["ExpiresAt"] = sess.ExpiresAt.Format(time.RFC1123)
 		data["CSRFToken"] = sess.CSRFToken
+		user, _ := b.store.GetUser(sess.UserID)
+		data["IsAdmin"] = b.userIsAdmin(user)
 	}
 	if issued != nil {
 		data["IssuedAppToken"] = issued
@@ -97,9 +100,15 @@ func (b *Broker) homeData(r *http.Request, issued *issuedAppTokenView) map[strin
 }
 
 func (b *Broker) appTokenViews() []appTokenView {
-	views := make([]appTokenView, 0, len(b.cfg.AppTokens))
-	for _, cfg := range b.cfg.AppTokens {
-		views = append(views, b.appTokenView(cfg))
+	merged := b.snapshotAppTokens()
+	ids := make([]string, 0, len(merged))
+	for id := range merged {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	views := make([]appTokenView, 0, len(merged))
+	for _, id := range ids {
+		views = append(views, b.appTokenView(merged[id]))
 	}
 	return views
 }
@@ -160,7 +169,7 @@ func (b *Broker) handleAppToken(w http.ResponseWriter, r *http.Request) {
 	}
 	b.maybeExtendSession(w, r)
 	tokenID := r.PathValue("id")
-	tokenCfg, ok := b.appTokens[tokenID]
+	tokenCfg, ok := b.lookupAppToken(tokenID)
 	if !ok {
 		b.auditEvent(r, auditEventAppTokenIssue, auditOutcomeFailure,
 			slog.String("user_id", sess.UserID),

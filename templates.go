@@ -83,6 +83,12 @@ var brokerHomeTemplate = template.Must(template.New("broker-home").Parse(`<!doct
             <p class="muted">JWKS</p>
             <code class="meta-value">{{.Issuer}}/oauth2/jwks</code>
           </section>
+          {{if .IsAdmin}}
+          <section class="panel">
+            <p class="section-kicker">Administration</p>
+            <a class="button" href="/admin">Open admin</a>
+          </section>
+          {{end}}
           <form method="get" action="/logout">
             <button type="submit" class="secondary">Sign out</button>
           </form>

@@ -329,13 +329,62 @@ button.danger {
   border-color: var(--accent);
 }
 
-.logout-panel {
+.logout-panel,
+.consent-panel {
   max-width: 560px;
   margin: 40px auto 0;
 }
 
 .logout-actions {
   margin-top: 18px;
+}
+
+.flash {
+  margin: 0 0 16px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+  color: var(--text);
+}
+
+.flash.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--panel-soft);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 650;
+}
+
+.scope-list {
+  margin: 0 0 16px;
+  padding-left: 20px;
+  display: grid;
+  gap: 4px;
+}
+
+.admin-breadcrumb {
+  margin: -8px 0 16px;
+  font-size: 14px;
 }
 
 @media (max-width: 800px) {

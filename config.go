@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/caddyserver/certmagic"
 )
@@ -59,12 +60,13 @@ type Config struct {
 	SigningKeyRotationDays  int                `json:"signing_key_rotation_days,omitempty"`
 	SigningKeyRetentionDays int                `json:"signing_key_retention_days,omitempty"`
 
-	LDAP      LDAPConfig       `json:"ldap"`
-	Clients   []Client         `json:"clients"`
-	MFA       MFAConfig        `json:"mfa"`
-	WebAuthn  WebAuthnConfig   `json:"webauthn"`
-	AppTokens []AppTokenConfig `json:"app_tokens,omitempty"`
-	ACME      ACMEConfig       `json:"acme,omitempty"`
+	LDAP        LDAPConfig       `json:"ldap"`
+	Clients     []Client         `json:"clients"`
+	MFA         MFAConfig        `json:"mfa"`
+	WebAuthn    WebAuthnConfig   `json:"webauthn"`
+	AppTokens   []AppTokenConfig `json:"app_tokens,omitempty"`
+	ACME        ACMEConfig       `json:"acme,omitempty"`
+	AdminGroups []string         `json:"admin_groups,omitempty"`
 
 	AccessTokenTTLMinutes int `json:"access_token_ttl_minutes"`
 	IDTokenTTLMinutes     int `json:"id_token_ttl_minutes"`
@@ -110,6 +112,16 @@ type Client struct {
 	Public                 bool              `json:"public"`
 	RequirePKCE            bool              `json:"require_pkce"`
 	GroupMappings          map[string]string `json:"group_mappings,omitempty"`
+	// RequireConsent enables the per-user consent screen for this client.
+	// Off by default for backwards compatibility with config-defined first-
+	// party clients. Admin-created clients via /admin set it to true so
+	// authorize prompts the user before redirecting back with a code.
+	RequireConsent bool `json:"require_consent,omitempty"`
+
+	// StoredAt distinguishes admin-created stored clients (non-zero) from
+	// config-defined ones (zero). Set by the admin handler; never written via
+	// config. Drives the read-only badge in the admin list view.
+	StoredAt time.Time `json:"stored_at,omitempty"`
 
 	// compiledMappings caches the parsed direct/scoped/regex mapping
 	// representation. Populated by NewBroker after normalizeClientGroupMappings.
@@ -154,6 +166,7 @@ type AppTokenConfig struct {
 	Scope           string            `json:"scope,omitempty"`
 	TokenTTLMinutes int               `json:"token_ttl_minutes,omitempty"`
 	GroupMappings   map[string]string `json:"group_mappings,omitempty"`
+	StoredAt        time.Time         `json:"stored_at,omitempty"`
 
 	// compiledMappings caches the parsed direct/scoped/regex mapping
 	// representation. Populated by NewBroker after normalizeClientGroupMappings.

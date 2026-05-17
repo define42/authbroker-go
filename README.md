@@ -163,6 +163,16 @@ export JWT_AUDIENCE="litellm"
 
 App tokens include `sub`, `preferred_username`, `email`, `name`, `client_id`, `app_token_id`, `scope`, and mapped `groups` when the selected profile has `group_mappings` and the profile scope includes `groups`. LiteLLM's JWT auth docs are at <https://docs.litellm.ai/docs/proxy/token_auth>.
 
+## Admin UI and consent screen
+
+Members of any group listed in `admin_groups` (in config.json) gain access to `/admin` after signing in. The admin UI lets you create and delete OAuth clients and app-token profiles at runtime; config-defined entries are read-only and stay declarative. Created entities persist in `AUTHBROKER_DATA/data.db` and are merged with config-defined ones on each request.
+
+```json
+"admin_groups": ["administrators"]
+```
+
+When a client has `require_consent: true`, the broker prompts the user (`/consent`) before redirecting back with an authorization code. Approvals are stored per (user, client) and re-prompted only if the client later requests a scope the user has not yet approved. Admin-created clients default to consent-required; config-defined clients default to consent-skipped to preserve existing first-party behavior — set `require_consent: true` per client to opt in.
+
 ## Signing keys and rotation
 
 When `signing_key_pem` and `signing_keys` are omitted, startup automatically manages RSA signing keys in `AUTHBROKER_DATA/signing-keys.json`. New JWTs are signed with the active key, and retained old keys remain in `/oauth2/jwks` so existing tokens can validate after rotation.
@@ -402,7 +412,9 @@ Before production, the remaining hardening work is:
 - encrypted secret storage for signing keys, TLS trust material, and deployment secrets
 - backup/restore for the `AUTHBROKER_DATA` directory
 - operational key rotation policy review for each deployment
-- consent screens, client administration, and app-token profile administration
+- group-mapping editor in the admin UI (currently config-only)
+- per-scope consent toggles (current consent screen is binary approve/deny)
+- editing of stored clients and app tokens (currently create + delete only)
 - app-token issuance audit, revocation strategy, per-app TTL review, and policy for who may generate each token profile
 - rate limiting and brute-force protection
 - audit log forwarding/retention: a structured JSON audit stream is emitted via `log/slog` for login, reauth, logout, TOTP enroll, WebAuthn register/login, token issuance, and revocation; deployments still need to ship and retain it

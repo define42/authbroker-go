@@ -19,7 +19,7 @@ func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unsupported response_type", http.StatusBadRequest)
 		return
 	}
-	client, ok := b.clients[q.Get("client_id")]
+	client, ok := b.lookupClient(q.Get("client_id"))
 	if !ok {
 		http.Error(w, "unknown client_id", http.StatusBadRequest)
 		return
@@ -54,7 +54,7 @@ func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 
 	if sess, ok := b.validSession(r); ok {
 		b.maybeExtendSession(w, r)
-		if err := b.issueCodeRedirect(w, r, authReq, sess); err != nil {
+		if err := b.proceedAfterAuthn(w, r, authReq, sess); err != nil {
 			http.Error(w, "store error", http.StatusInternalServerError)
 		}
 		return
@@ -112,7 +112,7 @@ func (b *Broker) authenticateClient(r *http.Request) (Client, error) {
 		id = r.Form.Get("client_id")
 		secret = r.Form.Get("client_secret")
 	}
-	client, exists := b.clients[id]
+	client, exists := b.lookupClient(id)
 	if !exists || id == "" {
 		return Client{}, fmt.Errorf("unknown client")
 	}
@@ -456,7 +456,7 @@ func (b *Broker) mappedGroupsForClient(clientID string, user *StoredUser) []stri
 	if user == nil {
 		return nil
 	}
-	client, ok := b.clients[clientID]
+	client, ok := b.lookupClient(clientID)
 	if !ok {
 		return nil
 	}

@@ -8,6 +8,8 @@ import (
 	"log"
 	"log/slog"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -76,8 +78,16 @@ type Broker struct {
 	verifyKeys map[string]*rsa.PublicKey
 	publicJWKs []any
 
+	// clients and appTokens hold the immutable config-defined entries. The
+	// stored* maps hold admin-managed entries persisted to bolt. Admin
+	// mutations rebuild storedClients/storedAppTokens under registryMu so
+	// reads (under RLock) observe a consistent snapshot.
 	clients   map[string]Client
 	appTokens map[string]AppTokenConfig
+
+	registryMu      sync.RWMutex
+	storedClients   map[string]Client
+	storedAppTokens map[string]AppTokenConfig
 
 	loginLimiter *loginRateLimiter
 
@@ -160,19 +170,139 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 	}
 
 	b := &Broker{
-		cfg:          cfg,
-		store:        store,
-		authn:        &LDAPAuthenticator{cfg: cfg.LDAP},
-		activeKey:    activeKey,
-		verifyKeys:   verifyKeys,
-		publicJWKs:   publicJWKs,
-		clients:      clientMap,
-		appTokens:    appTokenMap,
-		loginLimiter: newLoginRateLimiter(loginRateLimitWindow, loginRateLimitMaxAttempts, loginRateLockout),
-		audit:        newAuditLogger(nil),
+		cfg:             cfg,
+		store:           store,
+		authn:           &LDAPAuthenticator{cfg: cfg.LDAP},
+		activeKey:       activeKey,
+		verifyKeys:      verifyKeys,
+		publicJWKs:      publicJWKs,
+		clients:         clientMap,
+		appTokens:       appTokenMap,
+		storedClients:   map[string]Client{},
+		storedAppTokens: map[string]AppTokenConfig{},
+		loginLimiter:    newLoginRateLimiter(loginRateLimitWindow, loginRateLimitMaxAttempts, loginRateLockout),
+		audit:           newAuditLogger(nil),
+	}
+	if err := b.reloadStoredRegistries(); err != nil {
+		return nil, fmt.Errorf("load stored registries: %w", err)
 	}
 	b.sweepExpired(time.Now())
 	return b, nil
+}
+
+// reloadStoredRegistries rebuilds the stored client/app-token maps from bolt.
+// Called at startup and after every admin mutation so subsequent OAuth and
+// app-token requests see the new entries without restart.
+func (b *Broker) reloadStoredRegistries() error {
+	clients, err := b.store.ListStoredClients()
+	if err != nil {
+		return err
+	}
+	tokens, err := b.store.ListStoredAppTokens()
+	if err != nil {
+		return err
+	}
+	clientMap := make(map[string]Client, len(clients))
+	for _, c := range clients {
+		if _, isConfig := b.clients[c.ClientID]; isConfig {
+			// Config-defined entries always win — drop the shadowed stored copy.
+			continue
+		}
+		c.compiledMappings = compileGroupMappings(c.GroupMappings)
+		clientMap[c.ClientID] = c
+	}
+	tokenMap := make(map[string]AppTokenConfig, len(tokens))
+	for _, t := range tokens {
+		if _, isConfig := b.appTokens[t.ID]; isConfig {
+			continue
+		}
+		t.compiledMappings = compileGroupMappings(t.GroupMappings)
+		tokenMap[t.ID] = t
+	}
+	b.registryMu.Lock()
+	b.storedClients = clientMap
+	b.storedAppTokens = tokenMap
+	b.registryMu.Unlock()
+	return nil
+}
+
+// lookupClient returns the merged client (config first, then stored) for
+// OAuth handlers. Stored mutations are reflected because the snapshot is
+// rebuilt on reloadStoredRegistries.
+func (b *Broker) lookupClient(id string) (Client, bool) {
+	if c, ok := b.clients[id]; ok {
+		return c, true
+	}
+	b.registryMu.RLock()
+	defer b.registryMu.RUnlock()
+	c, ok := b.storedClients[id]
+	return c, ok
+}
+
+func (b *Broker) lookupAppToken(id string) (AppTokenConfig, bool) {
+	if t, ok := b.appTokens[id]; ok {
+		return t, true
+	}
+	b.registryMu.RLock()
+	defer b.registryMu.RUnlock()
+	t, ok := b.storedAppTokens[id]
+	return t, ok
+}
+
+// snapshotClients returns config + stored clients in a single map for admin
+// list views. Snapshot is a copy so callers can iterate without holding
+// registryMu.
+func (b *Broker) snapshotClients() map[string]Client {
+	b.registryMu.RLock()
+	defer b.registryMu.RUnlock()
+	out := make(map[string]Client, len(b.clients)+len(b.storedClients))
+	for k, v := range b.clients {
+		out[k] = v
+	}
+	for k, v := range b.storedClients {
+		out[k] = v
+	}
+	return out
+}
+
+func (b *Broker) snapshotAppTokens() map[string]AppTokenConfig {
+	b.registryMu.RLock()
+	defer b.registryMu.RUnlock()
+	out := make(map[string]AppTokenConfig, len(b.appTokens)+len(b.storedAppTokens))
+	for k, v := range b.appTokens {
+		out[k] = v
+	}
+	for k, v := range b.storedAppTokens {
+		out[k] = v
+	}
+	return out
+}
+
+// userIsAdmin reports whether the user has at least one group matching
+// cfg.AdminGroups. Matching is case-insensitive and tolerates raw LDAP DNs by
+// extracting the CN segment for comparison.
+func (b *Broker) userIsAdmin(user *StoredUser) bool {
+	if user == nil || len(b.cfg.AdminGroups) == 0 {
+		return false
+	}
+	allowed := map[string]bool{}
+	for _, g := range b.cfg.AdminGroups {
+		trimmed := strings.TrimSpace(g)
+		if trimmed == "" {
+			continue
+		}
+		allowed[strings.ToLower(ldapGroupName(trimmed))] = true
+		allowed[strings.ToLower(trimmed)] = true
+	}
+	if len(allowed) == 0 {
+		return false
+	}
+	for _, g := range user.Groups {
+		if allowed[strings.ToLower(ldapGroupName(g))] || allowed[strings.ToLower(g)] {
+			return true
+		}
+	}
+	return false
 }
 
 // sweepExpired removes expired entries from shared runtime state so abandoned
@@ -247,6 +377,15 @@ func (b *Broker) routes() http.Handler {
 	mux.HandleFunc("POST /webauthn/register/finish", b.handleWebAuthnRegisterFinish)
 	mux.HandleFunc("POST /webauthn/login/begin", b.handleWebAuthnLoginBegin)
 	mux.HandleFunc("POST /webauthn/login/finish", b.handleWebAuthnLoginFinish)
+	mux.HandleFunc("GET /consent", b.handleConsentGet)
+	mux.HandleFunc("POST /consent", b.handleConsentPost)
+	mux.HandleFunc("GET /admin", b.handleAdminHome)
+	mux.HandleFunc("GET /admin/clients/new", b.handleAdminClientsNew)
+	mux.HandleFunc("POST /admin/clients", b.handleAdminClientsCreate)
+	mux.HandleFunc("POST /admin/clients/{id}/delete", b.handleAdminClientsDelete)
+	mux.HandleFunc("GET /admin/app-tokens/new", b.handleAdminAppTokensNew)
+	mux.HandleFunc("POST /admin/app-tokens", b.handleAdminAppTokensCreate)
+	mux.HandleFunc("POST /admin/app-tokens/{id}/delete", b.handleAdminAppTokensDelete)
 	return b.securityHeaders(mux)
 }
 

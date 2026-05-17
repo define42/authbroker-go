@@ -10,6 +10,7 @@
   "refresh_token_ttl_days": 1,
   "auth_code_ttl_seconds": 120,
   "session_ttl_hours": 8,
+  "admin_groups": ["administrators"],
 
   "ldap": {
     "url": "ldaps://glauth:389",

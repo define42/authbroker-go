@@ -23,6 +23,8 @@ const (
 	auditEventTokenIssue       = "token_issue"
 	auditEventTokenRevoke      = "token_revoke"
 	auditEventAppTokenIssue    = "app_token_issue" //nolint:gosec // event name, not a credential.
+	auditEventConsent          = "consent"
+	auditEventAdminMutation    = "admin_mutation"
 )
 
 const (

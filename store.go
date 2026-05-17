@@ -61,6 +61,9 @@ const (
 	bucketWebAuthnReg   = "webauthn_registration_challenges"
 	bucketWebAuthnLog   = "webauthn_login_challenges"
 	bucketSigningKeys   = "signing_keys"
+	bucketClients       = "clients"
+	bucketAppTokens     = "app_tokens"
+	bucketConsents      = "consents"
 )
 
 // signingKeySetKey is the single bbolt key under bucketSigningKeys that holds
@@ -79,6 +82,9 @@ func allBuckets() []string {
 		bucketWebAuthnReg,
 		bucketWebAuthnLog,
 		bucketSigningKeys,
+		bucketClients,
+		bucketAppTokens,
+		bucketConsents,
 	}
 }
 
@@ -676,6 +682,178 @@ func seedBucketTx[T any](tx *bolt.Tx, name string, in map[string]T) error {
 		}
 	}
 	return nil
+}
+
+// -- Stored clients --------------------------------------------------------
+
+// ListStoredClients returns all admin-managed clients persisted in the store,
+// sorted by client_id.
+func (s *Store) ListStoredClients() ([]Client, error) {
+	clients := []Client{}
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := bucket(tx, bucketClients)
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(_, v []byte) error {
+			var c Client
+			if err := json.Unmarshal(v, &c); err != nil {
+				return err
+			}
+			clients = append(clients, c)
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	sortClientsByID(clients)
+	return clients, nil
+}
+
+// PutStoredClient persists a client. Caller is responsible for validating /
+// normalizing the value beforehand.
+func (s *Store) PutStoredClient(c Client) error {
+	if c.ClientID == "" {
+		return fmt.Errorf("store: client_id is required")
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return putJSON(bucket(tx, bucketClients), []byte(c.ClientID), c)
+	})
+}
+
+// DeleteStoredClient removes a stored client by id. Missing keys are a no-op
+// so the admin "delete" action is idempotent.
+func (s *Store) DeleteStoredClient(clientID string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return bucket(tx, bucketClients).Delete([]byte(clientID))
+	})
+}
+
+// -- Stored app tokens -----------------------------------------------------
+
+func (s *Store) ListStoredAppTokens() ([]AppTokenConfig, error) {
+	tokens := []AppTokenConfig{}
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := bucket(tx, bucketAppTokens)
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(_, v []byte) error {
+			var t AppTokenConfig
+			if err := json.Unmarshal(v, &t); err != nil {
+				return err
+			}
+			tokens = append(tokens, t)
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	sortAppTokensByID(tokens)
+	return tokens, nil
+}
+
+func (s *Store) PutStoredAppToken(t AppTokenConfig) error {
+	if t.ID == "" {
+		return fmt.Errorf("store: app token id is required")
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return putJSON(bucket(tx, bucketAppTokens), []byte(t.ID), t)
+	})
+}
+
+func (s *Store) DeleteStoredAppToken(id string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return bucket(tx, bucketAppTokens).Delete([]byte(id))
+	})
+}
+
+// -- Consent records -------------------------------------------------------
+
+// ConsentRecord captures that a user has approved a client for a set of
+// requested scopes. The granted-scope set lets us re-prompt when a later
+// authorize asks for additional scopes the user has not yet seen.
+type ConsentRecord struct {
+	UserID    string    `json:"user_id"`
+	ClientID  string    `json:"client_id"`
+	Scopes    []string  `json:"scopes,omitempty"`
+	GrantedAt time.Time `json:"granted_at"`
+}
+
+func consentKey(userID, clientID string) string {
+	return userID + "|" + clientID
+}
+
+func (s *Store) GetConsent(userID, clientID string) (ConsentRecord, bool, error) {
+	var rec ConsentRecord
+	var found bool
+	err := s.db.View(func(tx *bolt.Tx) error {
+		v := bucket(tx, bucketConsents).Get([]byte(consentKey(userID, clientID)))
+		if v == nil {
+			return nil
+		}
+		found = true
+		return json.Unmarshal(v, &rec)
+	})
+	return rec, found, err
+}
+
+func (s *Store) PutConsent(rec ConsentRecord) error {
+	if rec.UserID == "" || rec.ClientID == "" {
+		return fmt.Errorf("store: consent requires user_id and client_id")
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return putJSON(bucket(tx, bucketConsents), []byte(consentKey(rec.UserID, rec.ClientID)), rec)
+	})
+}
+
+// DeleteConsentsForClient removes every consent record naming the given
+// client. Called when a stored client is deleted so future re-creates with the
+// same id do not silently inherit old approvals.
+func (s *Store) DeleteConsentsForClient(clientID string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := bucket(tx, bucketConsents)
+		if b == nil {
+			return nil
+		}
+		var stale [][]byte
+		if err := b.ForEach(func(k, v []byte) error {
+			var rec ConsentRecord
+			if err := json.Unmarshal(v, &rec); err != nil {
+				return nil
+			}
+			if rec.ClientID == clientID {
+				stale = append(stale, append([]byte(nil), k...))
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, k := range stale {
+			if err := b.Delete(k); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func sortClientsByID(clients []Client) {
+	for i := 1; i < len(clients); i++ {
+		for j := i; j > 0 && clients[j-1].ClientID > clients[j].ClientID; j-- {
+			clients[j-1], clients[j] = clients[j], clients[j-1]
+		}
+	}
+}
+
+func sortAppTokensByID(tokens []AppTokenConfig) {
+	for i := 1; i < len(tokens); i++ {
+		for j := i; j > 0 && tokens[j-1].ID > tokens[j].ID; j-- {
+			tokens[j-1], tokens[j] = tokens[j], tokens[j-1]
+		}
+	}
 }
 
 // -- Internal helpers ------------------------------------------------------

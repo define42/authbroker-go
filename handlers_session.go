@@ -146,7 +146,7 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		slog.Bool("oauth_flow", oauthLogin),
 		slog.Bool("totp_used", b.needsTOTP(user)))
 	if oauthLogin {
-		if err := b.issueCodeRedirect(w, r, ar, sess); err != nil {
+		if err := b.proceedAfterAuthn(w, r, ar, sess); err != nil {
 			http.Error(w, "store error", http.StatusInternalServerError)
 		}
 		return
@@ -311,7 +311,7 @@ func (b *Broker) renderRPLogoutConfirm(w http.ResponseWriter, sess Session, idTo
 }
 
 func (b *Broker) handlePostLogoutRedirect(w http.ResponseWriter, r *http.Request, clientID, redirectURI, state string) {
-	client, ok := b.clients[clientID]
+	client, ok := b.lookupClient(clientID)
 	if !ok || !clientAllowsPostLogoutRedirect(client, redirectURI) {
 		http.Error(w, "invalid post_logout_redirect_uri", http.StatusBadRequest)
 		return
