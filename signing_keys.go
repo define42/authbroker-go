@@ -143,16 +143,14 @@ func prepareSigningKeys(cfg *Config, dataDir string, forceRotate bool) error {
 	}
 
 	path := filepath.Join(dataDir, defaultKeysPath)
-	return withExclusiveFileLock(path+".lock", func() error {
-		keySet, loaded, changed, err := prepareManagedSigningKeySet(path, cfg, forceRotate, time.Now())
-		if err != nil {
-			return err
-		}
-		cfg.SigningKeys = keySet.signingKeyConfigs()
-		cfg.KeyID = keySet.ActiveKeyID
-		logManagedSigningKeySet(path, loaded, changed)
-		return nil
-	})
+	keySet, loaded, changed, err := prepareManagedSigningKeySet(path, cfg, forceRotate, time.Now())
+	if err != nil {
+		return err
+	}
+	cfg.SigningKeys = keySet.signingKeyConfigs()
+	cfg.KeyID = keySet.ActiveKeyID
+	logManagedSigningKeySet(path, loaded, changed)
+	return nil
 }
 
 func prepareManagedSigningKeySet(path string, cfg *Config, forceRotate bool, now time.Time) (managedSigningKeySet, bool, bool, error) {

@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -64,7 +63,9 @@ func NewStore(path string) (*Store, error) {
 	if path == "" {
 		return s, nil
 	}
-	if err := s.withLockedData(nil); err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadLocked(); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -149,53 +150,14 @@ func (s *Store) loadLocked() error {
 func (s *Store) withLockedData(fn func() (bool, error)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.path == "" {
-		if fn == nil {
-			return nil
-		}
-		changed, err := fn()
-		if err != nil || !changed {
-			return err
-		}
-		return s.saveLocked()
+	if fn == nil {
+		return nil
 	}
-	return withExclusiveFileLock(s.path+".lock", func() error {
-		if err := s.loadLocked(); err != nil {
-			return err
-		}
-		if fn == nil {
-			return nil
-		}
-		changed, err := fn()
-		if err != nil || !changed {
-			return err
-		}
-		return s.saveLocked()
-	})
-}
-
-func withExclusiveFileLock(lockPath string, fn func() error) error {
-	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+	changed, err := fn()
+	if err != nil || !changed {
 		return err
 	}
-	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // lock path is derived from operator-supplied data directory.
-	if err != nil {
-		return err
-	}
-	defer lockFile.Close()
-	for {
-		err = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX)
-		if err == nil {
-			break
-		}
-		if !errors.Is(err, syscall.EINTR) {
-			return err
-		}
-	}
-	defer func() {
-		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
-	}()
-	return fn()
+	return s.saveLocked()
 }
 
 func writeFileAtomic(path string, content []byte, perm os.FileMode) (err error) {
@@ -267,19 +229,13 @@ func (s *Store) UpsertProfile(p UserProfile) (*StoredUser, error) {
 }
 
 func (s *Store) GetUser(username string) (*StoredUser, bool) {
-	var out *StoredUser
-	err := s.withLockedData(func() (bool, error) {
-		u, ok := s.data.Users[username]
-		if !ok || u == nil {
-			return false, nil
-		}
-		out = cloneStoredUser(u)
-		return false, nil
-	})
-	if err != nil || out == nil {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	u, ok := s.data.Users[username]
+	if !ok || u == nil {
 		return nil, false
 	}
-	return out, true
+	return cloneStoredUser(u), true
 }
 
 func (s *Store) SetTOTP(username, secret string) error {
@@ -328,16 +284,9 @@ func (s *Store) UpdateWebAuthnSignCount(username, credID string, signCount uint3
 }
 
 func (s *Store) RuntimeState() StoredRuntimeState {
-	var out StoredRuntimeState
-	if err := s.withLockedData(func() (bool, error) {
-		out = s.runtimeStateLocked()
-		return false, nil
-	}); err != nil {
-		s.mu.RLock()
-		defer s.mu.RUnlock()
-		return s.runtimeStateLocked()
-	}
-	return out
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.runtimeStateLocked()
 }
 
 func (s *Store) runtimeStateLocked() StoredRuntimeState {

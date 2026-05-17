@@ -10,8 +10,7 @@ import (
 
 // loginRateLimiter throttles authentication endpoints (login, webauthn login
 // finish) and applies a per-key lockout when too many failures accumulate.
-// It is an in-memory limiter — for multi-instance deployments behind a load
-// balancer, replace with a shared backend, or run with sticky sessions.
+// It is an in-memory limiter — the broker runs as a single instance.
 type loginRateLimiter struct {
 	mu sync.Mutex
 
