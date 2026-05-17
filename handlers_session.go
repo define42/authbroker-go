@@ -15,12 +15,10 @@ func (b *Broker) handleLoginGet(w http.ResponseWriter, r *http.Request) {
 	clientID := "authbroker"
 	if rid != "" {
 		var ar AuthorizationRequest
-		b.mu.Lock()
-		err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		_, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
 			ar = state.AuthRequests[rid]
 			return false, nil
 		})
-		b.mu.Unlock()
 		if err != nil {
 			http.Error(w, "store error", http.StatusInternalServerError)
 			return
@@ -66,8 +64,7 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	var ar AuthorizationRequest
 	if oauthLogin {
 		var ok bool
-		b.mu.Lock()
-		persistErr := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		_, persistErr := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
 			ar, ok = state.AuthRequests[rid]
 			if !ok {
 				return false, nil
@@ -75,7 +72,6 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 			delete(state.AuthRequests, rid)
 			return true, nil
 		})
-		b.mu.Unlock()
 		if persistErr != nil {
 			http.Error(w, "store error", http.StatusInternalServerError)
 			return
@@ -378,11 +374,9 @@ func (b *Broker) validSession(r *http.Request) (Session, bool) {
 	if err != nil || c.Value == "" {
 		return Session{}, false
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
 	var s Session
 	var valid bool
-	err = b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+	_, err = b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
 		var ok bool
 		s, ok = state.Sessions[c.Value]
 		if !ok {
@@ -415,9 +409,7 @@ func (b *Broker) markSessionReAuth(r *http.Request) error {
 	if err != nil || c.Value == "" {
 		return fmt.Errorf("no session")
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+	_, err = b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
 		s, ok := state.Sessions[c.Value]
 		if !ok {
 			return false, nil
@@ -426,6 +418,7 @@ func (b *Broker) markSessionReAuth(r *http.Request) error {
 		state.Sessions[c.Value] = s
 		return true, nil
 	})
+	return err
 }
 
 // sessionRecentlyReAuthenticated reports whether the session's ReAuthAt is
@@ -451,10 +444,9 @@ func (b *Broker) maybeExtendSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
-	b.mu.Lock()
 	var newExpiry time.Time
 	extended := false
-	err = b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+	_, err = b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
 		s, ok := state.Sessions[c.Value]
 		if !ok {
 			return false, nil
@@ -474,14 +466,11 @@ func (b *Broker) maybeExtendSession(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		log.Printf("persist extended session: %v", err)
-		b.mu.Unlock()
 		return
 	}
 	if !extended {
-		b.mu.Unlock()
 		return
 	}
-	b.mu.Unlock()
 
 	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure is controlled by issuer/config for local HTTP demos and HTTPS deployments.
 		Name:     sessionCookieName,
@@ -496,15 +485,13 @@ func (b *Broker) maybeExtendSession(w http.ResponseWriter, r *http.Request) {
 
 func (b *Broker) clearSession(w http.ResponseWriter, r *http.Request) error {
 	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
-		b.mu.Lock()
-		err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		_, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
 			if _, ok := state.Sessions[c.Value]; !ok {
 				return false, nil
 			}
 			delete(state.Sessions, c.Value)
 			return true, nil
 		})
-		b.mu.Unlock()
 		if err != nil {
 			return err
 		}
@@ -532,15 +519,12 @@ func (b *Broker) createSession(w http.ResponseWriter, userID string, freshlyAuth
 	if freshlyAuthenticated {
 		sess.ReAuthAt = now
 	}
-	b.mu.Lock()
-	if err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+	if _, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
 		state.Sessions[sid] = sess
 		return true, nil
 	}); err != nil {
-		b.mu.Unlock()
 		return Session{}, err
 	}
-	b.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure is controlled by issuer/config for local HTTP demos and HTTPS deployments.
 		Name:     sessionCookieName,
 		Value:    sid,
@@ -566,15 +550,12 @@ func (b *Broker) issueCodeRedirect(w http.ResponseWriter, r *http.Request, ar Au
 		AuthTime:            sess.AuthTime,
 		ExpiresAt:           time.Now().Add(time.Duration(b.cfg.AuthCodeTTLSeconds) * time.Second),
 	}
-	b.mu.Lock()
-	if err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+	if _, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
 		state.AuthCodes[hashSecret(code)] = ac
 		return true, nil
 	}); err != nil {
-		b.mu.Unlock()
 		return err
 	}
-	b.mu.Unlock()
 
 	u, _ := url.Parse(ar.RedirectURI)
 	q := u.Query()

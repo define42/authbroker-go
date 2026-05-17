@@ -21,6 +21,41 @@ type regexGroupMapping struct {
 	Pattern *regexp.Regexp
 }
 
+// compiledGroupMappings is the parsed form of a client's group_mappings map.
+// It is built once at config-normalize time so the per-request token issuance
+// path does not re-parse DNs and re-compile regexes for every user group.
+type compiledGroupMappings struct {
+	direct map[string]string // lowercase source name -> target template
+	scoped []scopedGroupMapping
+	regex  []regexGroupMapping
+}
+
+func compileGroupMappings(in map[string]string) *compiledGroupMappings {
+	if len(in) == 0 {
+		return nil
+	}
+	compiled := &compiledGroupMappings{direct: map[string]string{}}
+	for source, target := range in {
+		if regexMapping, ok, err := parseRegexGroupMapping(source, target); err == nil && ok {
+			compiled.regex = append(compiled.regex, regexMapping)
+			continue
+		}
+		if scoped, ok, err := parseScopedGroupMapping(source, target); err == nil && ok {
+			compiled.scoped = append(compiled.scoped, scoped)
+			continue
+		}
+		sourceName := ldapGroupName(source)
+		if sourceName == "" || strings.TrimSpace(target) == "" {
+			continue
+		}
+		compiled.direct[strings.ToLower(sourceName)] = strings.TrimSpace(target)
+	}
+	if len(compiled.direct) == 0 && len(compiled.scoped) == 0 && len(compiled.regex) == 0 {
+		return nil
+	}
+	return compiled
+}
+
 //nolint:gocognit,cyclop // Validation branches mirror the supported group mapping forms.
 func normalizeClientGroupMappings(in map[string]string) (map[string]string, error) {
 	if len(in) == 0 {
@@ -75,41 +110,27 @@ func normalizeClientGroupMappings(in map[string]string) (map[string]string, erro
 	return out, nil
 }
 
-//nolint:gocognit,cyclop,funlen // Mapping modes are evaluated in one pass to preserve deterministic output.
 func mappedClientGroups(client Client, userGroups []string) []string {
-	if len(userGroups) == 0 || len(client.GroupMappings) == 0 {
+	return mappedGroups(client.compiledMappings, userGroups)
+}
+
+//nolint:gocognit // Mapping modes are evaluated in one pass to preserve deterministic output.
+func mappedGroups(compiled *compiledGroupMappings, userGroups []string) []string {
+	if len(userGroups) == 0 || compiled == nil {
 		return nil
-	}
-	mappings := map[string]string{}
-	scopedMappings := []scopedGroupMapping{}
-	regexMappings := []regexGroupMapping{}
-	for source, target := range client.GroupMappings {
-		if regexMapping, ok, err := parseRegexGroupMapping(source, target); err == nil && ok {
-			regexMappings = append(regexMappings, regexMapping)
-			continue
-		}
-		if scoped, ok, err := parseScopedGroupMapping(source, target); err == nil && ok {
-			scopedMappings = append(scopedMappings, scoped)
-			continue
-		}
-		sourceName := ldapGroupName(source)
-		if sourceName == "" || strings.TrimSpace(target) == "" {
-			continue
-		}
-		mappings[strings.ToLower(sourceName)] = strings.TrimSpace(target)
 	}
 	seen := map[string]bool{}
 	groups := []string{}
 	for _, group := range userGroups {
 		groupName := ldapGroupName(group)
-		if target := mappings[strings.ToLower(groupName)]; target != "" {
+		if target := compiled.direct[strings.ToLower(groupName)]; target != "" {
 			mapped := renderGroupMappingTarget(target, groupName, group)
 			if mapped != "" && !seen[mapped] {
 				seen[mapped] = true
 				groups = append(groups, mapped)
 			}
 		}
-		for _, scoped := range scopedMappings {
+		for _, scoped := range compiled.scoped {
 			cn, dn, ok := scopedGroupMatch(scoped, group)
 			if !ok {
 				continue
@@ -121,7 +142,7 @@ func mappedClientGroups(client Client, userGroups []string) []string {
 			seen[mapped] = true
 			groups = append(groups, mapped)
 		}
-		for _, regexMapping := range regexMappings {
+		for _, regexMapping := range compiled.regex {
 			matches := regexMapping.Pattern.FindStringSubmatch(group)
 			if matches == nil {
 				continue
@@ -277,10 +298,8 @@ func scopeIncludes(scope, wanted string) bool {
 	return false
 }
 
-// mappedAppTokenGroups applies an app token's group_mappings to user groups.
-// Wrapping mappedClientGroups in a function keyed by the mapping map keeps the
-// app-token codepath from awkwardly synthesizing a Client just to reuse the
-// mapping logic.
-func mappedAppTokenGroups(mappings map[string]string, userGroups []string) []string {
-	return mappedClientGroups(Client{GroupMappings: mappings}, userGroups)
+// mappedAppTokenGroups applies an app token's precompiled group mappings to
+// user groups. Wraps the shared evaluator keyed on the compiled form.
+func mappedAppTokenGroups(compiled *compiledGroupMappings, userGroups []string) []string {
+	return mappedGroups(compiled, userGroups)
 }

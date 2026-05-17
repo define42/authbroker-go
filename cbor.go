@@ -62,6 +62,13 @@ func parseCBOR(data []byte) (cborValue, []byte, error) {
 		}
 		return cborValue{kind: cborString, strValue: string(rest[:n])}, rest[n:], nil
 	case 4:
+		// Each array element is at least one CBOR byte, so a declared length
+		// greater than the remaining input is malformed. Reject before
+		// allocating to avoid attacker-controlled OOM via huge declared
+		// lengths.
+		if n > uint64(len(rest)) {
+			return cborValue{}, nil, io.ErrUnexpectedEOF
+		}
 		arr := make([]cborValue, 0, n)
 		cur := rest
 		for i := uint64(0); i < n; i++ {
@@ -74,6 +81,11 @@ func parseCBOR(data []byte) (cborValue, []byte, error) {
 		}
 		return cborValue{kind: cborArray, arrayValue: arr}, cur, nil
 	case 5:
+		// Each map entry needs at least two CBOR bytes (key + value); reject
+		// declared lengths that cannot possibly fit in the remaining input.
+		if n > uint64(len(rest))/2 {
+			return cborValue{}, nil, io.ErrUnexpectedEOF
+		}
 		m := make(map[any]cborValue, n)
 		cur := rest
 		for i := uint64(0); i < n; i++ {

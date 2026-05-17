@@ -207,6 +207,7 @@ func TestMappedClientGroups(t *testing.T) {
 		t.Fatalf("normalizeClientGroupMappings(): %v", err)
 	}
 	client.GroupMappings = groupMappings
+	client.compiledMappings = compileGroupMappings(groupMappings)
 
 	got := mappedClientGroups(client, []string{
 		"APP_ELK_TEAM10_INGEST",
@@ -230,6 +231,7 @@ func TestMappedClientGroupsScopedOU(t *testing.T) {
 		t.Fatalf("normalizeClientGroupMappings(): %v", err)
 	}
 	client.GroupMappings = groupMappings
+	client.compiledMappings = compileGroupMappings(groupMappings)
 
 	got := mappedClientGroups(client, []string{
 		"CN=Reports,OU=Demo,DC=example,DC=com",
@@ -251,6 +253,7 @@ func TestMappedClientGroupsCNWildcardSource(t *testing.T) {
 		t.Fatalf("normalizeClientGroupMappings(): %v", err)
 	}
 	client.GroupMappings = groupMappings
+	client.compiledMappings = compileGroupMappings(groupMappings)
 
 	got := mappedClientGroups(client, []string{
 		"CN=Reports,OU=Demo,DC=example,DC=com",
@@ -269,6 +272,7 @@ func TestMappedClientGroupsRegexSource(t *testing.T) {
 		t.Fatalf("normalizeClientGroupMappings(): %v", err)
 	}
 	client.GroupMappings = groupMappings
+	client.compiledMappings = compileGroupMappings(groupMappings)
 
 	got := mappedClientGroups(client, []string{
 		"CN=app_gitlab_admins,OU=GitLab,DC=example,DC=com",
@@ -288,6 +292,7 @@ func TestMappedClientGroupsRegexCaptures(t *testing.T) {
 		t.Fatalf("normalizeClientGroupMappings(): %v", err)
 	}
 	client.GroupMappings = groupMappings
+	client.compiledMappings = compileGroupMappings(groupMappings)
 
 	got := mappedClientGroups(client, []string{
 		"CN=app_gitlab_admins,OU=Any,DC=example,DC=com",
@@ -374,13 +379,16 @@ func TestDiscoveryAdvertisesEndSessionEndpoint(t *testing.T) {
 
 func TestBrokerLogoutClearsSessionAndRedirects(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	broker.mu.Lock()
-	broker.sessions["logout-session"] = Session{
-		UserID:    "johndoe",
-		ExpiresAt: time.Now().Add(time.Hour),
-		AuthTime:  time.Now(),
+	if _, err := broker.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
+		state.Sessions["logout-session"] = Session{
+			UserID:    "johndoe",
+			ExpiresAt: time.Now().Add(time.Hour),
+			AuthTime:  time.Now(),
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("seed session: %v", err)
 	}
-	broker.mu.Unlock()
 
 	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid", "", time.Now(), false)
 	if err != nil {
@@ -406,10 +414,7 @@ func TestBrokerLogoutClearsSessionAndRedirects(t *testing.T) {
 	if location := rr.Header().Get("Location"); location != "http://app.example/?state=logout-state" {
 		t.Fatalf("Location = %q", location)
 	}
-	broker.mu.Lock()
-	_, stillActive := broker.sessions["logout-session"]
-	broker.mu.Unlock()
-	if stillActive {
+	if _, stillActive := broker.store.RuntimeState().Sessions["logout-session"]; stillActive {
 		t.Fatalf("broker session was not cleared")
 	}
 	assertDeletedCookie(t, rr, sessionCookieName)
@@ -598,10 +603,7 @@ func TestBrokerStandaloneLoginAndLogoutPages(t *testing.T) {
 		t.Fatalf("expected logout status 302, got %d: %s", logoutRR.Code, logoutRR.Body.String())
 	}
 	assertDeletedCookie(t, logoutRR, sessionCookieName)
-	broker.mu.Lock()
-	_, stillActive := broker.sessions[sessionCookie.Value]
-	broker.mu.Unlock()
-	if stillActive {
+	if _, stillActive := broker.store.RuntimeState().Sessions[sessionCookie.Value]; stillActive {
 		t.Fatalf("standalone logout did not remove broker session")
 	}
 }
@@ -750,10 +752,7 @@ func TestLDAPBrokerOAuthIntegration(t *testing.T) {
 		if location := resp.Header.Get("Location"); location != "" {
 			t.Fatalf("failed login should not redirect, got Location %q", location)
 		}
-		broker.mu.Lock()
-		authCodes := len(broker.authCodes)
-		broker.mu.Unlock()
-		if authCodes != 0 {
+		if authCodes := len(broker.store.RuntimeState().AuthCodes); authCodes != 0 {
 			t.Fatalf("failed login issued %d auth codes", authCodes)
 		}
 	})

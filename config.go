@@ -109,6 +109,10 @@ type Client struct {
 	Public                 bool              `json:"public"`
 	RequirePKCE            bool              `json:"require_pkce"`
 	GroupMappings          map[string]string `json:"group_mappings,omitempty"`
+
+	// compiledMappings caches the parsed direct/scoped/regex mapping
+	// representation. Populated by NewBroker after normalizeClientGroupMappings.
+	compiledMappings *compiledGroupMappings
 }
 
 type MFAConfig struct {
@@ -149,6 +153,10 @@ type AppTokenConfig struct {
 	Scope           string            `json:"scope,omitempty"`
 	TokenTTLMinutes int               `json:"token_ttl_minutes,omitempty"`
 	GroupMappings   map[string]string `json:"group_mappings,omitempty"`
+
+	// compiledMappings caches the parsed direct/scoped/regex mapping
+	// representation. Populated by NewBroker after normalizeClientGroupMappings.
+	compiledMappings *compiledGroupMappings
 }
 
 //nolint:gocognit,cyclop,funlen // Defaulting the flat JSON config is intentionally centralized.

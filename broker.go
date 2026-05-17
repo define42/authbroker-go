@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"sync"
 	"time"
 )
 
@@ -80,15 +79,6 @@ type Broker struct {
 	appTokens map[string]AppTokenConfig
 
 	loginLimiter *loginRateLimiter
-
-	mu           sync.Mutex
-	sessions     map[string]Session
-	authRequests map[string]AuthorizationRequest
-	authCodes    map[string]AuthCode
-	refresh      map[string]RefreshToken
-	revokedJTIs  map[string]time.Time
-	webauthnReg  map[string]ChallengeRecord
-	webauthnLog  map[string]ChallengeRecord
 }
 
 const (
@@ -138,6 +128,7 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 			return nil, fmt.Errorf("client %q: %w", c.ClientID, err)
 		}
 		c.GroupMappings = groupMappings
+		c.compiledMappings = compileGroupMappings(groupMappings)
 		clientMap[c.ClientID] = c
 	}
 	appTokenMap := map[string]AppTokenConfig{}
@@ -153,6 +144,7 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 			return nil, fmt.Errorf("app token %q: %w", tokenCfg.ID, err)
 		}
 		tokenCfg.GroupMappings = groupMappings
+		tokenCfg.compiledMappings = compileGroupMappings(groupMappings)
 		cfg.AppTokens[i] = tokenCfg
 		if _, exists := appTokenMap[tokenCfg.ID]; exists {
 			return nil, fmt.Errorf("duplicate app token id %q", tokenCfg.ID)
@@ -164,7 +156,6 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 		log.Printf("WARNING: ldap.insecure_skip_verify is enabled — server TLS certificate is not validated. Use only for local fixtures.")
 	}
 
-	runtimeState := store.RuntimeState()
 	b := &Broker{
 		cfg:          cfg,
 		store:        store,
@@ -175,13 +166,6 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 		clients:      clientMap,
 		appTokens:    appTokenMap,
 		loginLimiter: newLoginRateLimiter(loginRateLimitWindow, loginRateLimitMaxAttempts, loginRateLockout),
-		sessions:     runtimeState.Sessions,
-		authRequests: runtimeState.AuthRequests,
-		authCodes:    runtimeState.AuthCodes,
-		refresh:      runtimeState.RefreshTokens,
-		revokedJTIs:  runtimeState.RevokedJTIs,
-		webauthnReg:  runtimeState.WebAuthnReg,
-		webauthnLog:  runtimeState.WebAuthnLog,
 	}
 	b.sweepExpired(time.Now())
 	return b, nil
@@ -190,9 +174,7 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 // sweepExpired removes expired entries from shared runtime state so abandoned
 // grants do not accumulate indefinitely.
 func (b *Broker) sweepExpired(now time.Time) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+	if _, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
 		changed := sweepExpiredMap(state.Sessions, now, func(v Session) time.Time { return v.ExpiresAt })
 		changed = sweepExpiredMap(state.AuthRequests, now, func(v AuthorizationRequest) time.Time { return v.ExpiresAt }) || changed
 		changed = sweepExpiredMap(state.AuthCodes, now, func(v AuthCode) time.Time { return v.ExpiresAt }) || changed
@@ -235,48 +217,6 @@ func (b *Broker) startBackgroundSweeper(ctx context.Context, interval time.Durat
 			b.sweepExpired(t)
 		}
 	}
-}
-
-func (b *Broker) runtimeStateLocked() StoredRuntimeState {
-	return StoredRuntimeState{
-		Sessions:      cloneSessionMap(b.sessions),
-		AuthRequests:  cloneAuthorizationRequestMap(b.authRequests),
-		AuthCodes:     cloneAuthCodeMap(b.authCodes),
-		RefreshTokens: cloneRefreshTokenMap(b.refresh),
-		RevokedJTIs:   cloneRevokedJTIMap(b.revokedJTIs),
-		WebAuthnReg:   cloneChallengeRecordMap(b.webauthnReg),
-		WebAuthnLog:   cloneChallengeRecordMap(b.webauthnLog),
-	}
-}
-
-func (b *Broker) replaceRuntimeStateLocked(state StoredRuntimeState) {
-	b.sessions = cloneSessionMap(state.Sessions)
-	b.authRequests = cloneAuthorizationRequestMap(state.AuthRequests)
-	b.authCodes = cloneAuthCodeMap(state.AuthCodes)
-	b.refresh = cloneRefreshTokenMap(state.RefreshTokens)
-	b.revokedJTIs = cloneRevokedJTIMap(state.RevokedJTIs)
-	b.webauthnReg = cloneChallengeRecordMap(state.WebAuthnReg)
-	b.webauthnLog = cloneChallengeRecordMap(state.WebAuthnLog)
-}
-
-func (b *Broker) updateRuntimeStateLocked(fn func(*StoredRuntimeState) (bool, error)) error {
-	if b.store == nil {
-		state := b.runtimeStateLocked()
-		changed, err := fn(&state)
-		if err != nil {
-			return err
-		}
-		if changed {
-			b.replaceRuntimeStateLocked(state)
-		}
-		return nil
-	}
-	state, err := b.store.UpdateRuntimeState(fn)
-	if err != nil {
-		return err
-	}
-	b.replaceRuntimeStateLocked(state)
-	return nil
 }
 
 func validAppTokenID(id string) bool {

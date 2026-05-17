@@ -32,14 +32,12 @@ func (b *Broker) handleWebAuthnRegisterBegin(w http.ResponseWriter, r *http.Requ
 		user = &StoredUser{Username: sess.UserID}
 	}
 	challenge := randomB64(32)
-	b.mu.Lock()
 	// Key by challenge (not user ID) so parallel registration attempts from
 	// the same account don't overwrite one another's challenge state.
-	err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+	_, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
 		state.WebAuthnReg[challenge] = ChallengeRecord{UserID: sess.UserID, Challenge: challenge, ExpiresAt: time.Now().Add(5 * time.Minute)}
 		return true, nil
 	})
-	b.mu.Unlock()
 	if err != nil {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
@@ -100,10 +98,9 @@ func (b *Broker) handleWebAuthnRegisterFinish(w http.ResponseWriter, r *http.Req
 	}
 	challenge := normalizeChallenge(cd.Challenge)
 
-	b.mu.Lock()
 	var ch ChallengeRecord
 	var found bool
-	persistErr := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+	_, persistErr := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
 		ch, found = state.WebAuthnReg[challenge]
 		if !found {
 			return false, nil
@@ -111,7 +108,6 @@ func (b *Broker) handleWebAuthnRegisterFinish(w http.ResponseWriter, r *http.Req
 		delete(state.WebAuthnReg, challenge)
 		return true, nil
 	})
-	b.mu.Unlock()
 	if persistErr != nil {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
@@ -157,12 +153,10 @@ func (b *Broker) handleWebAuthnLoginBegin(w http.ResponseWriter, r *http.Request
 		userID = user.Username
 	}
 	challenge := randomB64(32)
-	b.mu.Lock()
-	err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+	_, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
 		state.WebAuthnLog[challenge] = ChallengeRecord{UserID: userID, Challenge: challenge, ExpiresAt: time.Now().Add(5 * time.Minute)}
 		return true, nil
 	})
-	b.mu.Unlock()
 	if err != nil {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
@@ -201,10 +195,9 @@ func (b *Broker) handleWebAuthnLoginFinish(w http.ResponseWriter, r *http.Reques
 	}
 	challenge := normalizeChallenge(cd.Challenge)
 
-	b.mu.Lock()
 	var ch ChallengeRecord
 	var ok bool
-	persistErr := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+	_, persistErr := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
 		ch, ok = state.WebAuthnLog[challenge]
 		if !ok {
 			return false, nil
@@ -212,19 +205,23 @@ func (b *Broker) handleWebAuthnLoginFinish(w http.ResponseWriter, r *http.Reques
 		delete(state.WebAuthnLog, challenge)
 		return true, nil
 	})
-	b.mu.Unlock()
 	if persistErr != nil {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
-	if !ok || time.Now().After(ch.ExpiresAt) || ch.UserID == "" {
-		http.Error(w, "login challenge expired", http.StatusBadRequest)
-		return
-	}
+	// Rate-limit before the empty-UserID early exit so an attacker cannot
+	// time-distinguish "user exists" (runs the assertion verify) from "user
+	// doesn't exist" (short-circuits here) by spraying usernames at
+	// /webauthn/login/begin and submitting the resulting challenges.
 	rateKey := loginRateKey(r, ch.UserID)
 	if allowed, retry := b.loginLimiter.allow(rateKey); !allowed {
 		writeRetryAfter(w, retry)
 		http.Error(w, "too many login attempts; try again later", http.StatusTooManyRequests)
+		return
+	}
+	if !ok || time.Now().After(ch.ExpiresAt) || ch.UserID == "" {
+		b.loginLimiter.recordFailure(rateKey)
+		http.Error(w, "login challenge expired", http.StatusBadRequest)
 		return
 	}
 	if err := b.verifyWebAuthnAssertion(req, ch.UserID, ch.Challenge, clientDataBytes, cd); err != nil {

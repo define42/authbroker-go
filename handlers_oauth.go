@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -76,12 +77,11 @@ func authorizePKCEError(client Client, challenge, method string) string {
 }
 
 func (b *Broker) putAuthRequest(ar AuthorizationRequest) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+	_, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
 		state.AuthRequests[ar.ID] = ar
 		return true, nil
 	})
+	return err
 }
 
 func (b *Broker) handleToken(w http.ResponseWriter, r *http.Request) {
@@ -145,10 +145,9 @@ func (b *Broker) tokenAuthorizationCode(w http.ResponseWriter, r *http.Request, 
 	redirectURI := r.Form.Get("redirect_uri")
 	codeKey := hashSecret(code)
 
-	b.mu.Lock()
 	var ac AuthCode
 	var ok bool
-	persistErr := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+	_, persistErr := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
 		ac, ok = state.AuthCodes[codeKey]
 		if !ok {
 			return false, nil
@@ -156,9 +155,8 @@ func (b *Broker) tokenAuthorizationCode(w http.ResponseWriter, r *http.Request, 
 		delete(state.AuthCodes, codeKey)
 		return true, nil
 	})
-	b.mu.Unlock()
 	if persistErr != nil {
-		tokenErrorStatus(w, http.StatusInternalServerError, "server_error", persistErr.Error())
+		tokenServerError(w, "consume authorization code", persistErr)
 		return
 	}
 
@@ -184,7 +182,7 @@ func (b *Broker) tokenAuthorizationCode(w http.ResponseWriter, r *http.Request, 
 	includeRefresh := scopeIncludes(ac.Scope, "offline_access")
 	resp, err := b.issueUserTokens(ac.UserID, client.ClientID, ac.Scope, ac.Nonce, ac.AuthTime, includeRefresh)
 	if err != nil {
-		tokenErrorStatus(w, http.StatusInternalServerError, "server_error", err.Error())
+		tokenServerError(w, "issue tokens for authorization_code grant", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -194,12 +192,11 @@ func (b *Broker) tokenRefresh(w http.ResponseWriter, r *http.Request, client Cli
 	rt := r.Form.Get("refresh_token")
 	rtKey := hashSecret(rt)
 	requestedScope := strings.TrimSpace(r.Form.Get("scope"))
-	b.mu.Lock()
 	var old RefreshToken
 	var ok bool
 	invalidGrant := false
 	invalidScope := false
-	err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+	_, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
 		old, ok = state.RefreshTokens[rtKey]
 		if !ok {
 			invalidGrant = true
@@ -220,9 +217,8 @@ func (b *Broker) tokenRefresh(w http.ResponseWriter, r *http.Request, client Cli
 		delete(state.RefreshTokens, rtKey) // refresh token rotation
 		return true, nil
 	})
-	b.mu.Unlock()
 	if err != nil {
-		tokenErrorStatus(w, http.StatusInternalServerError, "server_error", err.Error())
+		tokenServerError(w, "rotate refresh token", err)
 		return
 	}
 	if invalidGrant {
@@ -239,7 +235,7 @@ func (b *Broker) tokenRefresh(w http.ResponseWriter, r *http.Request, client Cli
 	}
 	resp, err := b.issueUserTokens(old.UserID, client.ClientID, scope, "", old.AuthTime, true)
 	if err != nil {
-		tokenErrorStatus(w, http.StatusInternalServerError, "server_error", err.Error())
+		tokenServerError(w, "issue tokens for refresh_token grant", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -278,7 +274,7 @@ func (b *Broker) tokenClientCredentials(w http.ResponseWriter, r *http.Request, 
 	}
 	access, err := b.signJWT(claims)
 	if err != nil {
-		tokenErrorStatus(w, http.StatusInternalServerError, "server_error", err.Error())
+		tokenServerError(w, "sign client_credentials access token", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -363,15 +359,12 @@ func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime
 			AuthTime:  authTime,
 			ExpiresAt: now.Add(time.Duration(b.cfg.RefreshTokenTTLDays) * 24 * time.Hour),
 		}
-		b.mu.Lock()
-		if err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		if _, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
 			state.RefreshTokens[hashSecret(rt)] = refreshToken
 			return true, nil
 		}); err != nil {
-			b.mu.Unlock()
 			return nil, err
 		}
-		b.mu.Unlock()
 		resp["refresh_token"] = rt
 	}
 	return resp, nil
@@ -405,7 +398,7 @@ func (b *Broker) issueAppToken(sess Session, tokenCfg AppTokenConfig) (string, e
 			claims["user_email"] = user.Email
 		}
 		if scopeIncludes(scope, "groups") {
-			if groups := mappedAppTokenGroups(tokenCfg.GroupMappings, user.Groups); len(groups) > 0 {
+			if groups := mappedAppTokenGroups(tokenCfg.compiledMappings, user.Groups); len(groups) > 0 {
 				claims["groups"] = groups
 			}
 		}
@@ -499,15 +492,14 @@ func (b *Broker) revokeRefreshToken(tok string, client Client) error {
 		return nil
 	}
 	key := hashSecret(tok)
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+	_, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
 		if rt, ok := state.RefreshTokens[key]; ok && rt.ClientID == client.ClientID {
 			delete(state.RefreshTokens, key)
 			return true, nil
 		}
 		return false, nil
 	})
+	return err
 }
 
 func (b *Broker) revokeJWT(tok string, client Client) error {
@@ -521,12 +513,11 @@ func (b *Broker) revokeJWT(tok string, client Client) error {
 	if aud != client.ClientID || jti == "" || !ok {
 		return nil
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+	_, err = b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
 		state.RevokedJTIs[jti] = time.Unix(expUnix, 0)
 		return true, nil
 	})
+	return err
 }
 
 func clientAllowsRedirect(c Client, redirectURI string) bool {
@@ -571,4 +562,12 @@ func tokenError(w http.ResponseWriter, code, desc string) {
 
 func tokenErrorStatus(w http.ResponseWriter, status int, code, desc string) {
 	writeJSON(w, status, map[string]string{"error": code, "error_description": desc})
+}
+
+// tokenServerError logs the underlying error server-side and returns a generic
+// server_error response. Token-endpoint responses must not leak internal error
+// strings (file paths, store internals) to OAuth clients.
+func tokenServerError(w http.ResponseWriter, what string, err error) {
+	log.Printf("token endpoint %s: %v", what, err)
+	tokenErrorStatus(w, http.StatusInternalServerError, "server_error", "internal error")
 }

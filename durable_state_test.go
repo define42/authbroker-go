@@ -48,19 +48,20 @@ func TestBrokerLoadsDurableRuntimeState(t *testing.T) {
 		t.Fatalf("create broker: %v", err)
 	}
 
-	if got := broker.sessions["sid"].UserID; got != "johndoe" {
-		t.Fatalf("loaded session user = %q, want johndoe", got)
+	got := broker.store.RuntimeState()
+	if user := got.Sessions["sid"].UserID; user != "johndoe" {
+		t.Fatalf("loaded session user = %q, want johndoe", user)
 	}
-	if _, ok := broker.authRequests["rid"]; !ok {
+	if _, ok := got.AuthRequests["rid"]; !ok {
 		t.Fatal("authorization request was not loaded")
 	}
-	if got := broker.authCodes[hashSecret("code")].UserID; got != "johndoe" {
-		t.Fatalf("loaded authorization code user = %q, want johndoe", got)
+	if user := got.AuthCodes[hashSecret("code")].UserID; user != "johndoe" {
+		t.Fatalf("loaded authorization code user = %q, want johndoe", user)
 	}
-	if got := broker.refresh[hashSecret("refresh")].Scope; got != "openid" {
-		t.Fatalf("loaded refresh token scope = %q, want openid", got)
+	if scope := got.RefreshTokens[hashSecret("refresh")].Scope; scope != "openid" {
+		t.Fatalf("loaded refresh token scope = %q, want openid", scope)
 	}
-	if _, ok := broker.revokedJTIs["jti"]; !ok {
+	if _, ok := got.RevokedJTIs["jti"]; !ok {
 		t.Fatal("revoked token id was not loaded")
 	}
 }

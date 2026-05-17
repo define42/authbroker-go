@@ -149,9 +149,8 @@ func (b *Broker) verifyTokenNotRevoked(claims map[string]any) error {
 	if jti == "" {
 		return nil
 	}
-	b.mu.Lock()
 	var revoked bool
-	err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+	_, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
 		exp, found := state.RevokedJTIs[jti]
 		revoked = found
 		if found && time.Now().After(exp) {
@@ -161,7 +160,6 @@ func (b *Broker) verifyTokenNotRevoked(claims map[string]any) error {
 		}
 		return false, nil
 	})
-	b.mu.Unlock()
 	if err != nil {
 		return err
 	}
