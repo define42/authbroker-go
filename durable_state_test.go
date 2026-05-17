@@ -24,10 +24,10 @@ func TestBrokerLoadsDurableRuntimeState(t *testing.T) {
 			"rid": {ID: "rid", ClientID: "demo-web", RedirectURI: "http://app.example/callback", ExpiresAt: now.Add(time.Minute)},
 		},
 		AuthCodes: map[string]AuthCode{
-			"code": {Code: "code", UserID: "johndoe", ClientID: "demo-web", RedirectURI: "http://app.example/callback", ExpiresAt: now.Add(time.Minute)},
+			hashSecret("code"): {UserID: "johndoe", ClientID: "demo-web", RedirectURI: "http://app.example/callback", ExpiresAt: now.Add(time.Minute)},
 		},
 		RefreshTokens: map[string]RefreshToken{
-			"refresh": {Token: "refresh", UserID: "johndoe", ClientID: "demo-web", Scope: "openid", AuthTime: now, ExpiresAt: now.Add(time.Hour)},
+			hashSecret("refresh"): {UserID: "johndoe", ClientID: "demo-web", Scope: "openid", AuthTime: now, ExpiresAt: now.Add(time.Hour)},
 		},
 		RevokedJTIs: map[string]time.Time{
 			"jti": now.Add(time.Hour),
@@ -56,10 +56,10 @@ func TestBrokerLoadsDurableRuntimeState(t *testing.T) {
 	if _, ok := broker.authRequests["rid"]; !ok {
 		t.Fatal("authorization request was not loaded")
 	}
-	if got := broker.authCodes["code"].UserID; got != "johndoe" {
+	if got := broker.authCodes[hashSecret("code")].UserID; got != "johndoe" {
 		t.Fatalf("loaded authorization code user = %q, want johndoe", got)
 	}
-	if got := broker.refresh["refresh"].Scope; got != "openid" {
+	if got := broker.refresh[hashSecret("refresh")].Scope; got != "openid" {
 		t.Fatalf("loaded refresh token scope = %q, want openid", got)
 	}
 	if _, ok := broker.revokedJTIs["jti"]; !ok {
@@ -83,7 +83,7 @@ func TestBrokerPersistsRuntimeStateMutations(t *testing.T) {
 	}
 
 	sessionRecorder := httptest.NewRecorder()
-	sess, err := broker.createSession(sessionRecorder, "johndoe")
+	sess, err := broker.createSession(sessionRecorder, "johndoe", true)
 	if err != nil {
 		t.Fatalf("create session: %v", err)
 	}
@@ -123,10 +123,10 @@ func TestSharedStorePreservesRuntimeMutationsAcrossBrokers(t *testing.T) {
 	brokerA := mustNewDurableBroker(t, path)
 	brokerB := mustNewDurableBroker(t, path)
 
-	if _, err := brokerA.createSession(httptest.NewRecorder(), "alice"); err != nil {
+	if _, err := brokerA.createSession(httptest.NewRecorder(), "alice", true); err != nil {
 		t.Fatalf("broker A create session: %v", err)
 	}
-	if _, err := brokerB.createSession(httptest.NewRecorder(), "bob"); err != nil {
+	if _, err := brokerB.createSession(httptest.NewRecorder(), "bob", true); err != nil {
 		t.Fatalf("broker B create session: %v", err)
 	}
 
@@ -154,8 +154,7 @@ func TestSharedStoreConsumesAuthorizationCodeOnceAcrossBrokers(t *testing.T) {
 	now := time.Now()
 	if err := store.ReplaceRuntimeState(StoredRuntimeState{
 		AuthCodes: map[string]AuthCode{
-			"shared-code": {
-				Code:        "shared-code",
+			hashSecret("shared-code"): {
 				UserID:      "alice",
 				ClientID:    "demo-web",
 				RedirectURI: "http://app.example/callback",

@@ -1,0 +1,624 @@
+package main
+
+import (
+	"crypto/subtle"
+	"fmt"
+	"log"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+)
+
+func (b *Broker) handleLoginGet(w http.ResponseWriter, r *http.Request) {
+	rid := r.URL.Query().Get("request_id")
+	clientID := "authbroker"
+	if rid != "" {
+		var ar AuthorizationRequest
+		b.mu.Lock()
+		err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+			ar = state.AuthRequests[rid]
+			return false, nil
+		})
+		b.mu.Unlock()
+		if err != nil {
+			http.Error(w, "store error", http.StatusInternalServerError)
+			return
+		}
+		if ar.ID == "" || time.Now().After(ar.ExpiresAt) {
+			http.Error(w, "login request expired", http.StatusBadRequest)
+			return
+		}
+		clientID = ar.ClientID
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = loginTemplate.Execute(w, map[string]any{
+		"DisplayName": b.cfg.DisplayName,
+		"RequestID":   rid,
+		"ClientID":    clientID,
+		"TOTPHint":    b.cfg.MFA.TOTPRequired,
+		"CSRFToken":   b.anonymousCSRFToken(w, r),
+	})
+}
+
+//nolint:gocognit,cyclop,nestif,funlen // Login keeps OAuth request restoration and TOTP handling in one flow.
+func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxLoginBodyBytes)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	if !verifyAnonymousCSRF(r) {
+		http.Error(w, "invalid csrf token", http.StatusForbidden)
+		return
+	}
+
+	username := strings.TrimSpace(r.Form.Get("username"))
+	rateKey := loginRateKey(r, username)
+	if ok, retry := b.loginLimiter.allow(rateKey); !ok {
+		writeRetryAfter(w, retry)
+		http.Error(w, "too many login attempts; try again later", http.StatusTooManyRequests)
+		return
+	}
+
+	rid := r.Form.Get("request_id")
+	oauthLogin := rid != ""
+	var ar AuthorizationRequest
+	if oauthLogin {
+		var ok bool
+		b.mu.Lock()
+		persistErr := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+			ar, ok = state.AuthRequests[rid]
+			if !ok {
+				return false, nil
+			}
+			delete(state.AuthRequests, rid)
+			return true, nil
+		})
+		b.mu.Unlock()
+		if persistErr != nil {
+			http.Error(w, "store error", http.StatusInternalServerError)
+			return
+		}
+		if !ok || time.Now().After(ar.ExpiresAt) {
+			http.Error(w, "login request expired", http.StatusBadRequest)
+			return
+		}
+	}
+
+	password := r.Form.Get("password")
+	profile, err := b.authn.Authenticate(r.Context(), username, password)
+	if err != nil {
+		b.loginLimiter.recordFailure(rateKey)
+		if oauthLogin {
+			if err := b.putAuthRequest(ar); err != nil {
+				log.Printf("restore auth request after login failure: %v", err)
+			}
+		}
+		http.Error(w, "invalid username or password", http.StatusUnauthorized)
+		return
+	}
+	user, err := b.store.UpsertProfile(profile)
+	if err != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+
+	if b.needsTOTP(user) {
+		otp := strings.TrimSpace(r.Form.Get("otp"))
+		if user.TOTPSecretBase32 == "" {
+			b.loginLimiter.recordFailure(rateKey)
+			if oauthLogin {
+				if err := b.putAuthRequest(ar); err != nil {
+					log.Printf("restore auth request after missing totp enrollment: %v", err)
+				}
+			}
+			http.Error(w, "invalid username or password", http.StatusUnauthorized)
+			return
+		}
+		if !verifyTOTP(user.TOTPSecretBase32, otp, time.Now(), 1) {
+			b.loginLimiter.recordFailure(rateKey)
+			if oauthLogin {
+				if err := b.putAuthRequest(ar); err != nil {
+					log.Printf("restore auth request after totp failure: %v", err)
+				}
+			}
+			http.Error(w, "invalid username or password", http.StatusUnauthorized)
+			return
+		}
+	}
+
+	b.loginLimiter.recordSuccess(rateKey)
+	sess, err := b.createSession(w, user.Username, true)
+	if err != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	if oauthLogin {
+		if err := b.issueCodeRedirect(w, r, ar, sess); err != nil {
+			http.Error(w, "store error", http.StatusInternalServerError)
+		}
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+// handleReAuth re-confirms the current user's password and refreshes
+// ReAuthAt so the session may immediately mutate second-factor material
+// (TOTP enroll, WebAuthn register). Required when the existing session's
+// ReAuthAt is older than reAuthValidity.
+func (b *Broker) handleReAuth(w http.ResponseWriter, r *http.Request) {
+	sess, ok := b.validSession(r)
+	if !ok {
+		http.Error(w, "not authenticated", http.StatusUnauthorized)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxLoginBodyBytes)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	if !verifySessionCSRF(r, sess) {
+		http.Error(w, "invalid csrf token", http.StatusForbidden)
+		return
+	}
+	password := r.Form.Get("password")
+	rateKey := loginRateKey(r, sess.UserID)
+	if ok, retry := b.loginLimiter.allow(rateKey); !ok {
+		writeRetryAfter(w, retry)
+		http.Error(w, "too many login attempts; try again later", http.StatusTooManyRequests)
+		return
+	}
+	if _, err := b.authn.Authenticate(r.Context(), sess.UserID, password); err != nil {
+		b.loginLimiter.recordFailure(rateKey)
+		http.Error(w, "invalid password", http.StatusUnauthorized)
+		return
+	}
+	b.loginLimiter.recordSuccess(rateKey)
+	if err := b.markSessionReAuth(r); err != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (b *Broker) handleLocalLogoutGet(w http.ResponseWriter, r *http.Request) {
+	sess, ok := b.validSession(r)
+	if !ok {
+		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = brokerLogoutTemplate.Execute(w, map[string]any{
+		"DisplayName": b.cfg.DisplayName,
+		"UserID":      sess.UserID,
+		"CSRFToken":   sess.CSRFToken,
+	})
+}
+
+func (b *Broker) handleLocalLogoutPost(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxLogoutBodyBytes)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	sess, ok := b.validSession(r)
+	if ok && !verifySessionCSRF(r, sess) {
+		http.Error(w, "invalid csrf token", http.StatusForbidden)
+		return
+	}
+	if err := b.clearSession(w, r); err != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+func (b *Broker) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, maxLogoutBodyBytes)
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "bad form", http.StatusBadRequest)
+			return
+		}
+	}
+
+	idTokenHint := strings.TrimSpace(logoutParam(r, "id_token_hint"))
+	clientID := strings.TrimSpace(logoutParam(r, "client_id"))
+	clientID, ok := b.resolveLogoutClientID(w, clientID, idTokenHint)
+	if !ok {
+		return
+	}
+
+	postLogoutRedirectURI := strings.TrimSpace(logoutParam(r, "post_logout_redirect_uri"))
+	state := logoutParam(r, "state")
+	if postLogoutRedirectURI != "" {
+		b.handlePostLogoutRedirect(w, r, clientID, postLogoutRedirectURI, state)
+		return
+	}
+
+	if err := b.clearSession(w, r); err != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("logged out\n"))
+}
+
+func (b *Broker) handlePostLogoutRedirect(w http.ResponseWriter, r *http.Request, clientID, redirectURI, state string) {
+	client, ok := b.clients[clientID]
+	if !ok || !clientAllowsPostLogoutRedirect(client, redirectURI) {
+		http.Error(w, "invalid post_logout_redirect_uri", http.StatusBadRequest)
+		return
+	}
+	if err := b.clearSession(w, r); err != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	u, err := url.Parse(redirectURI)
+	if err != nil {
+		http.Error(w, "invalid post_logout_redirect_uri", http.StatusBadRequest)
+		return
+	}
+	if state != "" {
+		q := u.Query()
+		q.Set("state", state)
+		u.RawQuery = q.Encode()
+	}
+	http.Redirect(w, r, u.String(), http.StatusFound) //nolint:gosec // redirect URI was validated against registered post_logout_redirect_uris.
+}
+
+func (b *Broker) resolveLogoutClientID(w http.ResponseWriter, clientID, idTokenHint string) (string, bool) {
+	if idTokenHint == "" {
+		return clientID, true
+	}
+	hintClientID, err := b.logoutClientIDFromIDTokenHint(idTokenHint)
+	if err != nil && clientID == "" {
+		http.Error(w, "invalid id_token_hint", http.StatusBadRequest)
+		return "", false
+	}
+	if err != nil || hintClientID == "" {
+		return clientID, true
+	}
+	if clientID != "" && clientID != hintClientID {
+		http.Error(w, "client_id does not match id_token_hint", http.StatusBadRequest)
+		return "", false
+	}
+	return hintClientID, true
+}
+
+func logoutParam(r *http.Request, name string) string {
+	if r.Method == http.MethodPost {
+		return r.Form.Get(name)
+	}
+	return r.URL.Query().Get(name)
+}
+
+func (b *Broker) logoutClientIDFromIDTokenHint(idTokenHint string) (string, error) {
+	// Per OIDC RP-Initiated Logout 1.0 §3, id_token_hint is a HINT — the
+	// broker should accept previously valid (signature + iss) ID tokens even
+	// after exp has passed so that callers using long-lived stored tokens can
+	// still initiate logout.
+	claims, err := b.verifyJWTWithOptions(idTokenHint, jwtVerifyOptions{ignoreExpiry: true})
+	if err != nil {
+		return "", err
+	}
+	return clientIDFromTokenClaims(claims), nil
+}
+
+func clientIDFromTokenClaims(claims map[string]any) string {
+	if clientID, _ := claims["client_id"].(string); clientID != "" {
+		return clientID
+	}
+	if aud, _ := claims["aud"].(string); aud != "" {
+		return aud
+	}
+	if audList, ok := claims["aud"].([]any); ok && len(audList) == 1 {
+		clientID, _ := audList[0].(string)
+		return clientID
+	}
+	return ""
+}
+
+func (b *Broker) needsTOTP(user *StoredUser) bool {
+	return b.cfg.MFA.TOTPRequired || (user != nil && user.TOTPSecretBase32 != "")
+}
+
+func (b *Broker) anonymousCSRFToken(w http.ResponseWriter, r *http.Request) string {
+	if c, err := r.Cookie(csrfCookieName); err == nil && c.Value != "" {
+		return c.Value
+	}
+	token := randomB64(32)
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure is controlled by issuer/config for local HTTP demos and HTTPS deployments.
+		Name:     csrfCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   b.cookieSecure(),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int((24 * time.Hour).Seconds()),
+	})
+	return token
+}
+
+func verifyAnonymousCSRF(r *http.Request) bool {
+	c, err := r.Cookie(csrfCookieName)
+	if err != nil {
+		return false
+	}
+	return csrfTokenMatches(r.Form.Get(csrfFormField), c.Value)
+}
+
+func verifySessionCSRF(r *http.Request, sess Session) bool {
+	token := r.Form.Get(csrfFormField)
+	if token == "" {
+		token = r.Header.Get(csrfHeaderName)
+	}
+	return csrfTokenMatches(token, sess.CSRFToken)
+}
+
+func csrfTokenMatches(got, want string) bool {
+	if got == "" || want == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+func (b *Broker) cookieSecure() bool {
+	secure := strings.HasPrefix(b.cfg.Issuer, "https://")
+	if b.cfg.CookieSecure != nil {
+		secure = *b.cfg.CookieSecure
+	}
+	return secure
+}
+
+func (b *Broker) validSession(r *http.Request) (Session, bool) {
+	c, err := r.Cookie(sessionCookieName)
+	if err != nil || c.Value == "" {
+		return Session{}, false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var s Session
+	var valid bool
+	err = b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		var ok bool
+		s, ok = state.Sessions[c.Value]
+		if !ok {
+			return false, nil
+		}
+		if time.Now().After(s.ExpiresAt) {
+			delete(state.Sessions, c.Value)
+			return true, nil
+		}
+		if s.CSRFToken == "" {
+			s.CSRFToken = randomB64(32)
+			state.Sessions[c.Value] = s
+			valid = true
+			return true, nil
+		}
+		valid = true
+		return false, nil
+	})
+	if err != nil {
+		log.Printf("load session state: %v", err)
+		return Session{}, false
+	}
+	return s, valid
+}
+
+// markSessionReAuth refreshes the current session's ReAuthAt timestamp after a
+// successful password (or factor) re-confirmation.
+func (b *Broker) markSessionReAuth(r *http.Request) error {
+	c, err := r.Cookie(sessionCookieName)
+	if err != nil || c.Value == "" {
+		return fmt.Errorf("no session")
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		s, ok := state.Sessions[c.Value]
+		if !ok {
+			return false, nil
+		}
+		s.ReAuthAt = time.Now()
+		state.Sessions[c.Value] = s
+		return true, nil
+	})
+}
+
+// sessionRecentlyReAuthenticated reports whether the session's ReAuthAt is
+// within reAuthValidity of now. Returns false for sessions that have never
+// completed a password (or factor) re-confirmation.
+func sessionRecentlyReAuthenticated(sess Session) bool {
+	if sess.ReAuthAt.IsZero() {
+		return false
+	}
+	return time.Since(sess.ReAuthAt) <= reAuthValidity
+}
+
+// maybeExtendSession refreshes the broker session's expiry on activity once
+// more than half of the TTL has been consumed. The cookie is re-set so the
+// browser does not drop it at the original expiration.
+func (b *Broker) maybeExtendSession(w http.ResponseWriter, r *http.Request) {
+	c, err := r.Cookie(sessionCookieName)
+	if err != nil || c.Value == "" {
+		return
+	}
+	ttl := time.Duration(b.cfg.SessionTTLHrs) * time.Hour
+	if ttl <= 0 {
+		return
+	}
+	now := time.Now()
+	b.mu.Lock()
+	var newExpiry time.Time
+	extended := false
+	err = b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		s, ok := state.Sessions[c.Value]
+		if !ok {
+			return false, nil
+		}
+		if now.After(s.ExpiresAt) {
+			delete(state.Sessions, c.Value)
+			return true, nil
+		}
+		if s.ExpiresAt.Sub(now) > ttl/2 {
+			return false, nil
+		}
+		s.ExpiresAt = now.Add(ttl)
+		state.Sessions[c.Value] = s
+		newExpiry = s.ExpiresAt
+		extended = true
+		return true, nil
+	})
+	if err != nil {
+		log.Printf("persist extended session: %v", err)
+		b.mu.Unlock()
+		return
+	}
+	if !extended {
+		b.mu.Unlock()
+		return
+	}
+	b.mu.Unlock()
+
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure is controlled by issuer/config for local HTTP demos and HTTPS deployments.
+		Name:     sessionCookieName,
+		Value:    c.Value,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   b.cookieSecure(),
+		SameSite: http.SameSiteLaxMode,
+		Expires:  newExpiry,
+	})
+}
+
+func (b *Broker) clearSession(w http.ResponseWriter, r *http.Request) error {
+	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
+		b.mu.Lock()
+		err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+			if _, ok := state.Sessions[c.Value]; !ok {
+				return false, nil
+			}
+			delete(state.Sessions, c.Value)
+			return true, nil
+		})
+		b.mu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure is controlled by issuer/config for local HTTP demos and HTTPS deployments.
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   b.cookieSecure(),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+	return nil
+}
+
+// createSession persists a new session, sets the cookie, and optionally marks
+// the session as freshly re-authenticated. Direct password / passkey logins
+// pass freshlyAuthenticated=true so the user can immediately enroll TOTP /
+// register a passkey without an extra re-auth round-trip.
+func (b *Broker) createSession(w http.ResponseWriter, userID string, freshlyAuthenticated bool) (Session, error) {
+	sid := randomB64(32)
+	now := time.Now()
+	sess := Session{UserID: userID, ExpiresAt: now.Add(time.Duration(b.cfg.SessionTTLHrs) * time.Hour), AuthTime: now, CSRFToken: randomB64(32)}
+	if freshlyAuthenticated {
+		sess.ReAuthAt = now
+	}
+	b.mu.Lock()
+	if err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		state.Sessions[sid] = sess
+		return true, nil
+	}); err != nil {
+		b.mu.Unlock()
+		return Session{}, err
+	}
+	b.mu.Unlock()
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure is controlled by issuer/config for local HTTP demos and HTTPS deployments.
+		Name:     sessionCookieName,
+		Value:    sid,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   b.cookieSecure(),
+		SameSite: http.SameSiteLaxMode,
+		Expires:  sess.ExpiresAt,
+	})
+	return sess, nil
+}
+
+func (b *Broker) issueCodeRedirect(w http.ResponseWriter, r *http.Request, ar AuthorizationRequest, sess Session) error {
+	code := randomB64(32)
+	ac := AuthCode{
+		UserID:              sess.UserID,
+		ClientID:            ar.ClientID,
+		RedirectURI:         ar.RedirectURI,
+		Scope:               ar.Scope,
+		Nonce:               ar.Nonce,
+		CodeChallenge:       ar.CodeChallenge,
+		CodeChallengeMethod: ar.CodeChallengeMethod,
+		AuthTime:            sess.AuthTime,
+		ExpiresAt:           time.Now().Add(time.Duration(b.cfg.AuthCodeTTLSeconds) * time.Second),
+	}
+	b.mu.Lock()
+	if err := b.updateRuntimeStateLocked(func(state *StoredRuntimeState) (bool, error) {
+		state.AuthCodes[hashSecret(code)] = ac
+		return true, nil
+	}); err != nil {
+		b.mu.Unlock()
+		return err
+	}
+	b.mu.Unlock()
+
+	u, _ := url.Parse(ar.RedirectURI)
+	q := u.Query()
+	q.Set("code", code)
+	if ar.State != "" {
+		q.Set("state", ar.State)
+	}
+	u.RawQuery = q.Encode()
+	http.Redirect(w, r, u.String(), http.StatusFound)
+	return nil
+}
+
+// loginRateKey scopes the limiter by client IP and (when known) the username
+// being attempted so a single hostile IP cannot brute one account by trying
+// many other accounts in parallel.
+func loginRateKey(r *http.Request, username string) string {
+	ip := clientIP(r)
+	if username == "" {
+		return "ip:" + ip
+	}
+	return "ip:" + ip + "/user:" + strings.ToLower(username)
+}
+
+func writeRetryAfter(w http.ResponseWriter, d time.Duration) {
+	if d < time.Second {
+		d = time.Second
+	}
+	w.Header().Set("Retry-After", fmt.Sprintf("%d", int(d.Seconds())))
+}
+
+// requireRecentReAuth returns true if the session has a fresh ReAuthAt within
+// reAuthValidity. Otherwise it writes a 403 with a hint to re-authenticate.
+// Handlers that mutate second-factor material (TOTP, WebAuthn credentials)
+// should gate on this.
+func (b *Broker) requireRecentReAuth(w http.ResponseWriter, sess Session) bool {
+	if sessionRecentlyReAuthenticated(sess) {
+		return true
+	}
+	w.Header().Set("Content-Type", "application/json")
+	writeJSON(w, http.StatusForbidden, map[string]any{
+		"error":             "re_auth_required",
+		"error_description": "POST your current password to /reauth before enrolling a new factor",
+		"reauth_endpoint":   "/reauth",
+		"reauth_max_age":    int(reAuthValidity.Seconds()),
+	})
+	return false
+}
