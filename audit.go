@@ -22,6 +22,7 @@ const (
 	auditEventWebAuthnLogin    = "webauthn_login"
 	auditEventTokenIssue       = "token_issue"
 	auditEventTokenRevoke      = "token_revoke"
+	auditEventTokenIntrospect  = "token_introspect"
 	auditEventAppTokenIssue    = "app_token_issue" //nolint:gosec // event name, not a credential.
 	auditEventConsent          = "consent"
 	auditEventAdminMutation    = "admin_mutation"

@@ -806,6 +806,154 @@ func TestHandleRevokeBadClient(t *testing.T) {
 	}
 }
 
+func introspectRequest(form url.Values, basicUser, basicPass string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/oauth2/introspect", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if basicUser != "" {
+		req.SetBasicAuth(basicUser, basicPass)
+	}
+	return req
+}
+
+func TestIntrospectAccessToken(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid profile", "", time.Now(), nil, false)
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	access, _ := tokens["access_token"].(string)
+
+	rr := httptest.NewRecorder()
+	broker.handleIntrospect(rr, introspectRequest(url.Values{"token": {access}}, "demo-web", "demo-secret"))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["active"] != true {
+		t.Fatalf("active = %v body=%s", resp["active"], rr.Body.String())
+	}
+	if resp["client_id"] != "demo-web" {
+		t.Fatalf("client_id = %v", resp["client_id"])
+	}
+	if resp["sub"] != "johndoe" {
+		t.Fatalf("sub = %v", resp["sub"])
+	}
+	if resp["scope"] != "openid profile" {
+		t.Fatalf("scope = %v", resp["scope"])
+	}
+	if resp["token_type"] != "Bearer" {
+		t.Fatalf("token_type = %v", resp["token_type"])
+	}
+	if _, ok := numberClaim(resp["exp"]); !ok {
+		t.Fatalf("exp missing or not numeric: %#v", resp["exp"])
+	}
+	if cc := rr.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Fatalf("Cache-Control = %q", cc)
+	}
+}
+
+func TestIntrospectRefreshToken(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	rt := "intro-refresh"
+	exp := time.Now().Add(time.Hour).Truncate(time.Second)
+	if err := broker.store.PutRefreshToken(hashSecret(rt), RefreshToken{
+		UserID:    "johndoe",
+		ClientID:  "demo-web",
+		Scope:     "openid",
+		ExpiresAt: exp,
+	}); err != nil {
+		t.Fatalf("seed refresh: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	broker.handleIntrospect(rr, introspectRequest(url.Values{
+		"token":           {rt},
+		"token_type_hint": {"refresh_token"},
+	}, "demo-web", "demo-secret"))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["active"] != true {
+		t.Fatalf("active = %v", resp["active"])
+	}
+	if resp["sub"] != "johndoe" {
+		t.Fatalf("sub = %v", resp["sub"])
+	}
+	got, ok := numberClaim(resp["exp"])
+	if !ok || got != exp.Unix() {
+		t.Fatalf("exp = %v (want %d)", resp["exp"], exp.Unix())
+	}
+}
+
+func TestIntrospectUnknownToken(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	rr := httptest.NewRecorder()
+	broker.handleIntrospect(rr, introspectRequest(url.Values{"token": {"never-issued"}}, "demo-web", "demo-secret"))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["active"] != false {
+		t.Fatalf("active = %v", resp["active"])
+	}
+}
+
+func TestIntrospectEmptyTokenIsInactive(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	rr := httptest.NewRecorder()
+	broker.handleIntrospect(rr, introspectRequest(url.Values{}, "demo-web", "demo-secret"))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), `"active":false`) {
+		t.Fatalf("body = %s", rr.Body.String())
+	}
+}
+
+func TestIntrospectRequiresClientAuth(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	rr := httptest.NewRecorder()
+	broker.handleIntrospect(rr, introspectRequest(url.Values{"token": {"x"}}, "demo-web", "wrong"))
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if rr.Header().Get("WWW-Authenticate") == "" {
+		t.Fatal("missing WWW-Authenticate")
+	}
+}
+
+// A refresh token issued to one client must look inactive to a different
+// client — introspection must not leak token metadata across tenants.
+func TestIntrospectOtherClientCannotSeeToken(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	// Seed a refresh token for a different client_id.
+	rt := "intro-foreign"
+	if err := broker.store.PutRefreshToken(hashSecret(rt), RefreshToken{
+		UserID:    "johndoe",
+		ClientID:  "litellm",
+		ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("seed refresh: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	broker.handleIntrospect(rr, introspectRequest(url.Values{"token": {rt}}, "demo-web", "demo-secret"))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), `"active":false`) {
+		t.Fatalf("body = %s", rr.Body.String())
+	}
+}
+
 func TestUserInfoRequiresBearer(t *testing.T) {
 	broker := newLogoutTestBroker(t)
 	req := httptest.NewRequest(http.MethodGet, "/oauth2/userinfo", nil)

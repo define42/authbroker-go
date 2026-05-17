@@ -376,6 +376,7 @@ func (b *Broker) routes() http.Handler {
 	mux.HandleFunc("GET /oauth2/userinfo", b.handleUserInfo)
 	mux.HandleFunc("POST /oauth2/userinfo", b.handleUserInfo)
 	mux.HandleFunc("POST /oauth2/revoke", b.handleRevoke)
+	mux.HandleFunc("POST /oauth2/introspect", b.handleIntrospect)
 	mux.HandleFunc("GET /oauth2/logout", b.handleLogout)
 	mux.HandleFunc("POST /oauth2/logout", b.handleLogout)
 	mux.HandleFunc("POST /mfa/totp/enroll", b.handleTOTPEnroll)

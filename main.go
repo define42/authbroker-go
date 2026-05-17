@@ -461,6 +461,7 @@ func dumpRoutes() {
 		"/oauth2/jwks",
 		"/oauth2/userinfo",
 		"/oauth2/revoke",
+		"/oauth2/introspect",
 		"/oauth2/logout",
 		"/mfa/totp/enroll",
 		"/mfa/totp/verify",

@@ -630,6 +630,140 @@ func (b *Broker) handleUserInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// handleIntrospect implements OAuth 2.0 Token Introspection (RFC 7662). The
+// requesting client must authenticate, the response is always 200 with a JSON
+// body, and active=true is returned only when the token was issued to the
+// authenticated client (matching its client_id or audience). Any other state —
+// unknown, expired, revoked, signed by an unknown key, or owned by a different
+// client — is reported as {"active": false} so the endpoint cannot be used as
+// a token oracle by an unrelated client.
+func (b *Broker) handleIntrospect(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxIntrospectBodyBytes)
+	if err := r.ParseForm(); err != nil {
+		tokenError(w, "invalid_request", "bad form")
+		return
+	}
+	client, err := b.authenticateClient(r)
+	if err != nil {
+		w.Header().Set("WWW-Authenticate", `Basic realm="introspect"`)
+		b.auditEvent(r, auditEventTokenIntrospect, auditOutcomeFailure,
+			slog.String("reason", "unauthenticated_client"))
+		tokenErrorStatus(w, http.StatusUnauthorized, "invalid_client", err.Error())
+		return
+	}
+	tok := strings.TrimSpace(r.Form.Get("token"))
+	if tok == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"active": false})
+		return
+	}
+	hint := r.Form.Get("token_type_hint")
+	resp, ok := b.introspectToken(tok, hint, client)
+	if !ok {
+		writeJSON(w, http.StatusOK, map[string]any{"active": false})
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// introspectToken returns the active introspection response for tok when it
+// belongs to client. token_type_hint just reorders the lookup attempts; when
+// the hint is wrong or absent we still try the other shape, per RFC 7662 §2.1.
+func (b *Broker) introspectToken(tok, hint string, client Client) (map[string]any, bool) {
+	tryRefreshFirst := hint == "refresh_token"
+	if tryRefreshFirst {
+		if resp, ok := b.introspectRefreshToken(tok, client); ok {
+			return resp, true
+		}
+		return b.introspectJWT(tok, client)
+	}
+	if resp, ok := b.introspectJWT(tok, client); ok {
+		return resp, true
+	}
+	return b.introspectRefreshToken(tok, client)
+}
+
+func (b *Broker) introspectRefreshToken(tok string, client Client) (map[string]any, bool) {
+	rt, ok, err := b.store.GetRefreshToken(hashSecret(tok))
+	if err != nil || !ok {
+		return nil, false
+	}
+	if rt.ClientID != client.ClientID {
+		return nil, false
+	}
+	if time.Now().After(rt.ExpiresAt) {
+		return nil, false
+	}
+	resp := map[string]any{
+		"active":     true,
+		"token_type": "Bearer",
+		"client_id":  rt.ClientID,
+		"sub":        rt.UserID,
+		"username":   rt.UserID,
+		"aud":        rt.ClientID,
+		"iss":        b.cfg.Issuer,
+		"exp":        rt.ExpiresAt.Unix(),
+	}
+	if rt.Scope != "" {
+		resp["scope"] = rt.Scope
+	}
+	return resp, true
+}
+
+func (b *Broker) introspectJWT(tok string, client Client) (map[string]any, bool) {
+	claims, err := b.verifyJWT(tok)
+	if err != nil {
+		return nil, false
+	}
+	if !introspectClientOwnsToken(claims, client.ClientID) {
+		return nil, false
+	}
+	resp := map[string]any{
+		"active":     true,
+		"token_type": "Bearer",
+	}
+	for _, k := range []string{"iss", "sub", "aud", "client_id", "scope", "jti", "token_use"} {
+		if v, ok := claims[k]; ok {
+			resp[k] = v
+		}
+	}
+	for _, k := range []string{"exp", "iat", "nbf", "auth_time"} {
+		if v, ok := numberClaim(claims[k]); ok {
+			resp[k] = v
+		}
+	}
+	if sub, ok := claims["sub"].(string); ok {
+		resp["username"] = sub
+		if name, ok := claims["preferred_username"].(string); ok && name != "" {
+			resp["username"] = name
+		}
+	}
+	return resp, true
+}
+
+// introspectClientOwnsToken reports whether the authenticated client is
+// entitled to introspect the token. We accept either a client_id claim match
+// (the common case for tokens issued to this client) or an aud claim match
+// (so a resource server with its own credentials can introspect app tokens
+// minted for its audience).
+func introspectClientOwnsToken(claims map[string]any, clientID string) bool {
+	if cid, _ := claims["client_id"].(string); cid == clientID {
+		return true
+	}
+	switch aud := claims["aud"].(type) {
+	case string:
+		return aud == clientID
+	case []any:
+		for _, v := range aud {
+			if s, ok := v.(string); ok && s == clientID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (b *Broker) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRevokeBodyBytes)
 	_ = r.ParseForm()

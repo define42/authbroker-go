@@ -40,6 +40,7 @@ const (
 	maxTokenBodyBytes        = 16 << 10
 	maxLogoutBodyBytes       = 64 << 10
 	maxRevokeBodyBytes       = 16 << 10
+	maxIntrospectBodyBytes   = 16 << 10
 	maxWebAuthnBodyBytes     = 64 << 10
 	maxAppTokenFormBodyBytes = 4 << 10
 	maxTOTPEnrollBodyBytes   = 4 << 10
