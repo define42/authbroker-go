@@ -56,6 +56,34 @@ JWKS:
 curl http://localhost:8080/oauth2/jwks
 ```
 
+## ACME / Let's Encrypt
+
+The broker can terminate TLS itself via [certmagic](https://github.com/caddyserver/certmagic) and obtain certificates from Let's Encrypt (or any ACME CA). When the ACME block is enabled, `listen` is ignored: the broker binds `:443` for HTTPS and `:80` for the HTTP-01 challenge plus a 301 redirect to HTTPS.
+
+```json
+"acme": {
+  "enabled": true,
+  "domains": ["auth.example.com"],
+  "email": "ops@example.com",
+  "agreed_tos": true,
+  "ca_directory": "https://acme-v02.api.letsencrypt.org/directory",
+  "ca_cert_path": "",
+  "storage_path": "",
+  "http_addr": ":80",
+  "https_addr": ":443"
+}
+```
+
+- `agreed_tos` must be `true` — this signifies acceptance of the CA's Subscriber Agreement.
+- `ca_directory` defaults to Let's Encrypt production (`https://acme-v02.api.letsencrypt.org/directory`). Set it to `https://acme-staging-v02.api.letsencrypt.org/directory` while testing to avoid rate limits, or point it at any other ACME-compatible CA (e.g. ZeroSSL, Buypass, an internal step-ca).
+- `ca_cert_path` points at a PEM file with one or more root certificates the broker should trust when reaching the ACME server. Use this for internal CAs whose roots aren't in the system trust store; leave empty to rely solely on the system pool.
+- `storage_path` defaults to `<AUTHBROKER_DATA>/acme`. The account key, certificates, and locks live there — back this up alongside `data.json` and `signing-keys.json`.
+- `http_addr` / `https_addr` only need overriding for non-standard ports; ACME challenges still require `:80` / `:443` to reach the broker (port forwarding is fine).
+- Set `issuer` to `https://<domain>` so OIDC discovery, redirects, and WebAuthn origins match the served scheme.
+- The process needs permission to bind low ports — run as root, grant `CAP_NET_BIND_SERVICE`, or use a systemd `AmbientCapabilities=CAP_NET_BIND_SERVICE` unit.
+
+Certificate management runs asynchronously, so the listener comes up immediately and certificates are obtained in the background on first start.
+
 ## Docker Compose demo
 
 The compose stack starts:
@@ -277,6 +305,8 @@ For OpenLDAP DN-template bind:
 
 Profile lookup is optional. If `base_dn` and `user_filter` are omitted, the broker only performs the bind and falls back to the submitted username plus `domain_suffix` for profile claims. Use `"start_tls": true` only with `ldap://` URLs; `ldaps://` starts TLS during dial. Nested AD lookup searches groups with the recursive matching rule `member:1.2.840.113556.1.4.1941:=<userDN>` and merges those results with direct groups. This starter does not implement group sync, nested OpenLDAP group resolution, or Kerberos/SPNEGO. Add those as separate federation modules.
 
+For TLS to an LDAP server backed by an internal CA, set `ca_cert_path` to a PEM file with the root certificate(s) the broker should trust. The system trust store is also included, so this only needs to contain the extra roots. Prefer this over `insecure_skip_verify`, which disables certificate validation entirely.
+
 ## TOTP MFA
 
 After login, enroll TOTP using the session cookie:
@@ -368,7 +398,7 @@ await fetch('/webauthn/login/finish', {
 
 Before production, the remaining hardening work is:
 
-- TLS-only deployment behind a trusted ingress/proxy
+- TLS-only deployment behind a trusted ingress/proxy, or via the built-in ACME terminator
 - encrypted secret storage for signing keys, TLS trust material, and deployment secrets
 - backup/restore for the `AUTHBROKER_DATA` directory
 - operational key rotation policy review for each deployment

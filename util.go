@@ -2,10 +2,12 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 )
 
@@ -44,6 +46,29 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// loadRootCAs reads a PEM file containing one or more root certificates and
+// returns a *x509.CertPool seeded with the system roots plus those certs. If
+// path is empty, returns (nil, nil) — callers should leave RootCAs unset so
+// the system pool is used.
+func loadRootCAs(path string) (*x509.CertPool, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil, nil
+	}
+	pem, err := os.ReadFile(path) //nolint:gosec // path is supplied by the local operator.
+	if err != nil {
+		return nil, fmt.Errorf("read ca cert %q: %w", path, err)
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("no PEM certificates parsed from %q", path)
+	}
+	return pool, nil
 }
 
 func uniqueNonEmpty(values ...string) []string {

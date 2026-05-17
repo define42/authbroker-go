@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/caddyserver/certmagic"
 )
 
 const (
@@ -61,6 +63,7 @@ type Config struct {
 	MFA       MFAConfig        `json:"mfa"`
 	WebAuthn  WebAuthnConfig   `json:"webauthn"`
 	AppTokens []AppTokenConfig `json:"app_tokens,omitempty"`
+	ACME      ACMEConfig       `json:"acme,omitempty"`
 
 	AccessTokenTTLMinutes int `json:"access_token_ttl_minutes"`
 	IDTokenTTLMinutes     int `json:"id_token_ttl_minutes"`
@@ -90,7 +93,12 @@ type LDAPConfig struct {
 	GroupNameAttribute string `json:"group_name_attribute,omitempty"`
 	StartTLS           bool   `json:"start_tls,omitempty"`
 	InsecureSkipVerify bool   `json:"insecure_skip_verify,omitempty"`
-	TimeoutSeconds     int    `json:"timeout_seconds"`
+	// CACertPath points at a PEM file with one or more root certificates the
+	// broker must trust for the LDAP server's TLS certificate. Use this for
+	// internal/private CAs whose roots aren't in the system trust store.
+	// Empty means use the system pool only.
+	CACertPath     string `json:"ca_cert_path,omitempty"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
 }
 
 type Client struct {
@@ -111,6 +119,26 @@ type WebAuthnConfig struct {
 	RPID          string   `json:"rp_id"`           // e.g. "auth.example.com" or "localhost"
 	RPDisplayName string   `json:"rp_display_name"` // e.g. "Example Auth Broker"
 	Origins       []string `json:"origins"`         // e.g. ["https://auth.example.com"]
+}
+
+// ACMEConfig drives certmagic-managed TLS. When Enabled is true (and at least
+// one domain is set), the broker listens on HTTPSAddr for HTTPS and HTTPAddr
+// for HTTP-01 challenges plus a redirect-to-HTTPS handler; cfg.Listen is
+// ignored in that mode.
+type ACMEConfig struct {
+	Enabled     bool     `json:"enabled,omitempty"`
+	Domains     []string `json:"domains,omitempty"`
+	Email       string   `json:"email,omitempty"`
+	CADirectory string   `json:"ca_directory,omitempty"`
+	// CACertPath points at a PEM file with one or more root certificates the
+	// broker must trust when connecting to the ACME server. Use this for
+	// internal/private CAs (e.g. step-ca) whose roots aren't in the system
+	// trust store. Empty means use the system pool only.
+	CACertPath  string `json:"ca_cert_path,omitempty"`
+	StoragePath string `json:"storage_path,omitempty"`
+	HTTPAddr    string `json:"http_addr,omitempty"`
+	HTTPSAddr   string `json:"https_addr,omitempty"`
+	AgreedTOS   bool   `json:"agreed_tos,omitempty"`
 }
 
 type AppTokenConfig struct {
@@ -175,6 +203,7 @@ func normalizeConfig(cfg *Config) {
 			cfg.WebAuthn.Origins = []string{u.Scheme + "://" + u.Host}
 		}
 	}
+	normalizeACMEConfig(&cfg.ACME)
 	for i := range cfg.AppTokens {
 		if cfg.AppTokens[i].DisplayName == "" {
 			cfg.AppTokens[i].DisplayName = cfg.AppTokens[i].ID
@@ -191,6 +220,25 @@ func normalizeConfig(cfg *Config) {
 		if cfg.AppTokens[i].TokenTTLMinutes <= 0 {
 			cfg.AppTokens[i].TokenTTLMinutes = 480
 		}
+	}
+}
+
+func normalizeACMEConfig(acme *ACMEConfig) {
+	cleaned := acme.Domains[:0]
+	for _, d := range acme.Domains {
+		if d = strings.TrimSpace(d); d != "" {
+			cleaned = append(cleaned, d)
+		}
+	}
+	acme.Domains = cleaned
+	if acme.HTTPAddr == "" {
+		acme.HTTPAddr = ":80"
+	}
+	if acme.HTTPSAddr == "" {
+		acme.HTTPSAddr = ":443"
+	}
+	if strings.TrimSpace(acme.CADirectory) == "" {
+		acme.CADirectory = certmagic.LetsEncryptProductionCA
 	}
 }
 

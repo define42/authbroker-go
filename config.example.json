@@ -26,6 +26,7 @@
     "group_name_attribute": "cn",
     "start_tls": false,
     "insecure_skip_verify": false,
+    "ca_cert_path": "",
     "timeout_seconds": 5
   },
 
@@ -37,6 +38,18 @@
     "rp_id": "localhost",
     "rp_display_name": "Go Auth Broker",
     "origins": ["http://localhost:8080", "http://localhost:8091"]
+  },
+
+  "acme": {
+    "enabled": false,
+    "domains": ["auth.example.com"],
+    "email": "ops@example.com",
+    "agreed_tos": false,
+    "ca_directory": "https://acme-v02.api.letsencrypt.org/directory",
+    "ca_cert_path": "",
+    "storage_path": "",
+    "http_addr": ":80",
+    "https_addr": ":443"
   },
 
   "app_tokens": [

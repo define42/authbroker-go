@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -17,6 +19,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/caddyserver/certmagic"
 )
 
 type cliOptions struct {
@@ -68,7 +72,7 @@ func generateAndPrintKey() error {
 }
 
 func run(opts cliOptions) error {
-	broker, err := newConfiguredBroker(opts)
+	broker, dataDir, err := newConfiguredBroker(opts)
 	if err != nil {
 		return err
 	}
@@ -77,6 +81,11 @@ func run(opts cliOptions) error {
 	defer cleanup()
 
 	dumpRoutes()
+
+	if broker.cfg.ACME.Enabled && len(broker.cfg.ACME.Domains) > 0 {
+		return runACME(ctx, broker, dataDir, cleanup)
+	}
+
 	srv := newHTTPServer(broker)
 	shouldDrain, err := waitForServerStop(ctx, srv, broker)
 	if err != nil {
@@ -96,28 +105,144 @@ func run(opts cliOptions) error {
 	return nil
 }
 
-func newConfiguredBroker(opts cliOptions) (*Broker, error) {
+func newConfiguredBroker(opts cliOptions) (*Broker, string, error) {
 	cfg, err := loadConfig(opts.configPath)
 	if err != nil {
-		return nil, fmt.Errorf("load config: %w", err)
+		return nil, "", fmt.Errorf("load config: %w", err)
 	}
 	normalizeConfig(&cfg)
 	dataDir, err := resolveDataDir(opts.dataPath)
 	if err != nil {
-		return nil, fmt.Errorf("resolve data path: %w", err)
+		return nil, "", fmt.Errorf("resolve data path: %w", err)
 	}
 	if err := prepareSigningKeys(&cfg, dataDir, opts.rotateSigningKey); err != nil {
-		return nil, fmt.Errorf("prepare signing key: %w", err)
+		return nil, "", fmt.Errorf("prepare signing key: %w", err)
 	}
 	store, err := NewStore(filepath.Join(dataDir, defaultDataFile))
 	if err != nil {
-		return nil, fmt.Errorf("open store: %w", err)
+		return nil, "", fmt.Errorf("open store: %w", err)
 	}
 	broker, err := NewBroker(cfg, store)
 	if err != nil {
-		return nil, fmt.Errorf("new broker: %w", err)
+		return nil, "", fmt.Errorf("new broker: %w", err)
 	}
-	return broker, nil
+	return broker, dataDir, nil
+}
+
+// runACME serves the broker over HTTPS using certmagic-managed certificates,
+// with a parallel HTTP listener that solves ACME HTTP-01 challenges and
+// 301-redirects everything else to HTTPS. cfg.Listen is intentionally ignored
+// in this mode.
+func runACME(ctx context.Context, broker *Broker, dataDir string, cleanup func()) error {
+	acme := broker.cfg.ACME
+	if !acme.AgreedTOS {
+		return errors.New("acme: set \"agreed_tos\": true to accept the CA Subscriber Agreement")
+	}
+
+	storage := acme.StoragePath
+	if storage == "" {
+		if dataDir == "" {
+			return errors.New("acme: data dir is required when storage_path is unset")
+		}
+		storage = filepath.Join(dataDir, "acme")
+	}
+	if err := os.MkdirAll(storage, 0o700); err != nil {
+		return fmt.Errorf("create acme storage: %w", err)
+	}
+
+	trustedRoots, err := loadRootCAs(acme.CACertPath)
+	if err != nil {
+		return fmt.Errorf("acme ca cert: %w", err)
+	}
+
+	certmagic.Default.Storage = &certmagic.FileStorage{Path: storage}
+	certmagic.DefaultACME.Agreed = true
+	certmagic.DefaultACME.Email = acme.Email
+	certmagic.DefaultACME.CA = acme.CADirectory
+	certmagic.DefaultACME.TrustedRoots = trustedRoots
+	if trustedRoots != nil {
+		log.Printf("acme: trusting additional roots from %s", acme.CACertPath)
+	}
+	log.Printf("acme: using CA %s storage=%s domains=%v", acme.CADirectory, storage, acme.Domains)
+
+	magicCfg := certmagic.NewDefault()
+	if err := magicCfg.ManageAsync(ctx, acme.Domains); err != nil {
+		return fmt.Errorf("acme manage: %w", err)
+	}
+
+	tlsConfig := magicCfg.TLSConfig()
+	tlsConfig.NextProtos = append([]string{"h2", "http/1.1"}, tlsConfig.NextProtos...)
+
+	httpsSrv := &http.Server{
+		Addr:              acme.HTTPSAddr,
+		Handler:           broker.routes(),
+		TLSConfig:         tlsConfig,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	var httpHandler http.Handler = http.HandlerFunc(redirectToHTTPS)
+	if len(magicCfg.Issuers) > 0 {
+		if issuer, ok := magicCfg.Issuers[0].(*certmagic.ACMEIssuer); ok {
+			httpHandler = issuer.HTTPChallengeHandler(httpHandler)
+		}
+	}
+	httpSrv := &http.Server{
+		Addr:              acme.HTTPAddr,
+		Handler:           httpHandler,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	httpsListener, err := tls.Listen("tcp", acme.HTTPSAddr, tlsConfig)
+	if err != nil {
+		return fmt.Errorf("listen https %s: %w", acme.HTTPSAddr, err)
+	}
+	httpListener, err := net.Listen("tcp", acme.HTTPAddr)
+	if err != nil {
+		_ = httpsListener.Close()
+		return fmt.Errorf("listen http %s: %w", acme.HTTPAddr, err)
+	}
+
+	errCh := make(chan error, 2)
+	go func() {
+		log.Printf("auth broker listening on %s (https) for domains %v issuer=%s", acme.HTTPSAddr, acme.Domains, broker.cfg.Issuer)
+		if serveErr := httpsSrv.Serve(httpsListener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("https serve: %w", serveErr)
+		}
+	}()
+	go func() {
+		log.Printf("acme http listener on %s (challenge + redirect)", acme.HTTPAddr)
+		if serveErr := httpSrv.Serve(httpListener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("http serve: %w", serveErr)
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		log.Printf("shutdown signal received; draining")
+	case err := <-errCh:
+		return err
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := httpsSrv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("https shutdown: %v", err)
+	}
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("http shutdown: %v", err)
+	}
+	cleanup()
+	log.Printf("shutdown complete")
+	return nil
+}
+
+func redirectToHTTPS(w http.ResponseWriter, r *http.Request) {
+	host := r.Host
+	if i := strings.IndexByte(host, ':'); i != -1 {
+		host = host[:i]
+	}
+	w.Header().Set("Connection", "close")
+	http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusMovedPermanently)
 }
 
 func startSignalSweeper(broker *Broker) (context.Context, func()) {

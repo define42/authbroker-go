@@ -335,7 +335,11 @@ func dialLDAP(ctx context.Context, cfg LDAPConfig) (*ldap.Conn, error) {
 		timeout = 5 * time.Second
 	}
 	dialer := &net.Dialer{Timeout: timeout}
-	tlsConfig := &tls.Config{ServerName: u.Hostname(), InsecureSkipVerify: cfg.InsecureSkipVerify} //nolint:gosec // InsecureSkipVerify is operator-configurable for local LDAP fixtures.
+	rootCAs, err := loadRootCAs(cfg.CACertPath)
+	if err != nil {
+		return nil, fmt.Errorf("ldap ca cert: %w", err)
+	}
+	tlsConfig := &tls.Config{ServerName: u.Hostname(), InsecureSkipVerify: cfg.InsecureSkipVerify, RootCAs: rootCAs} //nolint:gosec // InsecureSkipVerify is operator-configurable for local LDAP fixtures.
 	conn, err := ldap.DialURL(cfg.URL, ldap.DialWithDialer(dialer), ldap.DialWithTLSConfig(tlsConfig))
 	if err != nil {
 		return nil, err
