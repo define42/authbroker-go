@@ -115,4 +115,3 @@ func TestBrokerPersistsRuntimeStateMutations(t *testing.T) {
 		t.Fatalf("persisted refresh tokens = %d, want 1", len(state.RefreshTokens))
 	}
 }
-
