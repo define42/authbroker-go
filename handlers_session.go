@@ -14,16 +14,12 @@ func (b *Broker) handleLoginGet(w http.ResponseWriter, r *http.Request) {
 	rid := r.URL.Query().Get("request_id")
 	clientID := "authbroker"
 	if rid != "" {
-		var ar AuthorizationRequest
-		_, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-			ar = state.AuthRequests[rid]
-			return false, nil
-		})
+		ar, ok, err := b.store.GetAuthRequest(rid)
 		if err != nil {
 			http.Error(w, "store error", http.StatusInternalServerError)
 			return
 		}
-		if ar.ID == "" || time.Now().After(ar.ExpiresAt) {
+		if !ok || time.Now().After(ar.ExpiresAt) {
 			http.Error(w, "login request expired", http.StatusBadRequest)
 			return
 		}
@@ -64,14 +60,8 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	var ar AuthorizationRequest
 	if oauthLogin {
 		var ok bool
-		_, persistErr := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-			ar, ok = state.AuthRequests[rid]
-			if !ok {
-				return false, nil
-			}
-			delete(state.AuthRequests, rid)
-			return true, nil
-		})
+		var persistErr error
+		ar, ok, persistErr = b.store.ConsumeAuthRequest(rid)
 		if persistErr != nil {
 			http.Error(w, "store error", http.StatusInternalServerError)
 			return
@@ -374,32 +364,28 @@ func (b *Broker) validSession(r *http.Request) (Session, bool) {
 	if err != nil || c.Value == "" {
 		return Session{}, false
 	}
-	var s Session
-	var valid bool
-	_, err = b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-		var ok bool
-		s, ok = state.Sessions[c.Value]
-		if !ok {
-			return false, nil
-		}
-		if time.Now().After(s.ExpiresAt) {
-			delete(state.Sessions, c.Value)
-			return true, nil
-		}
-		if s.CSRFToken == "" {
-			s.CSRFToken = randomB64(32)
-			state.Sessions[c.Value] = s
-			valid = true
-			return true, nil
-		}
-		valid = true
-		return false, nil
-	})
+	s, ok, err := b.store.GetSession(c.Value)
 	if err != nil {
 		log.Printf("load session state: %v", err)
 		return Session{}, false
 	}
-	return s, valid
+	if !ok {
+		return Session{}, false
+	}
+	if time.Now().After(s.ExpiresAt) {
+		if err := b.store.DeleteSession(c.Value); err != nil {
+			log.Printf("delete expired session: %v", err)
+		}
+		return Session{}, false
+	}
+	if s.CSRFToken == "" {
+		s.CSRFToken = randomB64(32)
+		if err := b.store.PutSession(c.Value, s); err != nil {
+			log.Printf("persist session csrf: %v", err)
+			return Session{}, false
+		}
+	}
+	return s, true
 }
 
 // markSessionReAuth refreshes the current session's ReAuthAt timestamp after a
@@ -409,16 +395,15 @@ func (b *Broker) markSessionReAuth(r *http.Request) error {
 	if err != nil || c.Value == "" {
 		return fmt.Errorf("no session")
 	}
-	_, err = b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-		s, ok := state.Sessions[c.Value]
-		if !ok {
-			return false, nil
-		}
-		s.ReAuthAt = time.Now()
-		state.Sessions[c.Value] = s
-		return true, nil
-	})
-	return err
+	s, ok, err := b.store.GetSession(c.Value)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	s.ReAuthAt = time.Now()
+	return b.store.PutSession(c.Value, s)
 }
 
 // sessionRecentlyReAuthenticated reports whether the session's ReAuthAt is
@@ -444,33 +429,29 @@ func (b *Broker) maybeExtendSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
-	var newExpiry time.Time
-	extended := false
-	_, err = b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-		s, ok := state.Sessions[c.Value]
-		if !ok {
-			return false, nil
-		}
-		if now.After(s.ExpiresAt) {
-			delete(state.Sessions, c.Value)
-			return true, nil
-		}
-		if s.ExpiresAt.Sub(now) > ttl/2 {
-			return false, nil
-		}
-		s.ExpiresAt = now.Add(ttl)
-		state.Sessions[c.Value] = s
-		newExpiry = s.ExpiresAt
-		extended = true
-		return true, nil
-	})
+	s, ok, err := b.store.GetSession(c.Value)
 	if err != nil {
+		log.Printf("load session for extension: %v", err)
+		return
+	}
+	if !ok {
+		return
+	}
+	if now.After(s.ExpiresAt) {
+		if err := b.store.DeleteSession(c.Value); err != nil {
+			log.Printf("delete expired session: %v", err)
+		}
+		return
+	}
+	if s.ExpiresAt.Sub(now) > ttl/2 {
+		return
+	}
+	s.ExpiresAt = now.Add(ttl)
+	if err := b.store.PutSession(c.Value, s); err != nil {
 		log.Printf("persist extended session: %v", err)
 		return
 	}
-	if !extended {
-		return
-	}
+	newExpiry := s.ExpiresAt
 
 	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure is controlled by issuer/config for local HTTP demos and HTTPS deployments.
 		Name:     sessionCookieName,
@@ -485,14 +466,7 @@ func (b *Broker) maybeExtendSession(w http.ResponseWriter, r *http.Request) {
 
 func (b *Broker) clearSession(w http.ResponseWriter, r *http.Request) error {
 	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
-		_, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-			if _, ok := state.Sessions[c.Value]; !ok {
-				return false, nil
-			}
-			delete(state.Sessions, c.Value)
-			return true, nil
-		})
-		if err != nil {
+		if err := b.store.DeleteSession(c.Value); err != nil {
 			return err
 		}
 	}
@@ -519,10 +493,7 @@ func (b *Broker) createSession(w http.ResponseWriter, userID string, freshlyAuth
 	if freshlyAuthenticated {
 		sess.ReAuthAt = now
 	}
-	if _, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-		state.Sessions[sid] = sess
-		return true, nil
-	}); err != nil {
+	if err := b.store.PutSession(sid, sess); err != nil {
 		return Session{}, err
 	}
 	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure is controlled by issuer/config for local HTTP demos and HTTPS deployments.
@@ -550,10 +521,7 @@ func (b *Broker) issueCodeRedirect(w http.ResponseWriter, r *http.Request, ar Au
 		AuthTime:            sess.AuthTime,
 		ExpiresAt:           time.Now().Add(time.Duration(b.cfg.AuthCodeTTLSeconds) * time.Second),
 	}
-	if _, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-		state.AuthCodes[hashSecret(code)] = ac
-		return true, nil
-	}); err != nil {
+	if err := b.store.PutAuthCode(hashSecret(code), ac); err != nil {
 		return err
 	}
 

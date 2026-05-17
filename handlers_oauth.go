@@ -77,11 +77,7 @@ func authorizePKCEError(client Client, challenge, method string) string {
 }
 
 func (b *Broker) putAuthRequest(ar AuthorizationRequest) error {
-	_, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-		state.AuthRequests[ar.ID] = ar
-		return true, nil
-	})
-	return err
+	return b.store.PutAuthRequest(ar)
 }
 
 func (b *Broker) handleToken(w http.ResponseWriter, r *http.Request) {
@@ -145,16 +141,7 @@ func (b *Broker) tokenAuthorizationCode(w http.ResponseWriter, r *http.Request, 
 	redirectURI := r.Form.Get("redirect_uri")
 	codeKey := hashSecret(code)
 
-	var ac AuthCode
-	var ok bool
-	_, persistErr := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-		ac, ok = state.AuthCodes[codeKey]
-		if !ok {
-			return false, nil
-		}
-		delete(state.AuthCodes, codeKey)
-		return true, nil
-	})
+	ac, ok, persistErr := b.store.ConsumeAuthCode(codeKey)
 	if persistErr != nil {
 		tokenServerError(w, "consume authorization code", persistErr)
 		return
@@ -192,41 +179,38 @@ func (b *Broker) tokenRefresh(w http.ResponseWriter, r *http.Request, client Cli
 	rt := r.Form.Get("refresh_token")
 	rtKey := hashSecret(rt)
 	requestedScope := strings.TrimSpace(r.Form.Get("scope"))
-	var old RefreshToken
-	var ok bool
-	invalidGrant := false
-	invalidScope := false
-	_, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-		old, ok = state.RefreshTokens[rtKey]
-		if !ok {
-			invalidGrant = true
-			return false, nil
+	old, ok, err := b.store.GetRefreshToken(rtKey)
+	if err != nil {
+		tokenServerError(w, "load refresh token", err)
+		return
+	}
+	if !ok {
+		tokenError(w, "invalid_grant", "invalid refresh_token")
+		return
+	}
+	if time.Now().After(old.ExpiresAt) || old.ClientID != client.ClientID {
+		if _, err := b.store.DeleteRefreshToken(rtKey); err != nil {
+			tokenServerError(w, "burn refresh token", err)
+			return
 		}
-		if time.Now().After(old.ExpiresAt) || old.ClientID != client.ClientID {
-			delete(state.RefreshTokens, rtKey)
-			invalidGrant = true
-			return true, nil
-		}
-		// Per RFC 6749 §6, the client may request a narrower scope on refresh,
-		// but never one that exceeds the original grant. Reject scope expansion
-		// without consuming the refresh token so the legitimate client can retry.
-		if requestedScope != "" && !scopeSubset(requestedScope, old.Scope) {
-			invalidScope = true
-			return false, nil
-		}
-		delete(state.RefreshTokens, rtKey) // refresh token rotation
-		return true, nil
-	})
+		tokenError(w, "invalid_grant", "invalid refresh_token")
+		return
+	}
+	// Per RFC 6749 §6, the client may request a narrower scope on refresh,
+	// but never one that exceeds the original grant. Reject scope expansion
+	// without consuming the refresh token so the legitimate client can retry.
+	if requestedScope != "" && !scopeSubset(requestedScope, old.Scope) {
+		tokenError(w, "invalid_scope", "requested scope exceeds original grant")
+		return
+	}
+	// Single-use rotation: only the request that wins the CAS proceeds.
+	deleted, err := b.store.DeleteRefreshToken(rtKey)
 	if err != nil {
 		tokenServerError(w, "rotate refresh token", err)
 		return
 	}
-	if invalidGrant {
+	if !deleted {
 		tokenError(w, "invalid_grant", "invalid refresh_token")
-		return
-	}
-	if invalidScope {
-		tokenError(w, "invalid_scope", "requested scope exceeds original grant")
 		return
 	}
 	scope := old.Scope
@@ -359,10 +343,7 @@ func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime
 			AuthTime:  authTime,
 			ExpiresAt: now.Add(time.Duration(b.cfg.RefreshTokenTTLDays) * 24 * time.Hour),
 		}
-		if _, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-			state.RefreshTokens[hashSecret(rt)] = refreshToken
-			return true, nil
-		}); err != nil {
+		if err := b.store.PutRefreshToken(hashSecret(rt), refreshToken); err != nil {
 			return nil, err
 		}
 		resp["refresh_token"] = rt
@@ -492,13 +473,14 @@ func (b *Broker) revokeRefreshToken(tok string, client Client) error {
 		return nil
 	}
 	key := hashSecret(tok)
-	_, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-		if rt, ok := state.RefreshTokens[key]; ok && rt.ClientID == client.ClientID {
-			delete(state.RefreshTokens, key)
-			return true, nil
-		}
-		return false, nil
-	})
+	rt, ok, err := b.store.GetRefreshToken(key)
+	if err != nil {
+		return err
+	}
+	if !ok || rt.ClientID != client.ClientID {
+		return nil
+	}
+	_, err = b.store.DeleteRefreshToken(key)
 	return err
 }
 
@@ -513,11 +495,7 @@ func (b *Broker) revokeJWT(tok string, client Client) error {
 	if aud != client.ClientID || jti == "" || !ok {
 		return nil
 	}
-	_, err = b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-		state.RevokedJTIs[jti] = time.Unix(expUnix, 0)
-		return true, nil
-	})
-	return err
+	return b.store.PutRevokedJTI(jti, time.Unix(expUnix, 0))
 }
 
 func clientAllowsRedirect(c Client, redirectURI string) bool {

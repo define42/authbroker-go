@@ -34,11 +34,7 @@ func (b *Broker) handleWebAuthnRegisterBegin(w http.ResponseWriter, r *http.Requ
 	challenge := randomB64(32)
 	// Key by challenge (not user ID) so parallel registration attempts from
 	// the same account don't overwrite one another's challenge state.
-	_, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-		state.WebAuthnReg[challenge] = ChallengeRecord{UserID: sess.UserID, Challenge: challenge, ExpiresAt: time.Now().Add(5 * time.Minute)}
-		return true, nil
-	})
-	if err != nil {
+	if err := b.store.PutWebAuthnRegistration(challenge, ChallengeRecord{UserID: sess.UserID, Challenge: challenge, ExpiresAt: time.Now().Add(5 * time.Minute)}); err != nil {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
@@ -98,16 +94,7 @@ func (b *Broker) handleWebAuthnRegisterFinish(w http.ResponseWriter, r *http.Req
 	}
 	challenge := normalizeChallenge(cd.Challenge)
 
-	var ch ChallengeRecord
-	var found bool
-	_, persistErr := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-		ch, found = state.WebAuthnReg[challenge]
-		if !found {
-			return false, nil
-		}
-		delete(state.WebAuthnReg, challenge)
-		return true, nil
-	})
+	ch, found, persistErr := b.store.ConsumeWebAuthnRegistration(challenge)
 	if persistErr != nil {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
@@ -153,11 +140,7 @@ func (b *Broker) handleWebAuthnLoginBegin(w http.ResponseWriter, r *http.Request
 		userID = user.Username
 	}
 	challenge := randomB64(32)
-	_, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-		state.WebAuthnLog[challenge] = ChallengeRecord{UserID: userID, Challenge: challenge, ExpiresAt: time.Now().Add(5 * time.Minute)}
-		return true, nil
-	})
-	if err != nil {
+	if err := b.store.PutWebAuthnLogin(challenge, ChallengeRecord{UserID: userID, Challenge: challenge, ExpiresAt: time.Now().Add(5 * time.Minute)}); err != nil {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
@@ -195,16 +178,7 @@ func (b *Broker) handleWebAuthnLoginFinish(w http.ResponseWriter, r *http.Reques
 	}
 	challenge := normalizeChallenge(cd.Challenge)
 
-	var ch ChallengeRecord
-	var ok bool
-	_, persistErr := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-		ch, ok = state.WebAuthnLog[challenge]
-		if !ok {
-			return false, nil
-		}
-		delete(state.WebAuthnLog, challenge)
-		return true, nil
-	})
+	ch, ok, persistErr := b.store.ConsumeWebAuthnLogin(challenge)
 	if persistErr != nil {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return

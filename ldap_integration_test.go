@@ -379,13 +379,10 @@ func TestDiscoveryAdvertisesEndSessionEndpoint(t *testing.T) {
 
 func TestBrokerLogoutClearsSessionAndRedirects(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	if _, err := broker.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-		state.Sessions["logout-session"] = Session{
-			UserID:    "johndoe",
-			ExpiresAt: time.Now().Add(time.Hour),
-			AuthTime:  time.Now(),
-		}
-		return true, nil
+	if err := broker.store.PutSession("logout-session", Session{
+		UserID:    "johndoe",
+		ExpiresAt: time.Now().Add(time.Hour),
+		AuthTime:  time.Now(),
 	}); err != nil {
 		t.Fatalf("seed session: %v", err)
 	}
@@ -414,7 +411,7 @@ func TestBrokerLogoutClearsSessionAndRedirects(t *testing.T) {
 	if location := rr.Header().Get("Location"); location != "http://app.example/?state=logout-state" {
 		t.Fatalf("Location = %q", location)
 	}
-	if _, stillActive := broker.store.RuntimeState().Sessions["logout-session"]; stillActive {
+	if _, stillActive := broker.store.RuntimeSnapshot().Sessions["logout-session"]; stillActive {
 		t.Fatalf("broker session was not cleared")
 	}
 	assertDeletedCookie(t, rr, sessionCookieName)
@@ -603,7 +600,7 @@ func TestBrokerStandaloneLoginAndLogoutPages(t *testing.T) {
 		t.Fatalf("expected logout status 302, got %d: %s", logoutRR.Code, logoutRR.Body.String())
 	}
 	assertDeletedCookie(t, logoutRR, sessionCookieName)
-	if _, stillActive := broker.store.RuntimeState().Sessions[sessionCookie.Value]; stillActive {
+	if _, stillActive := broker.store.RuntimeSnapshot().Sessions[sessionCookie.Value]; stillActive {
 		t.Fatalf("standalone logout did not remove broker session")
 	}
 }
@@ -752,7 +749,7 @@ func TestLDAPBrokerOAuthIntegration(t *testing.T) {
 		if location := resp.Header.Get("Location"); location != "" {
 			t.Fatalf("failed login should not redirect, got Location %q", location)
 		}
-		if authCodes := len(broker.store.RuntimeState().AuthCodes); authCodes != 0 {
+		if authCodes := len(broker.store.RuntimeSnapshot().AuthCodes); authCodes != 0 {
 			t.Fatalf("failed login issued %d auth codes", authCodes)
 		}
 	})
@@ -910,10 +907,11 @@ func codeFromRedirect(location string) (string, error) {
 func newLogoutTestBroker(t *testing.T) *Broker {
 	t.Helper()
 
-	store, err := NewStore("")
+	store, err := NewStore(filepath.Join(t.TempDir(), defaultDataFile))
 	if err != nil {
 		t.Fatalf("create store: %v", err)
 	}
+	t.Cleanup(func() { _ = store.Close() })
 	cfg := Config{
 		Issuer:       "http://broker.example",
 		Listen:       ":0",
@@ -979,10 +977,11 @@ func startTestBroker(ctx context.Context, t *testing.T, ldapCfg LDAPConfig) (str
 		t.Fatalf("listen for broker: %v", err)
 	}
 	baseURL := "http://" + listener.Addr().String()
-	store, err := NewStore("")
+	store, err := NewStore(filepath.Join(t.TempDir(), defaultDataFile))
 	if err != nil {
 		t.Fatalf("create store: %v", err)
 	}
+	t.Cleanup(func() { _ = store.Close() })
 	cfg := Config{
 		Issuer:       baseURL,
 		Listen:       ":0",

@@ -174,30 +174,10 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 // sweepExpired removes expired entries from shared runtime state so abandoned
 // grants do not accumulate indefinitely.
 func (b *Broker) sweepExpired(now time.Time) {
-	if _, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-		changed := sweepExpiredMap(state.Sessions, now, func(v Session) time.Time { return v.ExpiresAt })
-		changed = sweepExpiredMap(state.AuthRequests, now, func(v AuthorizationRequest) time.Time { return v.ExpiresAt }) || changed
-		changed = sweepExpiredMap(state.AuthCodes, now, func(v AuthCode) time.Time { return v.ExpiresAt }) || changed
-		changed = sweepExpiredMap(state.RefreshTokens, now, func(v RefreshToken) time.Time { return v.ExpiresAt }) || changed
-		changed = sweepExpiredMap(state.RevokedJTIs, now, func(v time.Time) time.Time { return v }) || changed
-		changed = sweepExpiredMap(state.WebAuthnReg, now, func(v ChallengeRecord) time.Time { return v.ExpiresAt }) || changed
-		changed = sweepExpiredMap(state.WebAuthnLog, now, func(v ChallengeRecord) time.Time { return v.ExpiresAt }) || changed
-		return changed, nil
-	}); err != nil {
+	if _, err := b.store.SweepExpired(now); err != nil {
 		log.Printf("persist runtime state after sweep: %v", err)
 	}
 	b.loginLimiter.sweep(now)
-}
-
-func sweepExpiredMap[T any](m map[string]T, now time.Time, expiresAt func(T) time.Time) bool {
-	changed := false
-	for k, v := range m {
-		if now.After(expiresAt(v)) {
-			delete(m, k)
-			changed = true
-		}
-	}
-	return changed
 }
 
 // startBackgroundSweeper periodically calls sweepExpired until ctx is done.

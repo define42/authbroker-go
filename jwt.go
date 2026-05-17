@@ -149,24 +149,20 @@ func (b *Broker) verifyTokenNotRevoked(claims map[string]any) error {
 	if jti == "" {
 		return nil
 	}
-	var revoked bool
-	_, err := b.store.UpdateRuntimeState(func(state *StoredRuntimeState) (bool, error) {
-		exp, found := state.RevokedJTIs[jti]
-		revoked = found
-		if found && time.Now().After(exp) {
-			delete(state.RevokedJTIs, jti)
-			revoked = false
-			return true, nil
-		}
-		return false, nil
-	})
+	exp, found, err := b.store.GetRevokedJTI(jti)
 	if err != nil {
 		return err
 	}
-	if revoked {
-		return fmt.Errorf("token revoked")
+	if !found {
+		return nil
 	}
-	return nil
+	if time.Now().After(exp) {
+		if err := b.store.DeleteRevokedJTI(jti); err != nil {
+			return err
+		}
+		return nil
+	}
+	return fmt.Errorf("token revoked")
 }
 
 func numberClaim(v any) (int64, bool) {

@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/caddyserver/certmagic v0.25.3
 	github.com/go-ldap/ldap/v3 v3.4.13
+	go.etcd.io/bbolt v1.4.3
 )
 
 require (

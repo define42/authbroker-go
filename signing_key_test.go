@@ -246,10 +246,12 @@ func TestResolveDataDirRejectsFile(t *testing.T) {
 
 func mustNewStore(t *testing.T) *Store {
 	t.Helper()
-	store, err := NewStore("")
+	path := filepath.Join(t.TempDir(), defaultDataFile)
+	store, err := NewStore(path)
 	if err != nil {
 		t.Fatalf("create store: %v", err)
 	}
+	t.Cleanup(func() { _ = store.Close() })
 	return store
 }
 

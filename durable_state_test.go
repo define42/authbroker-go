@@ -31,14 +31,18 @@ func TestBrokerLoadsDurableRuntimeState(t *testing.T) {
 			"jti": now.Add(time.Hour),
 		},
 	}
-	if err := store.ReplaceRuntimeState(state); err != nil {
+	if err := store.SeedRuntimeState(state); err != nil {
 		t.Fatalf("persist runtime state: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
 	}
 
 	reloaded, err := NewStore(path)
 	if err != nil {
 		t.Fatalf("reload store: %v", err)
 	}
+	t.Cleanup(func() { _ = reloaded.Close() })
 	broker, err := NewBroker(Config{
 		Issuer:        "http://broker.example",
 		KeyID:         "test-key",
@@ -48,7 +52,7 @@ func TestBrokerLoadsDurableRuntimeState(t *testing.T) {
 		t.Fatalf("create broker: %v", err)
 	}
 
-	got := broker.store.RuntimeState()
+	got := broker.store.RuntimeSnapshot()
 	if user := got.Sessions["sid"].UserID; user != "johndoe" {
 		t.Fatalf("loaded session user = %q, want johndoe", user)
 	}
@@ -100,12 +104,16 @@ func TestBrokerPersistsRuntimeStateMutations(t *testing.T) {
 	if _, err := broker.issueUserTokens("johndoe", "demo-web", "openid offline_access", "", sess.AuthTime, true); err != nil {
 		t.Fatalf("issue user tokens: %v", err)
 	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
 
 	reloaded, err := NewStore(path)
 	if err != nil {
 		t.Fatalf("reload store: %v", err)
 	}
-	state := reloaded.RuntimeState()
+	t.Cleanup(func() { _ = reloaded.Close() })
+	state := reloaded.RuntimeSnapshot()
 	if len(state.Sessions) != 1 {
 		t.Fatalf("persisted sessions = %d, want 1", len(state.Sessions))
 	}

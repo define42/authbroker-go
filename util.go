@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -69,6 +70,54 @@ func loadRootCAs(path string) (*x509.CertPool, error) {
 		return nil, fmt.Errorf("no PEM certificates parsed from %q", path)
 	}
 	return pool, nil
+}
+
+// writeFileAtomic writes content to path via a temp file in the same dir,
+// fsyncs, and atomically renames into place. Used for human-editable files
+// outside the bbolt store (signing keys, etc.).
+func writeFileAtomic(path string, content []byte, perm os.FileMode) (err error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		if err != nil {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(content); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	return syncDir(dir)
+}
+
+func syncDir(dir string) error {
+	dirFile, err := os.Open(dir) //nolint:gosec // directory path is derived from operator-supplied data directory.
+	if err != nil {
+		return err
+	}
+	defer dirFile.Close()
+	return dirFile.Sync()
 }
 
 func uniqueNonEmpty(values ...string) []string {

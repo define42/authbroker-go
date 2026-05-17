@@ -34,7 +34,7 @@ The same paths can be supplied through environment variables:
 AUTHBROKER_CONFIG=config.example.json AUTHBROKER_DATA=data go run .
 ```
 
-`AUTHBROKER_DATA` points at a data directory. The broker stores users, MFA secrets, WebAuthn credentials and challenge state, sessions, OAuth authorization state, refresh tokens, and revoked token IDs in `data.json` using atomic file replacement. Managed signing keys live in `signing-keys.json` inside the same directory. The broker is single-instance: only one process should run against a given `AUTHBROKER_DATA` directory at a time.
+`AUTHBROKER_DATA` points at a data directory. The broker stores users, MFA secrets, WebAuthn credentials and challenge state, sessions, OAuth authorization state, refresh tokens, and revoked token IDs in `data.db`, a [bbolt](https://github.com/etcd-io/bbolt) (BoltDB) embedded key-value store. Managed signing keys live in `signing-keys.json` inside the same directory. The broker is single-instance: only one process should run against a given `AUTHBROKER_DATA` directory at a time — bbolt holds an exclusive file lock on `data.db` and will refuse to open it from a second process.
 
 Browser pages serve first-party CSS/JS under a strict Content-Security-Policy. Login uses a double-submit CSRF cookie, and authenticated browser forms such as logout and app-token generation use the session CSRF token.
 
@@ -77,7 +77,7 @@ The broker can terminate TLS itself via [certmagic](https://github.com/caddyserv
 - `agreed_tos` must be `true` — this signifies acceptance of the CA's Subscriber Agreement.
 - `ca_directory` defaults to Let's Encrypt production (`https://acme-v02.api.letsencrypt.org/directory`). Set it to `https://acme-staging-v02.api.letsencrypt.org/directory` while testing to avoid rate limits, or point it at any other ACME-compatible CA (e.g. ZeroSSL, Buypass, an internal step-ca).
 - `ca_cert_path` points at a PEM file with one or more root certificates the broker should trust when reaching the ACME server. Use this for internal CAs whose roots aren't in the system trust store; leave empty to rely solely on the system pool.
-- `storage_path` defaults to `<AUTHBROKER_DATA>/acme`. The account key, certificates, and locks live there — back this up alongside `data.json` and `signing-keys.json`.
+- `storage_path` defaults to `<AUTHBROKER_DATA>/acme`. The account key, certificates, and locks live there — back this up alongside `data.db` and `signing-keys.json`.
 - `http_addr` / `https_addr` only need overriding for non-standard ports; ACME challenges still require `:80` / `:443` to reach the broker (port forwarding is fine).
 - Set `issuer` to `https://<domain>` so OIDC discovery, redirects, and WebAuthn origins match the served scheme.
 - The process needs permission to bind low ports — run as root, grant `CAP_NET_BIND_SERVICE`, or use a systemd `AmbientCapabilities=CAP_NET_BIND_SERVICE` unit.

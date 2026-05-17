@@ -21,7 +21,7 @@ const (
 
 	defaultConfigPath = "config.json"
 	defaultDataDir    = "data"
-	defaultDataFile   = "data.json"
+	defaultDataFile   = "data.db"
 	defaultKeysPath   = "signing-keys.json"
 	envConfigPath     = "AUTHBROKER_CONFIG"
 	envDataPath       = "AUTHBROKER_DATA"

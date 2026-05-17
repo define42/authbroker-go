@@ -77,6 +77,11 @@ func run(opts cliOptions) error {
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if cerr := broker.store.Close(); cerr != nil {
+			log.Printf("close store: %v", cerr)
+		}
+	}()
 
 	ctx, cleanup := startSignalSweeper(broker)
 	defer cleanup()
