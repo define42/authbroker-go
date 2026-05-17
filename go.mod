@@ -1,4 +1,4 @@
-module authbroker-go
+module github.com/define42/authbroker-go
 
 go 1.25.0
 
