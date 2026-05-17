@@ -379,11 +379,15 @@ func (b *Broker) validSession(r *http.Request) (Session, bool) {
 		return Session{}, false
 	}
 	if s.CSRFToken == "" {
-		s.CSRFToken = randomB64(32)
-		if err := b.store.PutSession(c.Value, s); err != nil {
+		migrated, ok, err := b.store.EnsureSessionCSRF(c.Value, func() string { return randomB64(32) })
+		if err != nil {
 			log.Printf("persist session csrf: %v", err)
 			return Session{}, false
 		}
+		if !ok {
+			return Session{}, false
+		}
+		s = migrated
 	}
 	return s, true
 }

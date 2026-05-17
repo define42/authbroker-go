@@ -56,10 +56,20 @@ func compileGroupMappings(in map[string]string) *compiledGroupMappings {
 	return compiled
 }
 
+// maxGroupMappingsPerClient bounds how many group_mappings entries a single
+// client or app token may declare. Each user-supplied regex is RE2 (no
+// catastrophic backtracking) but still costs CPU on every token issuance, and
+// the LDAP-DN matchers walk the user's group list once per mapping. Capping
+// the count keeps the per-request cost bounded.
+const maxGroupMappingsPerClient = 64
+
 //nolint:gocognit,cyclop // Validation branches mirror the supported group mapping forms.
 func normalizeClientGroupMappings(in map[string]string) (map[string]string, error) {
 	if len(in) == 0 {
 		return nil, nil
+	}
+	if len(in) > maxGroupMappingsPerClient {
+		return nil, fmt.Errorf("group_mappings has %d entries; limit is %d", len(in), maxGroupMappingsPerClient)
 	}
 	out := map[string]string{}
 	seenSources := map[string]string{}

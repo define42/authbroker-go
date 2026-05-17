@@ -230,6 +230,33 @@ func (s *Store) PutSession(sid string, sess Session) error {
 	})
 }
 
+// EnsureSessionCSRF lazily backfills a CSRF token on legacy sessions that were
+// persisted before createSession started populating CSRFToken. The read-modify-
+// write happens inside a single bbolt transaction so two concurrent callers on
+// the same session cannot race to install different tokens — the second tx
+// observes the value the first committed and returns it unchanged.
+func (s *Store) EnsureSessionCSRF(sid string, generate func() string) (Session, bool, error) {
+	var sess Session
+	var found bool
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := bucket(tx, bucketSessions)
+		v := b.Get([]byte(sid))
+		if v == nil {
+			return nil
+		}
+		if err := json.Unmarshal(v, &sess); err != nil {
+			return err
+		}
+		found = true
+		if sess.CSRFToken != "" {
+			return nil
+		}
+		sess.CSRFToken = generate()
+		return putJSON(b, []byte(sid), sess)
+	})
+	return sess, found, err
+}
+
 func (s *Store) DeleteSession(sid string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		return bucket(tx, bucketSessions).Delete([]byte(sid))

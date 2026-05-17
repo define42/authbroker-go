@@ -19,6 +19,12 @@ const (
 	cborMap
 )
 
+// maxCBORDepth caps how deeply parseCBOR will recurse into nested arrays/maps.
+// Real WebAuthn attestation and COSE_Key payloads never exceed a handful of
+// levels; bounding this prevents a pathological input from exhausting the
+// goroutine stack on small GOMAXPROCS deployments.
+const maxCBORDepth = 32
+
 type cborValue struct {
 	kind       cborKind
 	intValue   int64
@@ -28,8 +34,15 @@ type cborValue struct {
 	mapValue   map[any]cborValue
 }
 
-//nolint:gocognit,cyclop,funlen // This minimal CBOR decoder is deliberately local and explicit for WebAuthn.
 func parseCBOR(data []byte) (cborValue, []byte, error) {
+	return parseCBORDepth(data, 0)
+}
+
+//nolint:gocognit,cyclop,funlen // This minimal CBOR decoder is deliberately local and explicit for WebAuthn.
+func parseCBORDepth(data []byte, depth int) (cborValue, []byte, error) {
+	if depth > maxCBORDepth {
+		return cborValue{}, nil, fmt.Errorf("cbor nesting too deep")
+	}
 	if len(data) == 0 {
 		return cborValue{}, nil, io.ErrUnexpectedEOF
 	}
@@ -72,7 +85,7 @@ func parseCBOR(data []byte) (cborValue, []byte, error) {
 		arr := make([]cborValue, 0, n)
 		cur := rest
 		for i := uint64(0); i < n; i++ {
-			v, r, err := parseCBOR(cur)
+			v, r, err := parseCBORDepth(cur, depth+1)
 			if err != nil {
 				return cborValue{}, nil, err
 			}
@@ -89,12 +102,12 @@ func parseCBOR(data []byte) (cborValue, []byte, error) {
 		m := make(map[any]cborValue, n)
 		cur := rest
 		for i := uint64(0); i < n; i++ {
-			k, r, err := parseCBOR(cur)
+			k, r, err := parseCBORDepth(cur, depth+1)
 			if err != nil {
 				return cborValue{}, nil, err
 			}
 			cur = r
-			v, r, err := parseCBOR(cur)
+			v, r, err := parseCBORDepth(cur, depth+1)
 			if err != nil {
 				return cborValue{}, nil, err
 			}

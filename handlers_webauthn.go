@@ -311,7 +311,12 @@ func (b *Broker) verifyWebAuthnAssertion(req webauthnAssertionResponse, username
 	if err != nil {
 		return err
 	}
-	if cred.SignCount != 0 && signCount != 0 && signCount <= cred.SignCount {
+	// Once the authenticator has ever reported a non-zero signCount, every
+	// subsequent assertion must strictly increase it. A regression to 0 (or to
+	// any earlier value) is treated as a possible cloning indicator. The
+	// "always-zero" authenticator class is still accepted because stored
+	// SignCount stays 0 across all assertions.
+	if cred.SignCount > 0 && signCount <= cred.SignCount {
 		return fmt.Errorf("signature counter did not increase")
 	}
 	signature, err := decodeB64URL(req.Response.Signature)
