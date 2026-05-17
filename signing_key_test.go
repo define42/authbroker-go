@@ -14,9 +14,10 @@ import (
 
 func TestPrepareSigningKeysCreatesAndReusesKeySet(t *testing.T) {
 	dataDir := t.TempDir()
+	store := newStoreInDir(t, dataDir)
 	cfg := Config{}
 
-	if err := prepareSigningKeys(&cfg, dataDir, false); err != nil {
+	if err := prepareSigningKeys(&cfg, store, dataDir, false); err != nil {
 		t.Fatalf("prepare signing keys: %v", err)
 	}
 	if cfg.SigningKeyPEM != "" {
@@ -28,15 +29,15 @@ func TestPrepareSigningKeysCreatesAndReusesKeySet(t *testing.T) {
 	if cfg.KeyID != cfg.SigningKeys[0].KeyID {
 		t.Fatalf("cfg.KeyID = %q, want active key %q", cfg.KeyID, cfg.SigningKeys[0].KeyID)
 	}
-	keySetPath, keySet := readManagedKeySet(t, dataDir)
+	keySet := readStoredKeySet(t, store)
 	if keySet.ActiveKeyID != cfg.KeyID || len(keySet.Keys) != 1 {
 		t.Fatalf("generated key set = %#v, want one active key", keySet)
 	}
 	requireRSAKeyBits(t, cfg.SigningKeys[0].SigningKeyPEM, 2048)
-	requirePrivateFile(t, keySetPath)
+	requireNoLegacyKeyFile(t, dataDir)
 
 	reloadedCfg := Config{}
-	if err := prepareSigningKeys(&reloadedCfg, dataDir, false); err != nil {
+	if err := prepareSigningKeys(&reloadedCfg, store, dataDir, false); err != nil {
 		t.Fatalf("prepare signing keys again: %v", err)
 	}
 	if len(reloadedCfg.SigningKeys) != 1 || reloadedCfg.SigningKeys[0].SigningKeyPEM != cfg.SigningKeys[0].SigningKeyPEM {
@@ -44,18 +45,16 @@ func TestPrepareSigningKeysCreatesAndReusesKeySet(t *testing.T) {
 	}
 }
 
-func readManagedKeySet(t *testing.T, dataDir string) (string, managedSigningKeySet) {
+func readStoredKeySet(t *testing.T, store *Store) managedSigningKeySet {
 	t.Helper()
-	keySetPath := filepath.Join(dataDir, defaultKeysPath)
-	keySetBytes, err := os.ReadFile(keySetPath) //nolint:gosec // Test reads a file in t.TempDir.
+	keySet, ok, err := store.GetSigningKeySet()
 	if err != nil {
-		t.Fatalf("read generated key set: %v", err)
+		t.Fatalf("read stored key set: %v", err)
 	}
-	var keySet managedSigningKeySet
-	if err := json.Unmarshal(keySetBytes, &keySet); err != nil {
-		t.Fatalf("decode generated key set: %v", err)
+	if !ok {
+		t.Fatal("expected a signing key set in store, got none")
 	}
-	return keySetPath, keySet
+	return keySet
 }
 
 func requireRSAKeyBits(t *testing.T, keyPEM string, bits int) {
@@ -69,19 +68,16 @@ func requireRSAKeyBits(t *testing.T, keyPEM string, bits int) {
 	}
 }
 
-func requirePrivateFile(t *testing.T, path string) {
+func requireNoLegacyKeyFile(t *testing.T, dataDir string) {
 	t.Helper()
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat generated key set: %v", err)
-	}
-	if mode := info.Mode().Perm(); mode&0o077 != 0 {
-		t.Fatalf("generated key set permissions = %v, want no group/world access", mode)
+	if _, err := os.Stat(filepath.Join(dataDir, defaultKeysPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy signing-keys.json should not exist after store-backed run: %v", err)
 	}
 }
 
 func TestPrepareSigningKeysLeavesConfiguredKeyAlone(t *testing.T) {
 	dataDir := t.TempDir()
+	store := newStoreInDir(t, dataDir)
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatalf("generate configured key: %v", err)
@@ -92,14 +88,83 @@ func TestPrepareSigningKeysLeavesConfiguredKeyAlone(t *testing.T) {
 	}
 	cfg := Config{SigningKeyPEM: string(keyPEM)}
 
-	if err := prepareSigningKeys(&cfg, dataDir, false); err != nil {
+	if err := prepareSigningKeys(&cfg, store, dataDir, false); err != nil {
 		t.Fatalf("prepare signing keys: %v", err)
 	}
 	if cfg.SigningKeyPEM != string(keyPEM) {
 		t.Fatal("configured signing key was changed")
 	}
-	if _, err := os.Stat(filepath.Join(dataDir, defaultKeysPath)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("generated key set exists for configured key: %v", err)
+	if _, ok, err := store.GetSigningKeySet(); err != nil {
+		t.Fatalf("get stored key set: %v", err)
+	} else if ok {
+		t.Fatal("store should be empty when an operator-configured key is in use")
+	}
+}
+
+func TestPrepareSigningKeysMigratesLegacyFile(t *testing.T) {
+	dataDir := t.TempDir()
+	store := newStoreInDir(t, dataDir)
+
+	legacyKey, err := newManagedSigningKey("legacy", time.Now())
+	if err != nil {
+		t.Fatalf("create legacy key: %v", err)
+	}
+	legacySet := managedSigningKeySet{ActiveKeyID: legacyKey.KeyID, Keys: []managedSigningKey{legacyKey}}
+	legacyPath := filepath.Join(dataDir, defaultKeysPath)
+	legacyBytes, err := json.MarshalIndent(legacySet, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal legacy set: %v", err)
+	}
+	if err := os.WriteFile(legacyPath, legacyBytes, 0o600); err != nil {
+		t.Fatalf("write legacy file: %v", err)
+	}
+
+	cfg := Config{}
+	if err := prepareSigningKeys(&cfg, store, dataDir, false); err != nil {
+		t.Fatalf("prepare signing keys: %v", err)
+	}
+
+	if cfg.KeyID != legacyKey.KeyID {
+		t.Fatalf("cfg.KeyID = %q, want migrated key %q", cfg.KeyID, legacyKey.KeyID)
+	}
+	stored := readStoredKeySet(t, store)
+	if stored.ActiveKeyID != legacyKey.KeyID || len(stored.Keys) != 1 {
+		t.Fatalf("stored key set after migration = %#v, want migrated single key", stored)
+	}
+	if stored.Keys[0].SigningKeyPEM != legacyKey.SigningKeyPEM {
+		t.Fatal("migrated PEM does not match original legacy PEM")
+	}
+	if _, err := os.Stat(legacyPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy file should be renamed after migration: %v", err)
+	}
+	if _, err := os.Stat(legacyPath + ".migrated"); err != nil {
+		t.Fatalf("expected renamed legacy file at %s.migrated: %v", legacyPath, err)
+	}
+}
+
+func TestPrepareSigningKeysRejectsCorruptLegacyFile(t *testing.T) {
+	dataDir := t.TempDir()
+	store := newStoreInDir(t, dataDir)
+
+	legacyPath := filepath.Join(dataDir, defaultKeysPath)
+	if err := os.WriteFile(legacyPath, []byte("not json"), 0o600); err != nil {
+		t.Fatalf("write corrupt legacy file: %v", err)
+	}
+
+	err := prepareSigningKeys(&Config{}, store, dataDir, false)
+	if err == nil {
+		t.Fatal("prepareSigningKeys accepted a corrupt legacy file")
+	}
+	if !strings.Contains(err.Error(), defaultKeysPath) {
+		t.Fatalf("error %q should mention the legacy file path", err)
+	}
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Fatalf("corrupt legacy file should be left in place for inspection: %v", err)
+	}
+	if _, ok, err := store.GetSigningKeySet(); err != nil {
+		t.Fatalf("get stored key set: %v", err)
+	} else if ok {
+		t.Fatal("store should remain empty when migration fails")
 	}
 }
 
@@ -125,7 +190,8 @@ func TestBuildSigningKeySetActiveFlagOverridesKeyID(t *testing.T) {
 func TestPrepareSigningKeysRotatesAndKeepsOldJWKSKey(t *testing.T) {
 	now := time.Now()
 	dataDir := t.TempDir()
-	oldKey, oldToken := seedOldSigningKeySet(t, dataDir, now)
+	store := newStoreInDir(t, dataDir)
+	oldKey, oldToken := seedOldSigningKeySet(t, store, now)
 
 	cfg := Config{
 		Issuer:                  "http://broker.example",
@@ -133,7 +199,7 @@ func TestPrepareSigningKeysRotatesAndKeepsOldJWKSKey(t *testing.T) {
 		SigningKeyRotationDays:  1,
 		SigningKeyRetentionDays: 30,
 	}
-	if err := prepareSigningKeys(&cfg, dataDir, false); err != nil {
+	if err := prepareSigningKeys(&cfg, store, dataDir, false); err != nil {
 		t.Fatalf("prepare signing keys: %v", err)
 	}
 	requireRotatedSigningKeyConfig(t, cfg, oldKey.KeyID)
@@ -162,15 +228,15 @@ func TestPrepareSigningKeysRotatesAndKeepsOldJWKSKey(t *testing.T) {
 	}
 }
 
-func seedOldSigningKeySet(t *testing.T, dataDir string, now time.Time) (managedSigningKey, string) {
+func seedOldSigningKeySet(t *testing.T, store *Store, now time.Time) (managedSigningKey, string) {
 	t.Helper()
 	oldKey, err := newManagedSigningKey("test-key", now.AddDate(0, 0, -2))
 	if err != nil {
 		t.Fatalf("create old key: %v", err)
 	}
 	oldSet := managedSigningKeySet{ActiveKeyID: oldKey.KeyID, Keys: []managedSigningKey{oldKey}}
-	if err := saveManagedSigningKeySet(filepath.Join(dataDir, defaultKeysPath), oldSet); err != nil {
-		t.Fatalf("save old key set: %v", err)
+	if err := store.PutSigningKeySet(oldSet); err != nil {
+		t.Fatalf("seed old key set: %v", err)
 	}
 	oldToken := signTestToken(t, oldKey, now)
 	return oldKey, oldToken
@@ -250,6 +316,16 @@ func mustNewStore(t *testing.T) *Store {
 	store, err := NewStore(path)
 	if err != nil {
 		t.Fatalf("create store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+func newStoreInDir(t *testing.T, dataDir string) *Store {
+	t.Helper()
+	store, err := NewStore(filepath.Join(dataDir, defaultDataFile))
+	if err != nil {
+		t.Fatalf("create store in %s: %v", dataDir, err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	return store

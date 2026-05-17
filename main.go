@@ -121,12 +121,13 @@ func newConfiguredBroker(opts cliOptions) (*Broker, string, error) {
 	if err != nil {
 		return nil, "", fmt.Errorf("resolve data path: %w", err)
 	}
-	if err := prepareSigningKeys(&cfg, dataDir, opts.rotateSigningKey); err != nil {
-		return nil, "", fmt.Errorf("prepare signing key: %w", err)
-	}
 	store, err := NewStore(filepath.Join(dataDir, defaultDataFile))
 	if err != nil {
 		return nil, "", fmt.Errorf("open store: %w", err)
+	}
+	if err := prepareSigningKeys(&cfg, store, dataDir, opts.rotateSigningKey); err != nil {
+		_ = store.Close()
+		return nil, "", fmt.Errorf("prepare signing key: %w", err)
 	}
 	broker, err := NewBroker(cfg, store)
 	if err != nil {

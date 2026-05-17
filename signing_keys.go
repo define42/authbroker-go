@@ -137,67 +137,106 @@ type managedSigningKey struct {
 	RetiredAt     int64  `json:"retired_at,omitempty"`
 }
 
-func prepareSigningKeys(cfg *Config, dataDir string, forceRotate bool) error {
-	if strings.TrimSpace(cfg.SigningKeyPEM) != "" || len(cfg.SigningKeys) > 0 || dataDir == "" {
+// signingKeySetSource records where the in-memory managedSigningKeySet came
+// from on this boot. It drives both the startup log line and the decision of
+// whether to persist the set even when rotate/prune did not change it (a
+// freshly-generated or just-migrated set must always be written back).
+type signingKeySetSource int
+
+const (
+	sourceGenerated signingKeySetSource = iota
+	sourceMigrated
+	sourceStore
+)
+
+func prepareSigningKeys(cfg *Config, store *Store, dataDir string, forceRotate bool) error {
+	if strings.TrimSpace(cfg.SigningKeyPEM) != "" || len(cfg.SigningKeys) > 0 || store == nil {
 		return nil
 	}
 
-	path := filepath.Join(dataDir, defaultKeysPath)
-	keySet, loaded, changed, err := prepareManagedSigningKeySet(path, cfg, forceRotate, time.Now())
+	keySet, source, changed, err := prepareManagedSigningKeySet(store, dataDir, cfg, forceRotate, time.Now())
 	if err != nil {
 		return err
 	}
 	cfg.SigningKeys = keySet.signingKeyConfigs()
 	cfg.KeyID = keySet.ActiveKeyID
-	logManagedSigningKeySet(path, loaded, changed)
+	logManagedSigningKeySet(source, changed)
 	return nil
 }
 
-func prepareManagedSigningKeySet(path string, cfg *Config, forceRotate bool, now time.Time) (managedSigningKeySet, bool, bool, error) {
-	keySet, loaded, err := loadManagedSigningKeySet(path)
+func prepareManagedSigningKeySet(store *Store, dataDir string, cfg *Config, forceRotate bool, now time.Time) (managedSigningKeySet, signingKeySetSource, bool, error) {
+	keySet, loaded, err := store.GetSigningKeySet()
 	if err != nil {
-		return managedSigningKeySet{}, false, false, err
+		return managedSigningKeySet{}, sourceGenerated, false, err
 	}
+	source := sourceStore
 	if !loaded {
-		keySet, err = initialManagedSigningKeySet(cfg.KeyID, now)
+		migrated, hasFile, err := migrateLegacySigningKeyFile(dataDir)
 		if err != nil {
-			return managedSigningKeySet{}, false, false, err
+			return managedSigningKeySet{}, sourceGenerated, false, err
+		}
+		switch {
+		case hasFile:
+			keySet = migrated
+			source = sourceMigrated
+		default:
+			keySet, err = initialManagedSigningKeySet(cfg.KeyID, now)
+			if err != nil {
+				return managedSigningKeySet{}, sourceGenerated, false, err
+			}
+			source = sourceGenerated
 		}
 	}
-	changed, err := keySet.rotateAndPrune(cfg.KeyID, cfg.SigningKeyRotationDays, cfg.SigningKeyRetentionDays, forceRotate && loaded, now)
+	// forceRotate only applies to a pre-existing set — rotating a key we just
+	// generated this boot would be pointless churn.
+	changed, err := keySet.rotateAndPrune(cfg.KeyID, cfg.SigningKeyRotationDays, cfg.SigningKeyRetentionDays, forceRotate && source != sourceGenerated, now)
 	if err != nil {
-		return managedSigningKeySet{}, false, false, err
+		return managedSigningKeySet{}, source, false, err
 	}
-	if !loaded || changed {
-		if err := saveManagedSigningKeySet(path, keySet); err != nil {
-			return managedSigningKeySet{}, false, false, err
+	if source != sourceStore || changed {
+		if err := store.PutSigningKeySet(keySet); err != nil {
+			return managedSigningKeySet{}, source, false, err
 		}
 	}
-	return keySet, loaded, changed, nil
+	return keySet, source, changed, nil
 }
 
-func logManagedSigningKeySet(path string, loaded, changed bool) {
-	switch {
-	case !loaded:
-		log.Printf("generated RSA signing key set at %s", path)
-	case changed:
-		log.Printf("updated RSA signing key set at %s", path)
-	default:
-		log.Printf("loaded RSA signing key set from %s", path)
+func logManagedSigningKeySet(source signingKeySetSource, changed bool) {
+	switch source {
+	case sourceGenerated:
+		log.Printf("generated RSA signing key set in store")
+	case sourceMigrated:
+		log.Printf("migrated RSA signing key set from %s into store", defaultKeysPath)
+	case sourceStore:
+		if changed {
+			log.Printf("updated RSA signing key set in store")
+		} else {
+			log.Printf("loaded RSA signing key set from store")
+		}
 	}
 }
 
-func loadManagedSigningKeySet(path string) (managedSigningKeySet, bool, error) {
-	var keySet managedSigningKeySet
+// migrateLegacySigningKeyFile imports a pre-bbolt signing-keys.json into the
+// store on first boot after the switch. The file is renamed (not deleted) so
+// an operator who needs to roll back has the original PEMs on disk.
+func migrateLegacySigningKeyFile(dataDir string) (managedSigningKeySet, bool, error) {
+	if dataDir == "" {
+		return managedSigningKeySet{}, false, nil
+	}
+	path := filepath.Join(dataDir, defaultKeysPath)
 	b, err := os.ReadFile(path) //nolint:gosec // key path is derived from operator-supplied data directory.
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return keySet, false, nil
+			return managedSigningKeySet{}, false, nil
 		}
-		return keySet, false, err
+		return managedSigningKeySet{}, false, err
 	}
+	var keySet managedSigningKeySet
 	if err := json.Unmarshal(b, &keySet); err != nil {
-		return keySet, false, err
+		return managedSigningKeySet{}, false, fmt.Errorf("migrate %s: %w", path, err)
+	}
+	if err := os.Rename(path, path+".migrated"); err != nil {
+		return managedSigningKeySet{}, false, fmt.Errorf("rename migrated key file %s: %w", path, err)
 	}
 	return keySet, true, nil
 }
@@ -376,12 +415,4 @@ func sanitizeKeyIDPrefix(prefix string) string {
 		}
 	}
 	return strings.Trim(b.String(), "-_")
-}
-
-func saveManagedSigningKeySet(path string, keySet managedSigningKeySet) error {
-	b, err := json.MarshalIndent(keySet, "", "  ")
-	if err != nil {
-		return err
-	}
-	return writeFileAtomic(path, b, 0o600)
 }

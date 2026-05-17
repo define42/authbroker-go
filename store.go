@@ -60,7 +60,13 @@ const (
 	bucketRevokedJTIs   = "revoked_jtis"
 	bucketWebAuthnReg   = "webauthn_registration_challenges"
 	bucketWebAuthnLog   = "webauthn_login_challenges"
+	bucketSigningKeys   = "signing_keys"
 )
+
+// signingKeySetKey is the single bbolt key under bucketSigningKeys that holds
+// the managed signing key set. The bucket has only one entry; using a fixed
+// key keeps the schema explicit.
+const signingKeySetKey = "managed"
 
 func allBuckets() []string {
 	return []string{
@@ -72,6 +78,7 @@ func allBuckets() []string {
 		bucketRevokedJTIs,
 		bucketWebAuthnReg,
 		bucketWebAuthnLog,
+		bucketSigningKeys,
 	}
 }
 
@@ -492,6 +499,31 @@ func consumeChallenge(db *bolt.DB, name, challenge string) (ChallengeRecord, boo
 		return b.Delete([]byte(challenge))
 	})
 	return rec, found, err
+}
+
+// -- SigningKeys -----------------------------------------------------------
+
+// GetSigningKeySet loads the managed signing key set from the store. Returns
+// (zero, false, nil) when the bucket is empty, which is the boot-time signal
+// for "generate a fresh key" or "migrate from signing-keys.json".
+func (s *Store) GetSigningKeySet() (managedSigningKeySet, bool, error) {
+	var keySet managedSigningKeySet
+	var found bool
+	err := s.db.View(func(tx *bolt.Tx) error {
+		v := bucket(tx, bucketSigningKeys).Get([]byte(signingKeySetKey))
+		if v == nil {
+			return nil
+		}
+		found = true
+		return json.Unmarshal(v, &keySet)
+	})
+	return keySet, found, err
+}
+
+func (s *Store) PutSigningKeySet(keySet managedSigningKeySet) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return putJSON(bucket(tx, bucketSigningKeys), []byte(signingKeySetKey), keySet)
+	})
 }
 
 // -- Sweep -----------------------------------------------------------------
