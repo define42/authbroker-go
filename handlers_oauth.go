@@ -13,6 +13,7 @@ import (
 	"time"
 )
 
+//nolint:funlen // Authorize validates the request, dispatches prompt handling, and routes to login/consent — splitting would obscure the linear flow.
 func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	if q.Get("response_type") != "code" {
@@ -38,7 +39,6 @@ func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		redirectOAuthError(w, r, redirectURI, q.Get("state"), "invalid_request", msg)
 		return
 	}
-
 	authReq := AuthorizationRequest{
 		ID:                  randomB64(32),
 		ClientID:            client.ClientID,
@@ -52,7 +52,18 @@ func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt:           time.Now().Add(time.Duration(b.cfg.AuthCodeTTLSeconds) * time.Second),
 	}
 
-	if sess, ok := b.validSession(r); ok {
+	sess, hasSession := b.validSession(r)
+	errCode, errDesc, err := b.checkPrompt(q.Get("prompt"), sess, hasSession, client, authReq.Scope)
+	if err != nil {
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	if errCode != "" {
+		redirectOAuthError(w, r, redirectURI, q.Get("state"), errCode, errDesc)
+		return
+	}
+
+	if hasSession {
 		b.maybeExtendSession(w, r)
 		if err := b.proceedAfterAuthn(w, r, authReq, sess); err != nil {
 			http.Error(w, "store error", http.StatusInternalServerError)
@@ -65,6 +76,53 @@ func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/login?request_id="+url.QueryEscape(authReq.ID), http.StatusFound)
+}
+
+// checkPrompt implements OIDC Core §3.1.2.1 prompt handling. It parses the
+// space-separated `prompt` parameter, rejects `none` combined with any other
+// value, and applies the silent-auth pre-checks when only `none` was
+// requested. The returned (code, desc) is the OIDC error to redirect to the
+// client, or empty strings if the request may proceed.
+func (b *Broker) checkPrompt(raw string, sess Session, hasSession bool, client Client, scope string) (string, string, error) {
+	prompts := map[string]bool{}
+	for _, p := range strings.Fields(raw) {
+		prompts[p] = true
+	}
+	if prompts["none"] && len(prompts) > 1 {
+		return "invalid_request", "prompt=none cannot be combined with other prompt values", nil
+	}
+	if !prompts["none"] {
+		return "", "", nil
+	}
+	if !hasSession {
+		return "login_required", "prompt=none but no active session", nil
+	}
+	needConsent, err := b.consentMissingForRequest(sess.UserID, client, scope)
+	if err != nil {
+		return "", "", err
+	}
+	if needConsent {
+		return "consent_required", "prompt=none but consent has not been granted", nil
+	}
+	return "", "", nil
+}
+
+// consentMissingForRequest reports whether prompt=none must error with
+// consent_required for the given user and requested scope: true when the
+// client requires consent and the stored record does not cover every
+// requested scope.
+func (b *Broker) consentMissingForRequest(userID string, client Client, scope string) (bool, error) {
+	if !client.RequireConsent {
+		return false, nil
+	}
+	rec, found, err := b.store.GetConsent(userID, client.ClientID)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return true, nil
+	}
+	return !consentCovers(rec, requestedScopeList(scope)), nil
 }
 
 func authorizePKCEError(client Client, challenge, method string) string {

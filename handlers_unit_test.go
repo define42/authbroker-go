@@ -156,6 +156,148 @@ func TestAuthorizePKCEErrorBadRedirectFallsBack(t *testing.T) {
 	}
 }
 
+// TestAuthorizePromptNoneWithoutSessionReturnsLoginRequired exercises OIDC
+// Core §3.1.2.1: with prompt=none and no active session, the broker must
+// redirect back to the client with error=login_required instead of showing
+// the login page.
+func TestAuthorizePromptNoneWithoutSessionReturnsLoginRequired(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {"demo-web"},
+		"redirect_uri":          {"http://app.example/callback"},
+		"code_challenge":        {"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"},
+		"code_challenge_method": {"S256"},
+		"state":                 {"abc"},
+		"prompt":                {"none"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/authorize?"+q.Encode(), nil)
+	rr := httptest.NewRecorder()
+	broker.handleAuthorize(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	u, err := url.Parse(rr.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse location: %v", err)
+	}
+	if got := u.Query().Get("error"); got != "login_required" {
+		t.Fatalf("error = %q, want login_required", got)
+	}
+	if got := u.Query().Get("state"); got != "abc" {
+		t.Fatalf("state = %q, want abc", got)
+	}
+	if u.Scheme+"://"+u.Host+u.Path != "http://app.example/callback" {
+		t.Fatalf("redirect target = %q, want http://app.example/callback", u.String())
+	}
+}
+
+// TestAuthorizePromptNoneWithSessionIssuesCode confirms that prompt=none
+// silently completes the grant when the user is already authenticated and the
+// client does not require consent.
+func TestAuthorizePromptNoneWithSessionIssuesCode(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	sid := "sess-prompt-none"
+	if err := broker.store.PutSession(sid, Session{
+		UserID:    "johndoe",
+		ExpiresAt: time.Now().Add(time.Hour),
+		CSRFToken: "csrf",
+	}); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {"demo-web"},
+		"redirect_uri":          {"http://app.example/callback"},
+		"code_challenge":        {"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"},
+		"code_challenge_method": {"S256"},
+		"state":                 {"abc"},
+		"prompt":                {"none"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/authorize?"+q.Encode(), nil)
+	addSessionCookie(req, sid)
+	rr := httptest.NewRecorder()
+	broker.handleAuthorize(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	u, err := url.Parse(rr.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse location: %v", err)
+	}
+	if got := u.Query().Get("error"); got != "" {
+		t.Fatalf("unexpected error = %q", got)
+	}
+	if got := u.Query().Get("code"); got == "" {
+		t.Fatalf("missing authorization code in %q", u.String())
+	}
+}
+
+// TestAuthorizePromptNoneConsentRequired covers the other §3.1.2.1 silent
+// failure: session is valid but the client requires consent the user hasn't
+// granted, so the broker must return consent_required instead of showing the
+// consent UI.
+func TestAuthorizePromptNoneConsentRequired(t *testing.T) {
+	broker := newAdminTestBroker(t)
+	sid, _ := adminSession(t, broker, "alice", false)
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {"demo-web"},
+		"redirect_uri":          {"http://app.example/callback"},
+		"code_challenge":        {"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"},
+		"code_challenge_method": {"S256"},
+		"scope":                 {"openid profile"},
+		"state":                 {"st"},
+		"prompt":                {"none"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/authorize?"+q.Encode(), nil)
+	addSessionCookie(req, sid)
+	rr := httptest.NewRecorder()
+	broker.handleAuthorize(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	u, err := url.Parse(rr.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse location: %v", err)
+	}
+	if got := u.Query().Get("error"); got != "consent_required" {
+		t.Fatalf("error = %q, want consent_required (location=%s)", got, u.String())
+	}
+	if got := u.Query().Get("state"); got != "st" {
+		t.Fatalf("state = %q, want st", got)
+	}
+}
+
+// TestAuthorizePromptNoneRejectsCombination enforces the §3.1.2.1 rule that
+// the "none" value MUST NOT appear alongside any other prompt value; the
+// broker must surface invalid_request.
+func TestAuthorizePromptNoneRejectsCombination(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {"demo-web"},
+		"redirect_uri":          {"http://app.example/callback"},
+		"code_challenge":        {"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"},
+		"code_challenge_method": {"S256"},
+		"state":                 {"abc"},
+		"prompt":                {"none login"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/authorize?"+q.Encode(), nil)
+	rr := httptest.NewRecorder()
+	broker.handleAuthorize(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	u, err := url.Parse(rr.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse location: %v", err)
+	}
+	if got := u.Query().Get("error"); got != "invalid_request" {
+		t.Fatalf("error = %q, want invalid_request", got)
+	}
+}
+
 func TestHandleTokenBadGrant(t *testing.T) {
 	broker := newLogoutTestBroker(t)
 	form := url.Values{"grant_type": {"unsupported"}}
@@ -460,6 +602,36 @@ func TestUserInfoOnAccessToken(t *testing.T) {
 	}
 	if resp["sub"] != "johndoe" || resp["email"] != "j@e" {
 		t.Fatalf("body = %#v", resp)
+	}
+}
+
+// TestIssueUserTokensSetsAtHash verifies OIDC Core §3.3.2.11: the ID Token
+// must carry at_hash whenever an access_token is issued alongside it, and the
+// value must equal base64url(left-most 128 bits of SHA-256(access_token)) when
+// the ID Token is signed with RS256.
+func TestIssueUserTokensSetsAtHash(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid", "", time.Now(), false)
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	access, _ := tokens["access_token"].(string)
+	idToken, _ := tokens["id_token"].(string)
+	if access == "" || idToken == "" {
+		t.Fatalf("missing tokens: access=%q id=%q", access, idToken)
+	}
+	claims, err := broker.verifyJWT(idToken)
+	if err != nil {
+		t.Fatalf("verify id_token: %v", err)
+	}
+	got, _ := claims["at_hash"].(string)
+	if got == "" {
+		t.Fatal("id_token missing at_hash claim")
+	}
+	sum := sha256.Sum256([]byte(access))
+	want := base64.RawURLEncoding.EncodeToString(sum[:sha256.Size/2])
+	if got != want {
+		t.Fatalf("at_hash = %q, want %q", got, want)
 	}
 }
 
