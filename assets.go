@@ -4,19 +4,19 @@ const authbrokerCSP = "default-src 'none'; base-uri 'none'; connect-src 'self'; 
 
 const authbrokerCSS = `
 :root {
-  color-scheme: light;
-  --page: #f5f7fb;
-  --panel: #ffffff;
-  --panel-soft: #f8fafc;
-  --text: #182230;
-  --muted: #5f6b7a;
-  --line: #d9e0ea;
-  --line-strong: #c5cedb;
-  --brand: #0f766e;
-  --brand-strong: #0b5f59;
-  --accent: #245bdb;
-  --danger: #b42318;
-  --shadow: 0 12px 32px rgba(24, 34, 48, 0.08);
+  color-scheme: dark;
+  --page: #0b1220;
+  --panel: #131c2c;
+  --panel-soft: #1a2333;
+  --text: #e6ebf2;
+  --muted: #94a3b8;
+  --line: #243042;
+  --line-strong: #334155;
+  --brand: #14b8a6;
+  --brand-strong: #0d9488;
+  --accent: #60a5fa;
+  --danger: #f87171;
+  --shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
   --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
@@ -29,7 +29,7 @@ body {
   margin: 0;
   min-height: 100vh;
   background:
-    linear-gradient(180deg, rgba(15, 118, 110, 0.08), rgba(36, 91, 219, 0.03) 38%, transparent 72%),
+    linear-gradient(180deg, rgba(20, 184, 166, 0.10), rgba(96, 165, 250, 0.05) 38%, transparent 72%),
     var(--page);
   color: var(--text);
   font-family: var(--sans);
@@ -108,7 +108,7 @@ textarea {
   padding: 0 12px;
   border: 1px solid var(--line);
   border-radius: 999px;
-  background: #ffffff;
+  background: var(--panel);
   color: var(--muted);
   font-weight: 650;
 }
@@ -258,13 +258,13 @@ button:hover {
 .button.secondary,
 button.secondary {
   border-color: var(--line-strong);
-  background: #ffffff;
+  background: var(--panel-soft);
   color: var(--text);
 }
 
 .button.secondary:hover,
 button.secondary:hover {
-  background: var(--panel-soft);
+  background: var(--panel);
 }
 
 button.danger {
@@ -316,12 +316,16 @@ button.danger {
   padding: 0 12px;
   color: var(--text);
   font: inherit;
-  background: #ffffff;
+  background: var(--panel-soft);
+}
+
+.field input::placeholder {
+  color: var(--muted);
 }
 
 .field input:focus,
 .token-output:focus {
-  outline: 3px solid rgba(36, 91, 219, 0.18);
+  outline: 3px solid rgba(96, 165, 250, 0.35);
   border-color: var(--accent);
 }
 
