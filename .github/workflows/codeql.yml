@@ -42,8 +42,11 @@ jobs:
           languages: ${{ matrix.language }}
           queries: security-and-quality
 
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v4
+      - name: Build
+        run: |
+          go build ./...
+          (cd test-web-ui && go build ./...)
+          (cd passkey-demo && go build ./...)
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
