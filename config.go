@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -29,6 +30,14 @@ const (
 
 	defaultSigningKeyRotationDays  = 90
 	defaultSigningKeyRetentionDays = 30
+
+	defaultLoginRateWindowSeconds  = 5 * 60
+	defaultLoginRateMaxAttempts    = 10
+	defaultLoginRateLockoutSeconds = 15 * 60
+	defaultTokenRateWindowSeconds  = 5 * 60
+	defaultTokenRateMaxAttempts    = 20
+	defaultTokenRateLockoutSeconds = 15 * 60
+	defaultMetricsPath             = "/metrics"
 )
 
 // Body size limits applied via http.MaxBytesReader. Keep these generous enough
@@ -51,12 +60,15 @@ const (
 // Config is intentionally small. It is enough to run a modern LDAP-backed
 // OAuth2/OIDC broker. Use this as a baseline, not as a complete enterprise IdP.
 type Config struct {
-	Issuer        string `json:"issuer"`
-	Listen        string `json:"listen"`
-	DisplayName   string `json:"display_name,omitempty"`
-	SigningKeyPEM string `json:"signing_key_pem,omitempty"`
-	KeyID         string `json:"key_id"`
-	CookieSecure  *bool  `json:"cookie_secure,omitempty"`
+	Issuer         string   `json:"issuer"`
+	Listen         string   `json:"listen"`
+	DisplayName    string   `json:"display_name,omitempty"`
+	Production     bool     `json:"production,omitempty"`
+	SigningKeyPEM  string   `json:"signing_key_pem,omitempty"`
+	KeyID          string   `json:"key_id"`
+	CookieSecure   *bool    `json:"cookie_secure,omitempty"`
+	TrustedProxies []string `json:"trusted_proxies,omitempty"`
+	ClientIPHeader string   `json:"client_ip_header,omitempty"`
 
 	SigningKeys             []SigningKeyConfig `json:"signing_keys,omitempty"`
 	SigningKeyRotationDays  int                `json:"signing_key_rotation_days,omitempty"`
@@ -68,6 +80,8 @@ type Config struct {
 	WebAuthn    WebAuthnConfig   `json:"webauthn"`
 	AppTokens   []AppTokenConfig `json:"app_tokens,omitempty"`
 	ACME        ACMEConfig       `json:"acme,omitempty"`
+	RateLimit   RateLimitConfig  `json:"rate_limit,omitempty"`
+	Metrics     MetricsConfig    `json:"metrics,omitempty"`
 	AdminGroups []string         `json:"admin_groups,omitempty"`
 
 	AccessTokenTTLMinutes int `json:"access_token_ttl_minutes"`
@@ -75,6 +89,20 @@ type Config struct {
 	RefreshTokenTTLDays   int `json:"refresh_token_ttl_days"`
 	AuthCodeTTLSeconds    int `json:"auth_code_ttl_seconds"`
 	SessionTTLHrs         int `json:"session_ttl_hours"`
+}
+
+type RateLimitConfig struct {
+	LoginWindowSeconds  int `json:"login_window_seconds,omitempty"`
+	LoginMaxAttempts    int `json:"login_max_attempts,omitempty"`
+	LoginLockoutSeconds int `json:"login_lockout_seconds,omitempty"`
+	TokenWindowSeconds  int `json:"token_window_seconds,omitempty"`
+	TokenMaxAttempts    int `json:"token_max_attempts,omitempty"`
+	TokenLockoutSeconds int `json:"token_lockout_seconds,omitempty"`
+}
+
+type MetricsConfig struct {
+	Enabled bool   `json:"enabled,omitempty"`
+	Path    string `json:"path,omitempty"`
 }
 
 type SigningKeyConfig struct {
@@ -211,6 +239,9 @@ func normalizeConfig(cfg *Config) {
 	if cfg.SessionTTLHrs == 0 {
 		cfg.SessionTTLHrs = 8
 	}
+	if cfg.ClientIPHeader == "" && len(cfg.TrustedProxies) > 0 {
+		cfg.ClientIPHeader = "X-Forwarded-For"
+	}
 	if cfg.WebAuthn.RPDisplayName == "" {
 		cfg.WebAuthn.RPDisplayName = "Go Auth Broker"
 	}
@@ -228,6 +259,8 @@ func normalizeConfig(cfg *Config) {
 		}
 	}
 	normalizeACMEConfig(&cfg.ACME)
+	normalizeRateLimitConfig(&cfg.RateLimit)
+	normalizeMetricsConfig(&cfg.Metrics)
 	for i := range cfg.AppTokens {
 		if cfg.AppTokens[i].DisplayName == "" {
 			cfg.AppTokens[i].DisplayName = cfg.AppTokens[i].ID
@@ -244,6 +277,33 @@ func normalizeConfig(cfg *Config) {
 		if cfg.AppTokens[i].TokenTTLMinutes <= 0 {
 			cfg.AppTokens[i].TokenTTLMinutes = 480
 		}
+	}
+}
+
+func normalizeRateLimitConfig(cfg *RateLimitConfig) {
+	if cfg.LoginWindowSeconds == 0 {
+		cfg.LoginWindowSeconds = defaultLoginRateWindowSeconds
+	}
+	if cfg.LoginMaxAttempts == 0 {
+		cfg.LoginMaxAttempts = defaultLoginRateMaxAttempts
+	}
+	if cfg.LoginLockoutSeconds == 0 {
+		cfg.LoginLockoutSeconds = defaultLoginRateLockoutSeconds
+	}
+	if cfg.TokenWindowSeconds == 0 {
+		cfg.TokenWindowSeconds = defaultTokenRateWindowSeconds
+	}
+	if cfg.TokenMaxAttempts == 0 {
+		cfg.TokenMaxAttempts = defaultTokenRateMaxAttempts
+	}
+	if cfg.TokenLockoutSeconds == 0 {
+		cfg.TokenLockoutSeconds = defaultTokenRateLockoutSeconds
+	}
+}
+
+func normalizeMetricsConfig(cfg *MetricsConfig) {
+	if strings.TrimSpace(cfg.Path) == "" {
+		cfg.Path = defaultMetricsPath
 	}
 }
 
@@ -264,6 +324,243 @@ func normalizeACMEConfig(acme *ACMEConfig) {
 	if strings.TrimSpace(acme.CADirectory) == "" {
 		acme.CADirectory = certmagic.LetsEncryptProductionCA
 	}
+}
+
+func validateConfig(cfg Config) error {
+	if err := validateConfigShape(cfg); err != nil {
+		return err
+	}
+	if !cfg.Production {
+		return nil
+	}
+	if err := validateProductionBase(cfg); err != nil {
+		return err
+	}
+	if err := validateProductionLDAP(cfg.LDAP); err != nil {
+		return err
+	}
+	return validateProductionClients(cfg)
+}
+
+func validateConfigShape(cfg Config) error {
+	seenClients := map[string]bool{}
+	for _, c := range cfg.Clients {
+		if strings.TrimSpace(c.ClientID) == "" {
+			return fmt.Errorf("client_id is required")
+		}
+		if seenClients[c.ClientID] {
+			return fmt.Errorf("duplicate client_id %q", c.ClientID)
+		}
+		seenClients[c.ClientID] = true
+	}
+	seenTokens := map[string]bool{}
+	for _, tokenCfg := range cfg.AppTokens {
+		if strings.TrimSpace(tokenCfg.ID) == "" {
+			return fmt.Errorf("app token id is required")
+		}
+		if seenTokens[tokenCfg.ID] {
+			return fmt.Errorf("duplicate app token id %q", tokenCfg.ID)
+		}
+		seenTokens[tokenCfg.ID] = true
+	}
+	if err := validateTrustedProxyConfig(cfg); err != nil {
+		return err
+	}
+	if cfg.Metrics.Enabled && !validHTTPPath(cfg.Metrics.Path) {
+		return fmt.Errorf("metrics.path must be an absolute path")
+	}
+	return nil
+}
+
+func validateTrustedProxyConfig(cfg Config) error {
+	for _, raw := range cfg.TrustedProxies {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if strings.Contains(raw, "/") {
+			if _, _, err := net.ParseCIDR(raw); err != nil {
+				return fmt.Errorf("trusted proxy %q is not a valid CIDR: %w", raw, err)
+			}
+			continue
+		}
+		if net.ParseIP(raw) == nil {
+			return fmt.Errorf("trusted proxy %q is not a valid IP or CIDR", raw)
+		}
+	}
+	if strings.ContainsAny(cfg.ClientIPHeader, "\r\n") {
+		return fmt.Errorf("client_ip_header must not contain control characters")
+	}
+	if len(cfg.TrustedProxies) > 0 && strings.TrimSpace(cfg.ClientIPHeader) == "" {
+		return fmt.Errorf("client_ip_header is required when trusted_proxies is set")
+	}
+	return nil
+}
+
+func validateProductionBase(cfg Config) error {
+	if !isHTTPSURL(cfg.Issuer) {
+		return fmt.Errorf("production requires an https issuer")
+	}
+	if !cookieSecureForConfig(cfg) {
+		return fmt.Errorf("production requires secure cookies")
+	}
+	if len(nonEmptyStrings(cfg.AdminGroups)) == 0 {
+		return fmt.Errorf("production requires at least one admin_group")
+	}
+	if !cfg.MFA.TOTPRequired {
+		return fmt.Errorf("production requires mfa.totp_required=true")
+	}
+	if !within(cfg.AccessTokenTTLMinutes, 1, 60) {
+		return fmt.Errorf("production access_token_ttl_minutes must be between 1 and 60")
+	}
+	if !within(cfg.IDTokenTTLMinutes, 1, 60) {
+		return fmt.Errorf("production id_token_ttl_minutes must be between 1 and 60")
+	}
+	if !within(cfg.RefreshTokenTTLDays, 1, 30) {
+		return fmt.Errorf("production refresh_token_ttl_days must be between 1 and 30")
+	}
+	if !within(cfg.AuthCodeTTLSeconds, 30, 300) {
+		return fmt.Errorf("production auth_code_ttl_seconds must be between 30 and 300")
+	}
+	if !within(cfg.SessionTTLHrs, 1, 24) {
+		return fmt.Errorf("production session_ttl_hours must be between 1 and 24")
+	}
+	return validateProductionWebAuthn(cfg.WebAuthn)
+}
+
+func validateProductionWebAuthn(cfg WebAuthnConfig) error {
+	if localhostOrLoopback(cfg.RPID) {
+		return fmt.Errorf("production webauthn.rp_id must not be localhost or loopback")
+	}
+	for _, origin := range cfg.Origins {
+		if !isHTTPSURL(origin) {
+			return fmt.Errorf("production webauthn origin %q must be https", origin)
+		}
+		if host, ok := urlHostname(origin); !ok || localhostOrLoopback(host) {
+			return fmt.Errorf("production webauthn origin %q must not use localhost or loopback", origin)
+		}
+	}
+	return nil
+}
+
+func validateProductionLDAP(cfg LDAPConfig) error {
+	ldapURL, err := url.Parse(strings.TrimSpace(cfg.URL))
+	if err != nil || ldapURL.Scheme == "" {
+		return fmt.Errorf("production requires a valid ldap.url")
+	}
+	if ldapURL.Scheme != "ldaps" && !cfg.StartTLS {
+		return fmt.Errorf("production requires LDAPS or ldap.start_tls=true")
+	}
+	if cfg.InsecureSkipVerify {
+		return fmt.Errorf("production forbids ldap.insecure_skip_verify")
+	}
+	return nil
+}
+
+func validateProductionClients(cfg Config) error {
+	for _, c := range cfg.Clients {
+		if err := validateProductionClient(c); err != nil {
+			return err
+		}
+	}
+	for _, t := range cfg.AppTokens {
+		if !within(t.TokenTTLMinutes, 1, 1440) {
+			return fmt.Errorf("production app token %q ttl must be between 1 and 1440 minutes", t.ID)
+		}
+	}
+	return nil
+}
+
+func validateProductionClient(c Client) error {
+	if !c.RequirePKCE {
+		return fmt.Errorf("production client %q must require PKCE", c.ClientID)
+	}
+	if !c.Public && !validSHA256Hex(c.ClientSecretSHA256) {
+		return fmt.Errorf("production confidential client %q requires a SHA-256 client secret hash", c.ClientID)
+	}
+	for _, redirectURI := range c.RedirectURIs {
+		if err := validateProductionRedirectURI(c.ClientID, redirectURI); err != nil {
+			return err
+		}
+	}
+	for _, redirectURI := range c.PostLogoutRedirectURIs {
+		if err := validateProductionRedirectURI(c.ClientID, redirectURI); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateProductionRedirectURI(clientID, redirectURI string) error {
+	if !isHTTPSURL(redirectURI) {
+		return fmt.Errorf("production client %q redirect URI %q must be https", clientID, redirectURI)
+	}
+	if host, ok := urlHostname(redirectURI); !ok || localhostOrLoopback(host) {
+		return fmt.Errorf("production client %q redirect URI %q must not use localhost or loopback", clientID, redirectURI)
+	}
+	return nil
+}
+
+func cookieSecureForConfig(cfg Config) bool {
+	if cfg.CookieSecure != nil {
+		return *cfg.CookieSecure
+	}
+	return strings.HasPrefix(cfg.Issuer, "https://")
+}
+
+func isHTTPSURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	return err == nil && u.Scheme == "https" && u.Hostname() != ""
+}
+
+func urlHostname(raw string) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Hostname() == "" {
+		return "", false
+	}
+	return u.Hostname(), true
+}
+
+func localhostOrLoopback(host string) bool {
+	host = strings.Trim(strings.ToLower(strings.TrimSpace(host)), "[]")
+	if host == "" || host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func validSHA256Hex(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validHTTPPath(path string) bool {
+	path = strings.TrimSpace(path)
+	return strings.HasPrefix(path, "/") && !strings.ContainsAny(path, " \t\r\n")
+}
+
+func within(v, minValue, maxValue int) bool {
+	return v >= minValue && v <= maxValue
+}
+
+func nonEmptyStrings(values []string) []string {
+	out := values[:0]
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func loadConfig(path string) (Config, error) {

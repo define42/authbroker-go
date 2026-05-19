@@ -31,6 +31,13 @@ type cliOptions struct {
 	rotateSigningKey bool
 }
 
+const (
+	httpReadHeaderTimeout = 5 * time.Second
+	httpReadTimeout       = 30 * time.Second
+	httpWriteTimeout      = 30 * time.Second
+	httpIdleTimeout       = 2 * time.Minute
+)
+
 func main() {
 	opts := parseCLIOptions()
 	if opts.printKey {
@@ -117,6 +124,9 @@ func newConfiguredBroker(opts cliOptions) (*Broker, string, error) {
 		return nil, "", fmt.Errorf("load config: %w", err)
 	}
 	normalizeConfig(&cfg)
+	if err := validateConfig(cfg); err != nil {
+		return nil, "", fmt.Errorf("validate config: %w", err)
+	}
 	dataDir, err := resolveDataDir(opts.dataPath)
 	if err != nil {
 		return nil, "", fmt.Errorf("resolve data path: %w", err)
@@ -259,12 +269,18 @@ func newACMEServers(broker *Broker, acme ACMEConfig, magicCfg *certmagic.Config,
 		Addr:              acme.HTTPSAddr,
 		Handler:           broker.routes(),
 		TLSConfig:         tlsConfig,
-		ReadHeaderTimeout: 5 * time.Second,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		WriteTimeout:      httpWriteTimeout,
+		IdleTimeout:       httpIdleTimeout,
 	}
 	httpSrv := &http.Server{
 		Addr:              acme.HTTPAddr,
 		Handler:           newACMEHTTPHandler(magicCfg, acme.Domains),
-		ReadHeaderTimeout: 5 * time.Second,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		WriteTimeout:      httpWriteTimeout,
+		IdleTimeout:       httpIdleTimeout,
 	}
 	return httpsSrv, httpSrv
 }
@@ -413,7 +429,10 @@ func newHTTPServer(broker *Broker) *http.Server {
 	return &http.Server{
 		Addr:              broker.cfg.Listen,
 		Handler:           broker.routes(),
-		ReadHeaderTimeout: 5 * time.Second,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		WriteTimeout:      httpWriteTimeout,
+		IdleTimeout:       httpIdleTimeout,
 	}
 }
 
@@ -443,6 +462,8 @@ func dumpRoutes() {
 	routes := []string{
 		"/",
 		"/healthz",
+		"/livez",
+		"/readyz",
 		"/login",
 		"/logout",
 		"/reauth",

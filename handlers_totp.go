@@ -79,9 +79,19 @@ func (b *Broker) handleTOTPEnrollVerify(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	b.maybeExtendSession(w, r)
+	rateKey := b.loginRateKey(r, sess.UserID+"/totp_enroll_verify")
+	if allowed, retry := b.loginLimiter.allow(rateKey); !allowed {
+		writeRetryAfter(w, retry)
+		b.auditEvent(r, auditEventTOTPEnrollVerify, auditOutcomeFailure,
+			slog.String("user_id", sess.UserID),
+			slog.String("reason", "rate_limited"))
+		http.Error(w, "too many verification attempts; try again later", http.StatusTooManyRequests)
+		return
+	}
 
 	code, err := readTOTPVerifyCode(r)
 	if err != nil {
+		b.loginLimiter.recordFailure(rateKey)
 		b.auditEvent(r, auditEventTOTPEnrollVerify, auditOutcomeFailure,
 			slog.String("user_id", sess.UserID),
 			slog.String("reason", "bad_request"))
@@ -91,6 +101,7 @@ func (b *Broker) handleTOTPEnrollVerify(w http.ResponseWriter, r *http.Request) 
 
 	user, found := b.store.GetUser(sess.UserID)
 	if !found || user.PendingTOTPSecretBase32 == "" {
+		b.loginLimiter.recordFailure(rateKey)
 		b.auditEvent(r, auditEventTOTPEnrollVerify, auditOutcomeFailure,
 			slog.String("user_id", sess.UserID),
 			slog.String("reason", "no_pending_enrollment"))
@@ -98,6 +109,7 @@ func (b *Broker) handleTOTPEnrollVerify(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if !verifyTOTP(user.PendingTOTPSecretBase32, code, time.Now(), 1) {
+		b.loginLimiter.recordFailure(rateKey)
 		b.auditEvent(r, auditEventTOTPEnrollVerify, auditOutcomeFailure,
 			slog.String("user_id", sess.UserID),
 			slog.String("reason", "invalid_code"))
@@ -105,12 +117,14 @@ func (b *Broker) handleTOTPEnrollVerify(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := b.store.CommitPendingTOTP(sess.UserID); err != nil {
+		b.loginLimiter.recordFailure(rateKey)
 		b.auditEvent(r, auditEventTOTPEnrollVerify, auditOutcomeFailure,
 			slog.String("user_id", sess.UserID),
 			slog.String("reason", "store_error"))
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
+	b.loginLimiter.recordSuccess(rateKey)
 	b.auditEvent(r, auditEventTOTPEnrollVerify, auditOutcomeSuccess,
 		slog.String("user_id", sess.UserID))
 	w.WriteHeader(http.StatusNoContent)

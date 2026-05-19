@@ -1,16 +1,33 @@
 {
   "issuer": "http://localhost:8080",
   "listen": ":8080",
+  "production": false,
   "key_id": "authbroker-dev-key-1",
   "signing_key_rotation_days": 90,
   "signing_key_retention_days": 30,
   "cookie_secure": false,
+  "trusted_proxies": [],
+  "client_ip_header": "",
   "access_token_ttl_minutes": 15,
   "id_token_ttl_minutes": 15,
   "refresh_token_ttl_days": 14,
   "auth_code_ttl_seconds": 120,
   "session_ttl_hours": 8,
   "admin_groups": ["administrators"],
+
+  "rate_limit": {
+    "login_window_seconds": 300,
+    "login_max_attempts": 10,
+    "login_lockout_seconds": 900,
+    "token_window_seconds": 300,
+    "token_max_attempts": 20,
+    "token_lockout_seconds": 900
+  },
+
+  "metrics": {
+    "enabled": false,
+    "path": "/metrics"
+  },
 
   "ldap": {
     "url": "ldaps://dc01.example.com:636",

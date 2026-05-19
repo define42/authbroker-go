@@ -1,0 +1,244 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: authbroker
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: authbroker-config
+  namespace: authbroker
+type: Opaque
+stringData:
+  config.json: |
+    {
+      "production": true,
+      "issuer": "https://auth.example.com",
+      "listen": ":8080",
+      "display_name": "Example Auth",
+      "key_id": "authbroker-prod-key",
+      "cookie_secure": true,
+      "trusted_proxies": ["10.0.0.0/8"],
+      "client_ip_header": "X-Forwarded-For",
+      "access_token_ttl_minutes": 15,
+      "id_token_ttl_minutes": 15,
+      "refresh_token_ttl_days": 14,
+      "auth_code_ttl_seconds": 120,
+      "session_ttl_hours": 8,
+      "admin_groups": ["authbroker-admins"],
+      "rate_limit": {
+        "login_window_seconds": 300,
+        "login_max_attempts": 10,
+        "login_lockout_seconds": 900,
+        "token_window_seconds": 300,
+        "token_max_attempts": 20,
+        "token_lockout_seconds": 900
+      },
+      "metrics": {
+        "enabled": true,
+        "path": "/metrics"
+      },
+      "ldap": {
+        "url": "ldaps://dc01.example.com:636",
+        "domain_suffix": "@example.com",
+        "base_dn": "dc=example,dc=com",
+        "user_filter": "(userPrincipalName={login})",
+        "email_attribute": "mail",
+        "name_attribute": "displayName",
+        "groups_attribute": "memberOf",
+        "nested_groups": true,
+        "group_search_base_dn": "dc=example,dc=com",
+        "group_search_filter": "(objectClass=group)",
+        "group_name_attribute": "cn",
+        "start_tls": false,
+        "insecure_skip_verify": false,
+        "timeout_seconds": 5
+      },
+      "mfa": {
+        "totp_required": true
+      },
+      "webauthn": {
+        "rp_id": "auth.example.com",
+        "rp_display_name": "Example Auth",
+        "origins": ["https://auth.example.com"]
+      },
+      "clients": [
+        {
+          "client_id": "internal-web",
+          "client_secret_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "redirect_uris": ["https://app.example.com/callback"],
+          "post_logout_redirect_uris": ["https://app.example.com/"],
+          "public": false,
+          "require_pkce": true,
+          "require_consent": true
+        }
+      ]
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: authbroker
+  namespace: authbroker
+  labels:
+    app.kubernetes.io/name: authbroker
+spec:
+  selector:
+    app.kubernetes.io/name: authbroker
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: authbroker
+  namespace: authbroker
+  labels:
+    app.kubernetes.io/name: authbroker
+spec:
+  serviceName: authbroker
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: authbroker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: authbroker
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: authbroker
+          image: ghcr.io/define42/authbroker-go:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: AUTHBROKER_CONFIG
+              value: /etc/authbroker/config.json
+            - name: AUTHBROKER_DATA
+              value: /var/lib/authbroker
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/authbroker
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/authbroker
+      volumes:
+        - name: config
+          secret:
+            secretName: authbroker-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: authbroker
+  namespace: authbroker
+  annotations:
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+spec:
+  tls:
+    - hosts:
+        - auth.example.com
+      secretName: authbroker-tls
+  rules:
+    - host: auth.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: authbroker
+                port:
+                  name: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: authbroker
+  namespace: authbroker
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: authbroker
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: authbroker
+  namespace: authbroker
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: authbroker
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - ports:
+        - protocol: TCP
+          port: 636

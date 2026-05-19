@@ -24,6 +24,24 @@ func (b *Broker) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+func (b *Broker) handleLive(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (b *Broker) handleReady(w http.ResponseWriter, _ *http.Request) {
+	if err := b.store.Ready(); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (b *Broker) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte(b.metrics.render()))
+}
+
 func (b *Broker) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 	issuer := b.cfg.Issuer
 	w.Header().Set("Cache-Control", "public, max-age=300, must-revalidate")

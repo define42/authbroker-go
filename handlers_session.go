@@ -53,7 +53,7 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	// AD/OpenLDAP are case-insensitive in practice; oscillating case used to
 	// surface as different audit user_id strings for the same account.
 	username := strings.ToLower(strings.TrimSpace(r.Form.Get("username")))
-	rateKey := loginRateKey(r, username)
+	rateKey := b.loginRateKey(r, username)
 	if ok, retry := b.loginLimiter.allow(rateKey); !ok {
 		writeRetryAfter(w, retry)
 		b.auditEvent(r, auditEventLogin, auditOutcomeFailure,
@@ -178,7 +178,7 @@ func (b *Broker) handleReAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	password := r.Form.Get("password")
-	rateKey := loginRateKey(r, sess.UserID)
+	rateKey := b.loginRateKey(r, sess.UserID)
 	if ok, retry := b.loginLimiter.allow(rateKey); !ok {
 		writeRetryAfter(w, retry)
 		b.auditEvent(r, auditEventReAuth, auditOutcomeFailure,
@@ -655,8 +655,8 @@ func loginAuditClientID(ar AuthorizationRequest) string {
 // loginRateKey scopes the limiter by client IP and (when known) the username
 // being attempted so a single hostile IP cannot brute one account by trying
 // many other accounts in parallel.
-func loginRateKey(r *http.Request, username string) string {
-	ip := clientIP(r)
+func (b *Broker) loginRateKey(r *http.Request, username string) string {
+	ip := b.clientIP(r)
 	if username == "" {
 		return "ip:" + ip
 	}

@@ -404,26 +404,34 @@ await fetch('/webauthn/login/finish', {
 });
 ```
 
-## Production hardening checklist
+## Production deployment
 
-Before production, the remaining hardening work is:
+For an internal Kubernetes deployment, set `"production": true` and run one broker replica with a ReadWriteOnce volume for `AUTHBROKER_DATA`. Production mode fails startup when unsafe settings are present: non-HTTPS issuer, insecure cookies, localhost or non-HTTPS redirects/WebAuthn origins, LDAP without LDAPS/StartTLS, `ldap.insecure_skip_verify`, missing admin groups, optional TOTP, missing PKCE, unbounded token/session TTLs, duplicate client IDs, or duplicate app-token IDs.
 
-- TLS-only deployment behind a trusted ingress/proxy, or via the built-in ACME terminator
-- encrypted secret storage for signing keys, TLS trust material, and deployment secrets
-- backup/restore for the `AUTHBROKER_DATA` directory
-- operational key rotation policy review for each deployment
-- group-mapping editor in the admin UI (currently config-only)
-- per-scope consent toggles (current consent screen is binary approve/deny)
-- editing of stored clients and app tokens (currently create + delete only)
-- app-token issuance audit, revocation strategy, per-app TTL review, and policy for who may generate each token profile
-- rate limiting and brute-force protection
-- audit log forwarding/retention: a structured JSON audit stream is emitted via `log/slog` for login, reauth, logout, TOTP enroll, WebAuthn register/login, token issuance, and revocation; deployments still need to ship and retain it
-- directory-specific group policy validation; LDAP group mapping and nested AD groups are implemented, but nested OpenLDAP group resolution and group lifecycle sync are not
-- OpenID Foundation conformance testing
-- WebAuthn conformance testing and broader attestation support
-- refresh-token reuse detection
-- OIDC front-channel/back-channel logout session notifications to relying parties if required; RP-initiated logout is implemented
+The Kubernetes starter manifest in `deploy/kubernetes/authbroker.yaml` uses a single-replica StatefulSet, non-root container security context, read-only root filesystem, RWO PVC, Service, TLS Ingress, NetworkPolicy, PodDisruptionBudget, `/livez` liveness, and `/readyz` readiness. Replace the example Secret, hostnames, LDAP settings, client hashes, image tag, ingress class assumptions, storage class, and network policy selectors before applying it.
+
+Operational release gates:
+
+- `make lint`
+- `make test`
+- `go test -race ./...`
+- `go run golang.org/x/vuln/cmd/govulncheck@latest ./...`
+- `docker build -t authbroker-go:verify .`
+- `make validate-k8s` with either `kubeconform` or `kubectl` installed
+
+`make verify` runs those gates together. The build is pinned to a patched Go toolchain so standard-library vulnerability scans do not pass by accident.
+
+Production operations still need deployment-specific work outside this repository:
+
+- encrypt Kubernetes Secrets, PVC snapshots, backups, and TLS trust material at the infrastructure layer
+- back up and restore-drill the full `AUTHBROKER_DATA` directory, including `data.db` and managed signing keys
+- forward and retain structured JSON request/audit logs; audit events include login, reauth, logout, TOTP enrollment, WebAuthn register/login, token issue/revoke/introspection, app-token issue, consent, admin mutations, and refresh-token reuse
+- scrape `/metrics` only when `metrics.enabled` is true; labels avoid usernames, tokens, raw groups, and client secrets
+- define app-token issuance policy, per-app TTLs, client-secret rotation, signing-key rotation, alerting, and incident-response runbooks
+- validate directory-specific group mapping and lifecycle behavior before go-live
+- run OIDC and WebAuthn conformance testing for the relying-party/browser mix you support
+- add OIDC front-channel/back-channel logout notifications if relying parties require them
 
 ## Important limitations
 
-This is a learning/reference implementation. It supports only WebAuthn `fmt: none` and ES256 credentials. It does not implement SAML, SCIM, dynamic client registration, token introspection, consent, or full enterprise lifecycle management.
+Production v1 is intentionally single-replica because the broker uses bbolt for local durable state. Multi-replica HA requires a future external/shared data-store design. The broker supports only WebAuthn `fmt: none` and ES256 credentials. It does not implement SAML, SCIM, dynamic client registration, nested OpenLDAP group resolution, group lifecycle sync, or full enterprise lifecycle management.

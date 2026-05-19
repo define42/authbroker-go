@@ -199,7 +199,7 @@ func (b *Broker) handleWebAuthnLoginFinish(w http.ResponseWriter, r *http.Reques
 	// time-distinguish "user exists" (runs the assertion verify) from "user
 	// doesn't exist" (short-circuits here) by spraying usernames at
 	// /webauthn/login/begin and submitting the resulting challenges.
-	rateKey := loginRateKey(r, ch.UserID)
+	rateKey := b.loginRateKey(r, ch.UserID)
 	if allowed, retry := b.loginLimiter.allow(rateKey); !allowed {
 		writeRetryAfter(w, retry)
 		b.auditEvent(r, auditEventWebAuthnLogin, auditOutcomeFailure,

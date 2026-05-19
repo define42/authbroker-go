@@ -21,6 +21,7 @@ const (
 	auditEventWebAuthnRegister = "webauthn_register"
 	auditEventWebAuthnLogin    = "webauthn_login"
 	auditEventTokenIssue       = "token_issue"
+	auditEventRefreshReuse     = "refresh_token_reuse"
 	auditEventTokenRevoke      = "token_revoke"
 	auditEventTokenIntrospect  = "token_introspect"
 	auditEventAppTokenIssue    = "app_token_issue" //nolint:gosec // event name, not a credential.
@@ -54,7 +55,10 @@ func (b *Broker) auditEvent(r *http.Request, event, outcome string, attrs ...slo
 	base = append(base, slog.String("event", event), slog.String("outcome", outcome))
 	ctx := context.Background()
 	if r != nil {
-		base = append(base, slog.String("client_ip", clientIP(r)))
+		base = append(base, slog.String("client_ip", b.clientIP(r)))
+		if requestID := requestIDFromContext(r.Context()); requestID != "" {
+			base = append(base, slog.String("request_id", requestID))
+		}
 		ctx = r.Context()
 	}
 	base = append(base, attrs...)

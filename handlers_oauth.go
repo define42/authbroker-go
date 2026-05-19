@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -173,9 +174,14 @@ func (b *Broker) handleToken(w http.ResponseWriter, r *http.Request) {
 		tokenError(w, "invalid_request", "bad form")
 		return
 	}
-	client, err := b.authenticateClient(r)
+	client, retry, err := b.authenticateClientRateLimited(r)
 	if err != nil {
 		w.Header().Set("WWW-Authenticate", `Basic realm="token"`)
+		if errors.Is(err, errClientAuthRateLimited) {
+			writeRetryAfter(w, retry)
+			tokenErrorStatus(w, http.StatusTooManyRequests, "invalid_client", "too many client authentication attempts")
+			return
+		}
 		tokenErrorStatus(w, http.StatusUnauthorized, "invalid_client", err.Error())
 		return
 	}
@@ -190,6 +196,37 @@ func (b *Broker) handleToken(w http.ResponseWriter, r *http.Request) {
 	default:
 		tokenError(w, "unsupported_grant_type", "unsupported grant_type")
 	}
+}
+
+var errClientAuthRateLimited = errors.New("client authentication rate limited")
+
+func (b *Broker) authenticateClientRateLimited(r *http.Request) (Client, time.Duration, error) {
+	id := clientIDFromRequest(r)
+	key := b.clientAuthRateKey(r, id)
+	if allowed, retry := b.tokenLimiter.allow(key); !allowed {
+		return Client{}, retry, errClientAuthRateLimited
+	}
+	client, err := b.authenticateClient(r)
+	if err != nil {
+		b.tokenLimiter.recordFailure(key)
+		return Client{}, 0, err
+	}
+	b.tokenLimiter.recordSuccess(key)
+	return client, 0, nil
+}
+
+func clientIDFromRequest(r *http.Request) string {
+	if id, _, ok := r.BasicAuth(); ok {
+		return strings.TrimSpace(id)
+	}
+	return strings.TrimSpace(r.Form.Get("client_id"))
+}
+
+func (b *Broker) clientAuthRateKey(r *http.Request, clientID string) string {
+	if clientID == "" {
+		clientID = "unknown"
+	}
+	return "ip:" + b.clientIP(r) + "/client:" + strings.ToLower(clientID)
 }
 
 func (b *Broker) authenticateClient(r *http.Request) (Client, error) {
@@ -286,6 +323,12 @@ func (b *Broker) tokenRefresh(w http.ResponseWriter, r *http.Request, client Cli
 	rt := r.Form.Get("refresh_token")
 	rtKey := hashSecret(rt)
 	requestedScope := strings.TrimSpace(r.Form.Get("scope"))
+	if handled, err := b.rejectConsumedRefreshToken(w, r, client, rtKey); err != nil {
+		tokenServerError(w, "load consumed refresh token", err)
+		return
+	} else if handled {
+		return
+	}
 	old, ok, err := b.store.GetRefreshToken(rtKey)
 	if err != nil {
 		tokenServerError(w, "load refresh token", err)
@@ -299,38 +342,36 @@ func (b *Broker) tokenRefresh(w http.ResponseWriter, r *http.Request, client Cli
 		tokenError(w, "invalid_grant", "invalid refresh_token")
 		return
 	}
-	if time.Now().After(old.ExpiresAt) || old.ClientID != client.ClientID {
-		if _, err := b.store.DeleteRefreshToken(rtKey); err != nil {
-			tokenServerError(w, "burn refresh token", err)
-			return
-		}
-		b.auditEvent(r, auditEventTokenIssue, auditOutcomeFailure,
-			slog.String("client_id", client.ClientID),
-			slog.String("user_id", old.UserID),
-			slog.String("grant_type", "refresh_token"),
-			slog.String("reason", "expired_or_client_mismatch"))
-		tokenError(w, "invalid_grant", "invalid refresh_token")
+	if handled, err := b.rejectExpiredOrMismatchedRefreshToken(w, r, client, rtKey, old); err != nil {
+		tokenServerError(w, "burn refresh token", err)
+		return
+	} else if handled {
 		return
 	}
 	// Per RFC 6749 §6, the client may request a narrower scope on refresh,
 	// but never one that exceeds the original grant. Reject scope expansion
 	// without consuming the refresh token so the legitimate client can retry.
-	if requestedScope != "" && !scopeSubset(requestedScope, old.Scope) {
-		b.auditEvent(r, auditEventTokenIssue, auditOutcomeFailure,
-			slog.String("client_id", client.ClientID),
-			slog.String("user_id", old.UserID),
-			slog.String("grant_type", "refresh_token"),
-			slog.String("reason", "scope_expansion"))
-		tokenError(w, "invalid_scope", "requested scope exceeds original grant")
+	if b.rejectRefreshScopeExpansion(w, r, client, old, requestedScope) {
 		return
 	}
-	// Single-use rotation: only the request that wins the CAS proceeds.
-	deleted, err := b.store.DeleteRefreshToken(rtKey)
+	scope := old.Scope
+	if requestedScope != "" {
+		scope = requestedScope
+	}
+	rotation := b.newRefreshRotation(old, client.ClientID, scope)
+	rotated, err := b.store.RotateRefreshToken(rtKey, rotation.key, rotation.next, rotation.consumed)
 	if err != nil {
 		tokenServerError(w, "rotate refresh token", err)
 		return
 	}
-	if !deleted {
+	if !rotated {
+		// A concurrent request rotated this refresh token between our
+		// GetRefreshToken and the rotation CAS. Treat as an honest retry:
+		// return invalid_grant without re-reading the consumed bucket, so a
+		// duplicate POST does not get reclassified as reuse and revoke the
+		// family that the winning request just established. True reuse — a
+		// second presentation after the rotation has fully committed — is
+		// caught by rejectConsumedRefreshToken at the top of tokenRefresh.
 		b.auditEvent(r, auditEventTokenIssue, auditOutcomeFailure,
 			slog.String("client_id", client.ClientID),
 			slog.String("user_id", old.UserID),
@@ -339,15 +380,12 @@ func (b *Broker) tokenRefresh(w http.ResponseWriter, r *http.Request, client Cli
 		tokenError(w, "invalid_grant", "invalid refresh_token")
 		return
 	}
-	scope := old.Scope
-	if requestedScope != "" {
-		scope = requestedScope
-	}
-	resp, err := b.issueUserTokens(old.UserID, client.ClientID, scope, "", old.AuthTime, old.AMR, true)
+	resp, err := b.issueUserTokens(old.UserID, client.ClientID, scope, "", old.AuthTime, old.AMR, false)
 	if err != nil {
 		tokenServerError(w, "issue tokens for refresh_token grant", err)
 		return
 	}
+	resp["refresh_token"] = rotation.plain
 	b.auditEvent(r, auditEventTokenIssue, auditOutcomeSuccess,
 		slog.String("client_id", client.ClientID),
 		slog.String("user_id", old.UserID),
@@ -355,6 +393,93 @@ func (b *Broker) tokenRefresh(w http.ResponseWriter, r *http.Request, client Cli
 		slog.String("scope", scope),
 		slog.Bool("refresh_token", true))
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (b *Broker) rejectExpiredOrMismatchedRefreshToken(w http.ResponseWriter, r *http.Request, client Client, key string, old RefreshToken) (bool, error) {
+	if !time.Now().After(old.ExpiresAt) && old.ClientID == client.ClientID {
+		return false, nil
+	}
+	if _, err := b.store.DeleteRefreshToken(key); err != nil {
+		return false, err
+	}
+	b.auditEvent(r, auditEventTokenIssue, auditOutcomeFailure,
+		slog.String("client_id", client.ClientID),
+		slog.String("user_id", old.UserID),
+		slog.String("grant_type", "refresh_token"),
+		slog.String("reason", "expired_or_client_mismatch"))
+	tokenError(w, "invalid_grant", "invalid refresh_token")
+	return true, nil
+}
+
+func (b *Broker) rejectRefreshScopeExpansion(w http.ResponseWriter, r *http.Request, client Client, old RefreshToken, requestedScope string) bool {
+	if requestedScope == "" || scopeSubset(requestedScope, old.Scope) {
+		return false
+	}
+	b.auditEvent(r, auditEventTokenIssue, auditOutcomeFailure,
+		slog.String("client_id", client.ClientID),
+		slog.String("user_id", old.UserID),
+		slog.String("grant_type", "refresh_token"),
+		slog.String("reason", "scope_expansion"))
+	tokenError(w, "invalid_scope", "requested scope exceeds original grant")
+	return true
+}
+
+type refreshRotation struct {
+	plain    string
+	key      string
+	next     RefreshToken
+	consumed ConsumedRefreshToken
+}
+
+func (b *Broker) newRefreshRotation(old RefreshToken, clientID, scope string) refreshRotation {
+	familyID := old.FamilyID
+	if familyID == "" {
+		familyID = randomB64(16)
+	}
+	plain := randomB64(32)
+	next := RefreshToken{
+		UserID:     old.UserID,
+		ClientID:   clientID,
+		Scope:      scope,
+		AuthTime:   old.AuthTime,
+		ExpiresAt:  time.Now().Add(time.Duration(b.cfg.RefreshTokenTTLDays) * 24 * time.Hour),
+		AMR:        old.AMR,
+		FamilyID:   familyID,
+		Generation: old.Generation + 1,
+	}
+	consumed := ConsumedRefreshToken{
+		UserID:    old.UserID,
+		ClientID:  clientID,
+		FamilyID:  familyID,
+		ExpiresAt: old.ExpiresAt,
+	}
+	return refreshRotation{plain: plain, key: hashSecret(plain), next: next, consumed: consumed}
+}
+
+func (b *Broker) rejectConsumedRefreshToken(w http.ResponseWriter, r *http.Request, client Client, key string) (bool, error) {
+	consumed, reused, err := b.store.GetConsumedRefreshToken(key)
+	if err != nil {
+		return false, err
+	}
+	if reused && !time.Now().After(consumed.ExpiresAt) {
+		b.handleRefreshTokenReuse(w, r, client, consumed)
+		return true, nil
+	}
+	return false, nil
+}
+
+func (b *Broker) handleRefreshTokenReuse(w http.ResponseWriter, r *http.Request, client Client, consumed ConsumedRefreshToken) {
+	if consumed.ClientID == client.ClientID {
+		if err := b.store.RevokeRefreshTokenFamily(consumed.FamilyID); err != nil {
+			tokenServerError(w, "revoke refresh token family", err)
+			return
+		}
+		b.auditEvent(r, auditEventRefreshReuse, auditOutcomeFailure,
+			slog.String("client_id", client.ClientID),
+			slog.String("user_id", consumed.UserID),
+			slog.String("family_id", consumed.FamilyID))
+	}
+	tokenError(w, "invalid_grant", "invalid refresh_token")
 }
 
 func scopeSubset(requested, granted string) bool {
@@ -494,12 +619,14 @@ func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime
 	if includeRefresh {
 		rt := randomB64(32)
 		refreshToken := RefreshToken{
-			UserID:    userID,
-			ClientID:  clientID,
-			Scope:     scope,
-			AuthTime:  authTime,
-			ExpiresAt: now.Add(time.Duration(b.cfg.RefreshTokenTTLDays) * 24 * time.Hour),
-			AMR:       amr,
+			UserID:     userID,
+			ClientID:   clientID,
+			Scope:      scope,
+			AuthTime:   authTime,
+			ExpiresAt:  now.Add(time.Duration(b.cfg.RefreshTokenTTLDays) * 24 * time.Hour),
+			AMR:        amr,
+			FamilyID:   randomB64(16),
+			Generation: 0,
 		}
 		if err := b.store.PutRefreshToken(hashSecret(rt), refreshToken); err != nil {
 			return nil, err
@@ -643,11 +770,16 @@ func (b *Broker) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 		tokenError(w, "invalid_request", "bad form")
 		return
 	}
-	client, err := b.authenticateClient(r)
+	client, retry, err := b.authenticateClientRateLimited(r)
 	if err != nil {
 		w.Header().Set("WWW-Authenticate", `Basic realm="introspect"`)
 		b.auditEvent(r, auditEventTokenIntrospect, auditOutcomeFailure,
 			slog.String("reason", "unauthenticated_client"))
+		if errors.Is(err, errClientAuthRateLimited) {
+			writeRetryAfter(w, retry)
+			tokenErrorStatus(w, http.StatusTooManyRequests, "invalid_client", "too many client authentication attempts")
+			return
+		}
 		tokenErrorStatus(w, http.StatusUnauthorized, "invalid_client", err.Error())
 		return
 	}
@@ -767,11 +899,16 @@ func introspectClientOwnsToken(claims map[string]any, clientID string) bool {
 func (b *Broker) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRevokeBodyBytes)
 	_ = r.ParseForm()
-	client, err := b.authenticateClient(r)
+	client, retry, err := b.authenticateClientRateLimited(r)
 	if err != nil {
 		// RFC 7009 expects client authentication; still avoid token oracle details.
 		b.auditEvent(r, auditEventTokenRevoke, auditOutcomeFailure,
 			slog.String("reason", "unauthenticated_client"))
+		if errors.Is(err, errClientAuthRateLimited) {
+			writeRetryAfter(w, retry)
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}

@@ -70,3 +70,15 @@ jobs:
 
       - name: Run unit tests with race detector
         run: go test -race ./...
+
+      - name: Run govulncheck
+        if: matrix.go-version == ''
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      - name: Build Docker image
+        if: matrix.go-version == ''
+        run: docker build -t authbroker-go:ci .
+
+      - name: Validate Kubernetes manifests
+        if: matrix.go-version == ''
+        run: docker run --rm -v "$PWD:/work" ghcr.io/yannh/kubeconform:latest -strict -summary /work/deploy/kubernetes

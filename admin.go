@@ -103,17 +103,20 @@ func (b *Broker) handleAdminClientsCreate(w http.ResponseWriter, r *http.Request
 		b.adminClientsFormRedirect(w, r, "at least one redirect_uri is required")
 		return
 	}
-	for _, u := range redirectURIs {
-		if _, err := url.ParseRequestURI(u); err != nil {
-			b.adminClientsFormRedirect(w, r, "invalid redirect_uri: "+u)
-			return
-		}
+	postLogoutRedirectURIs := splitFormLines(r.Form.Get("post_logout_redirect_uris"))
+	if err := b.validateAdminClientRedirects(clientID, redirectURIs, postLogoutRedirectURIs); err != nil {
+		b.adminClientsFormRedirect(w, r, err.Error())
+		return
+	}
+	if b.cfg.Production && r.Form.Get("require_pkce") != "on" {
+		b.adminClientsFormRedirect(w, r, "production clients must require PKCE")
+		return
 	}
 
 	client := Client{
 		ClientID:               clientID,
 		RedirectURIs:           redirectURIs,
-		PostLogoutRedirectURIs: splitFormLines(r.Form.Get("post_logout_redirect_uris")),
+		PostLogoutRedirectURIs: postLogoutRedirectURIs,
 		Public:                 r.Form.Get("public") == "on",
 		RequirePKCE:            r.Form.Get("require_pkce") == "on",
 		RequireConsent:         r.Form.Get("require_consent") == "on",
@@ -147,6 +150,28 @@ func (b *Broker) handleAdminClientsCreate(w http.ResponseWriter, r *http.Request
 		"ClientSecret": secretPlain,
 		"Public":       client.Public,
 	})
+}
+
+func (b *Broker) validateAdminClientRedirects(clientID string, redirectURIs, postLogoutRedirectURIs []string) error {
+	for _, u := range redirectURIs {
+		if _, err := url.ParseRequestURI(u); err != nil {
+			return fmt.Errorf("invalid redirect_uri: %s", u)
+		}
+	}
+	if !b.cfg.Production {
+		return nil
+	}
+	for _, u := range redirectURIs {
+		if err := validateProductionRedirectURI(clientID, u); err != nil {
+			return err
+		}
+	}
+	for _, u := range postLogoutRedirectURIs {
+		if err := validateProductionRedirectURI(clientID, u); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (b *Broker) handleAdminClientsDelete(w http.ResponseWriter, r *http.Request) {
@@ -234,6 +259,10 @@ func (b *Broker) handleAdminAppTokensCreate(w http.ResponseWriter, r *http.Reque
 	ttl, err := parseAdminTokenTTL(r.Form.Get("token_ttl_minutes"))
 	if err != nil {
 		b.adminAppTokensFormRedirect(w, r, err.Error())
+		return
+	}
+	if b.cfg.Production && !within(ttl, 1, 1440) {
+		b.adminAppTokensFormRedirect(w, r, "production app-token ttl must be between 1 and 1440 minutes")
 		return
 	}
 	displayName := strings.TrimSpace(r.Form.Get("display_name"))

@@ -42,28 +42,30 @@ type WebAuthnCredential struct {
 // StoredRuntimeState is a snapshot of all runtime buckets, used by tests
 // that need to assert presence/absence of entries.
 type StoredRuntimeState struct {
-	Sessions      map[string]Session
-	AuthRequests  map[string]AuthorizationRequest
-	AuthCodes     map[string]AuthCode
-	RefreshTokens map[string]RefreshToken
-	RevokedJTIs   map[string]time.Time
-	WebAuthnReg   map[string]ChallengeRecord
-	WebAuthnLog   map[string]ChallengeRecord
+	Sessions              map[string]Session
+	AuthRequests          map[string]AuthorizationRequest
+	AuthCodes             map[string]AuthCode
+	RefreshTokens         map[string]RefreshToken
+	ConsumedRefreshTokens map[string]ConsumedRefreshToken
+	RevokedJTIs           map[string]time.Time
+	WebAuthnReg           map[string]ChallengeRecord
+	WebAuthnLog           map[string]ChallengeRecord
 }
 
 const (
-	bucketUsers         = "users"
-	bucketSessions      = "sessions"
-	bucketAuthRequests  = "auth_requests"
-	bucketAuthCodes     = "auth_codes"
-	bucketRefreshTokens = "refresh_tokens"
-	bucketRevokedJTIs   = "revoked_jtis"
-	bucketWebAuthnReg   = "webauthn_registration_challenges"
-	bucketWebAuthnLog   = "webauthn_login_challenges"
-	bucketSigningKeys   = "signing_keys"
-	bucketClients       = "clients"
-	bucketAppTokens     = "app_tokens"
-	bucketConsents      = "consents"
+	bucketUsers                 = "users"
+	bucketSessions              = "sessions"
+	bucketAuthRequests          = "auth_requests"
+	bucketAuthCodes             = "auth_codes"
+	bucketRefreshTokens         = "refresh_tokens"
+	bucketConsumedRefreshTokens = "consumed_refresh_tokens"
+	bucketRevokedJTIs           = "revoked_jtis"
+	bucketWebAuthnReg           = "webauthn_registration_challenges"
+	bucketWebAuthnLog           = "webauthn_login_challenges"
+	bucketSigningKeys           = "signing_keys"
+	bucketClients               = "clients"
+	bucketAppTokens             = "app_tokens"
+	bucketConsents              = "consents"
 )
 
 // signingKeySetKey is the single bbolt key under bucketSigningKeys that holds
@@ -78,6 +80,7 @@ func allBuckets() []string {
 		bucketAuthRequests,
 		bucketAuthCodes,
 		bucketRefreshTokens,
+		bucketConsumedRefreshTokens,
 		bucketRevokedJTIs,
 		bucketWebAuthnReg,
 		bucketWebAuthnLog,
@@ -121,6 +124,18 @@ func (s *Store) Close() error {
 		return nil
 	}
 	return s.db.Close()
+}
+
+func (s *Store) Ready() error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("store is not open")
+	}
+	return s.db.View(func(tx *bolt.Tx) error {
+		if bucket(tx, bucketUsers) == nil || bucket(tx, bucketSigningKeys) == nil {
+			return fmt.Errorf("store buckets are not initialized")
+		}
+		return nil
+	})
 }
 
 // -- Users -----------------------------------------------------------------
@@ -437,6 +452,73 @@ func (s *Store) DeleteRefreshToken(key string) (bool, error) {
 	return deleted, err
 }
 
+func (s *Store) GetConsumedRefreshToken(key string) (ConsumedRefreshToken, bool, error) {
+	var rec ConsumedRefreshToken
+	var found bool
+	err := s.db.View(func(tx *bolt.Tx) error {
+		v := bucket(tx, bucketConsumedRefreshTokens).Get([]byte(key))
+		if v == nil {
+			return nil
+		}
+		found = true
+		return json.Unmarshal(v, &rec)
+	})
+	return rec, found, err
+}
+
+// RotateRefreshToken consumes oldKey and writes both the new active refresh
+// token and a tombstone for oldKey in one bbolt transaction. The returned
+// boolean is false when oldKey was already consumed by a concurrent request.
+func (s *Store) RotateRefreshToken(oldKey, newKey string, next RefreshToken, consumed ConsumedRefreshToken) (bool, error) {
+	rotated := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		active := bucket(tx, bucketRefreshTokens)
+		if active.Get([]byte(oldKey)) == nil {
+			return nil
+		}
+		if err := active.Delete([]byte(oldKey)); err != nil {
+			return err
+		}
+		if err := putJSON(bucket(tx, bucketConsumedRefreshTokens), []byte(oldKey), consumed); err != nil {
+			return err
+		}
+		if err := putJSON(active, []byte(newKey), next); err != nil {
+			return err
+		}
+		rotated = true
+		return nil
+	})
+	return rotated, err
+}
+
+func (s *Store) RevokeRefreshTokenFamily(familyID string) error {
+	if familyID == "" {
+		return nil
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := bucket(tx, bucketRefreshTokens)
+		var stale [][]byte
+		if err := b.ForEach(func(k, v []byte) error {
+			var rt RefreshToken
+			if err := json.Unmarshal(v, &rt); err != nil {
+				return err
+			}
+			if rt.FamilyID == familyID {
+				stale = append(stale, append([]byte(nil), k...))
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, key := range stale {
+			if err := b.Delete(key); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // -- RevokedJTIs -----------------------------------------------------------
 
 func (s *Store) GetRevokedJTI(jti string) (time.Time, bool, error) {
@@ -559,6 +641,11 @@ func (s *Store) SweepExpired(now time.Time) (int, error) {
 		if err != nil {
 			return err
 		}
+		removed, err = sweepBucketTx[ConsumedRefreshToken](tx, bucketConsumedRefreshTokens, func(v ConsumedRefreshToken) time.Time { return v.ExpiresAt }, now)
+		total += removed
+		if err != nil {
+			return err
+		}
 		removed, err = sweepBucketTx[time.Time](tx, bucketRevokedJTIs, func(v time.Time) time.Time { return v }, now)
 		total += removed
 		if err != nil {
@@ -609,19 +696,21 @@ func sweepBucketTx[T any](tx *bolt.Tx, name string, expiresAt func(T) time.Time,
 // hot request path.
 func (s *Store) RuntimeSnapshot() StoredRuntimeState {
 	state := StoredRuntimeState{
-		Sessions:      map[string]Session{},
-		AuthRequests:  map[string]AuthorizationRequest{},
-		AuthCodes:     map[string]AuthCode{},
-		RefreshTokens: map[string]RefreshToken{},
-		RevokedJTIs:   map[string]time.Time{},
-		WebAuthnReg:   map[string]ChallengeRecord{},
-		WebAuthnLog:   map[string]ChallengeRecord{},
+		Sessions:              map[string]Session{},
+		AuthRequests:          map[string]AuthorizationRequest{},
+		AuthCodes:             map[string]AuthCode{},
+		RefreshTokens:         map[string]RefreshToken{},
+		ConsumedRefreshTokens: map[string]ConsumedRefreshToken{},
+		RevokedJTIs:           map[string]time.Time{},
+		WebAuthnReg:           map[string]ChallengeRecord{},
+		WebAuthnLog:           map[string]ChallengeRecord{},
 	}
 	_ = s.db.View(func(tx *bolt.Tx) error {
 		loadBucketView(tx, bucketSessions, state.Sessions)
 		loadBucketView(tx, bucketAuthRequests, state.AuthRequests)
 		loadBucketView(tx, bucketAuthCodes, state.AuthCodes)
 		loadBucketView(tx, bucketRefreshTokens, state.RefreshTokens)
+		loadBucketView(tx, bucketConsumedRefreshTokens, state.ConsumedRefreshTokens)
 		loadBucketView(tx, bucketRevokedJTIs, state.RevokedJTIs)
 		loadBucketView(tx, bucketWebAuthnReg, state.WebAuthnReg)
 		loadBucketView(tx, bucketWebAuthnLog, state.WebAuthnLog)
@@ -644,6 +733,9 @@ func (s *Store) SeedRuntimeState(state StoredRuntimeState) error {
 			return err
 		}
 		if err := seedBucketTx(tx, bucketRefreshTokens, state.RefreshTokens); err != nil {
+			return err
+		}
+		if err := seedBucketTx(tx, bucketConsumedRefreshTokens, state.ConsumedRefreshTokens); err != nil {
 			return err
 		}
 		if err := seedBucketTx(tx, bucketRevokedJTIs, state.RevokedJTIs); err != nil {

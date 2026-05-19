@@ -62,12 +62,21 @@ type AuthCode struct {
 
 // RefreshToken is keyed in the RefreshTokens map by hashSecret(token).
 type RefreshToken struct {
+	UserID     string
+	ClientID   string
+	Scope      string
+	AuthTime   time.Time
+	ExpiresAt  time.Time
+	AMR        []string
+	FamilyID   string
+	Generation int
+}
+
+type ConsumedRefreshToken struct {
 	UserID    string
 	ClientID  string
-	Scope     string
-	AuthTime  time.Time
+	FamilyID  string
 	ExpiresAt time.Time
-	AMR       []string
 }
 
 type ChallengeRecord struct {
@@ -96,8 +105,12 @@ type Broker struct {
 	storedAppTokens map[string]AppTokenConfig
 
 	loginLimiter *loginRateLimiter
+	tokenLimiter *loginRateLimiter
+	proxies      trustedProxySet
 
-	audit *slog.Logger
+	audit      *slog.Logger
+	requestLog *slog.Logger
+	metrics    *metricsRegistry
 }
 
 const (
@@ -108,17 +121,15 @@ const (
 	// password constantly. See handleReAuth.
 	reAuthValidity = 5 * time.Minute
 
-	// loginRateLimit configuration. After loginRateLimitMaxAttempts failed
-	// attempts within loginRateLimitWindow, the limiter locks out the key
-	// (per IP + username) for loginRateLockout.
-	loginRateLimitWindow      = 5 * time.Minute
-	loginRateLimitMaxAttempts = 10
-	loginRateLockout          = 15 * time.Minute
+	loginRateLimitMaxAttempts = defaultLoginRateMaxAttempts
 )
 
-//nolint:gocognit,funlen // Broker construction validates clients, app tokens, and signing material together.
+//nolint:gocognit,cyclop,funlen // Broker construction validates clients, app tokens, and signing material together.
 func NewBroker(cfg Config, store *Store) (*Broker, error) {
 	normalizeConfig(&cfg)
+	if err := validateConfig(cfg); err != nil {
+		return nil, err
+	}
 
 	activeKey, verifyKeys, publicJWKs, err := buildSigningKeySet(cfg)
 	if err != nil {
@@ -141,6 +152,9 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 	for _, c := range cfg.Clients {
 		if c.ClientID == "" {
 			return nil, fmt.Errorf("client_id is required")
+		}
+		if _, exists := clientMap[c.ClientID]; exists {
+			return nil, fmt.Errorf("duplicate client_id %q", c.ClientID)
 		}
 		groupMappings, err := normalizeClientGroupMappings(c.GroupMappings)
 		if err != nil {
@@ -175,6 +189,11 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 		log.Printf("WARNING: ldap.insecure_skip_verify is enabled — server TLS certificate is not validated. Use only for local fixtures.")
 	}
 
+	proxies, err := newTrustedProxySet(cfg.TrustedProxies)
+	if err != nil {
+		return nil, err
+	}
+
 	b := &Broker{
 		cfg:             cfg,
 		store:           store,
@@ -186,8 +205,20 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 		appTokens:       appTokenMap,
 		storedClients:   map[string]Client{},
 		storedAppTokens: map[string]AppTokenConfig{},
-		loginLimiter:    newLoginRateLimiter(loginRateLimitWindow, loginRateLimitMaxAttempts, loginRateLockout),
-		audit:           newAuditLogger(nil),
+		loginLimiter: newLoginRateLimiter(
+			time.Duration(cfg.RateLimit.LoginWindowSeconds)*time.Second,
+			cfg.RateLimit.LoginMaxAttempts,
+			time.Duration(cfg.RateLimit.LoginLockoutSeconds)*time.Second,
+		),
+		tokenLimiter: newLoginRateLimiter(
+			time.Duration(cfg.RateLimit.TokenWindowSeconds)*time.Second,
+			cfg.RateLimit.TokenMaxAttempts,
+			time.Duration(cfg.RateLimit.TokenLockoutSeconds)*time.Second,
+		),
+		proxies:    proxies,
+		audit:      newAuditLogger(nil),
+		requestLog: newRequestLogger(nil),
+		metrics:    newMetricsRegistry(),
 	}
 	if err := b.reloadStoredRegistries(); err != nil {
 		return nil, fmt.Errorf("load stored registries: %w", err)
@@ -362,7 +393,7 @@ func (b *Broker) routes() http.Handler {
 	mux.HandleFunc("GET /assets/authbroker.css", b.handleStylesheet)
 	mux.HandleFunc("GET /assets/authbroker.js", b.handleScript)
 	mux.HandleFunc("GET /", b.handleHome)
-	mux.HandleFunc("GET /healthz", b.handleHealth)
+	b.registerOperationalRoutes(mux)
 	mux.HandleFunc("GET /.well-known/openid-configuration", b.handleDiscovery)
 	mux.HandleFunc("GET /oauth2/jwks", b.handleJWKS)
 	mux.HandleFunc("GET /oauth2/authorize", b.handleAuthorize)
@@ -394,7 +425,16 @@ func (b *Broker) routes() http.Handler {
 	mux.HandleFunc("GET /admin/app-tokens/new", b.handleAdminAppTokensNew)
 	mux.HandleFunc("POST /admin/app-tokens", b.handleAdminAppTokensCreate)
 	mux.HandleFunc("POST /admin/app-tokens/{id}/delete", b.handleAdminAppTokensDelete)
-	return b.securityHeaders(mux)
+	return b.observability(b.securityHeaders(mux))
+}
+
+func (b *Broker) registerOperationalRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /healthz", b.handleHealth)
+	mux.HandleFunc("GET /livez", b.handleLive)
+	mux.HandleFunc("GET /readyz", b.handleReady)
+	if b.cfg.Metrics.Enabled {
+		mux.HandleFunc("GET "+b.cfg.Metrics.Path, b.handleMetrics)
+	}
 }
 
 func (b *Broker) securityHeaders(next http.Handler) http.Handler {

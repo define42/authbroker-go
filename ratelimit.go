@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -133,4 +134,74 @@ func clientIP(r *http.Request) string {
 		return strings.TrimSpace(r.RemoteAddr)
 	}
 	return host
+}
+
+type trustedProxySet struct {
+	nets []*net.IPNet
+}
+
+func newTrustedProxySet(values []string) (trustedProxySet, error) {
+	set := trustedProxySet{}
+	for _, raw := range values {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if strings.Contains(raw, "/") {
+			_, ipNet, err := net.ParseCIDR(raw)
+			if err != nil {
+				return trustedProxySet{}, fmt.Errorf("trusted proxy %q: %w", raw, err)
+			}
+			set.nets = append(set.nets, ipNet)
+			continue
+		}
+		ip := net.ParseIP(raw)
+		if ip == nil {
+			return trustedProxySet{}, fmt.Errorf("trusted proxy %q is not an IP or CIDR", raw)
+		}
+		bits := 32
+		if ip.To4() == nil {
+			bits = 128
+		}
+		set.nets = append(set.nets, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+	}
+	return set, nil
+}
+
+func (s trustedProxySet) empty() bool {
+	return len(s.nets) == 0
+}
+
+func (s trustedProxySet) containsString(raw string) bool {
+	ip := net.ParseIP(strings.TrimSpace(raw))
+	if ip == nil {
+		return false
+	}
+	for _, ipNet := range s.nets {
+		if ipNet.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Broker) clientIP(r *http.Request) string {
+	remote := clientIP(r)
+	if b == nil || r == nil || b.proxies.empty() || !b.proxies.containsString(remote) {
+		return remote
+	}
+	if ip := clientIPFromHeader(r.Header.Get(b.cfg.ClientIPHeader)); ip != "" {
+		return ip
+	}
+	return remote
+}
+
+func clientIPFromHeader(value string) string {
+	for _, part := range strings.Split(value, ",") {
+		ip := strings.TrimSpace(part)
+		if net.ParseIP(ip) != nil {
+			return ip
+		}
+	}
+	return ""
 }

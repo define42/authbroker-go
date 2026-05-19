@@ -1,0 +1,280 @@
+package main
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+)
+
+func productionTestConfig() Config {
+	return Config{
+		Production:            true,
+		Issuer:                "https://auth.example.com",
+		Listen:                ":0",
+		CookieSecure:          boolPtr(true),
+		AdminGroups:           []string{"authbroker-admins"},
+		AccessTokenTTLMinutes: 15,
+		IDTokenTTLMinutes:     15,
+		RefreshTokenTTLDays:   14,
+		AuthCodeTTLSeconds:    120,
+		SessionTTLHrs:         8,
+		LDAP: LDAPConfig{
+			URL:            "ldaps://dc01.example.com:636",
+			BaseDN:         "dc=example,dc=com",
+			UserFilter:     "(userPrincipalName={login})",
+			TimeoutSeconds: 5,
+		},
+		MFA: MFAConfig{TOTPRequired: true},
+		WebAuthn: WebAuthnConfig{
+			RPID:          "auth.example.com",
+			RPDisplayName: "Example Auth",
+			Origins:       []string{"https://auth.example.com"},
+		},
+		Clients: []Client{{
+			ClientID:               "internal-web",
+			ClientSecretSHA256:     strings.Repeat("a", 64),
+			RedirectURIs:           []string{"https://app.example.com/callback"},
+			PostLogoutRedirectURIs: []string{"https://app.example.com/"},
+			RequirePKCE:            true,
+			RequireConsent:         true,
+		}},
+		AppTokens: []AppTokenConfig{{
+			ID:              "internal-api",
+			TokenTTLMinutes: 120,
+		}},
+	}
+}
+
+func TestProductionConfigValidationPasses(t *testing.T) {
+	cfg := productionTestConfig()
+	normalizeConfig(&cfg)
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("validate production config: %v", err)
+	}
+}
+
+func TestProductionConfigValidationFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*Config)
+		want string
+	}{
+		{
+			name: "http issuer",
+			edit: func(cfg *Config) { cfg.Issuer = "http://auth.example.com" },
+			want: "https issuer",
+		},
+		{
+			name: "insecure cookies",
+			edit: func(cfg *Config) { cfg.CookieSecure = boolPtr(false) },
+			want: "secure cookies",
+		},
+		{
+			name: "totp optional",
+			edit: func(cfg *Config) { cfg.MFA.TOTPRequired = false },
+			want: "totp_required",
+		},
+		{
+			name: "ldap insecure skip verify",
+			edit: func(cfg *Config) { cfg.LDAP.InsecureSkipVerify = true },
+			want: "insecure_skip_verify",
+		},
+		{
+			name: "pkce optional",
+			edit: func(cfg *Config) { cfg.Clients[0].RequirePKCE = false },
+			want: "PKCE",
+		},
+		{
+			name: "localhost redirect",
+			edit: func(cfg *Config) { cfg.Clients[0].RedirectURIs = []string{"https://localhost/callback"} },
+			want: "localhost",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := productionTestConfig()
+			tt.edit(&cfg)
+			normalizeConfig(&cfg)
+			err := validateConfig(cfg)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("validate error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestDuplicateClientIDRejected(t *testing.T) {
+	cfg := productionTestConfig()
+	cfg.Production = false
+	cfg.Clients = append(cfg.Clients, cfg.Clients[0])
+	normalizeConfig(&cfg)
+	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "duplicate client_id") {
+		t.Fatalf("validate duplicate client = %v", err)
+	}
+}
+
+func TestTrustedProxyClientIP(t *testing.T) {
+	cfg := productionTestConfig()
+	cfg.Production = false
+	cfg.TrustedProxies = []string{"10.0.0.0/8"}
+	cfg.ClientIPHeader = "X-Forwarded-For"
+	broker, err := NewBroker(cfg, mustNewStore(t))
+	if err != nil {
+		t.Fatalf("new broker: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "10.2.3.4:12345"
+	req.Header.Set("X-Forwarded-For", "203.0.113.10, 10.2.3.4")
+	if got := broker.clientIP(req); got != "203.0.113.10" {
+		t.Fatalf("trusted proxy client ip = %q", got)
+	}
+
+	req.RemoteAddr = "192.0.2.20:12345"
+	if got := broker.clientIP(req); got != "192.0.2.20" {
+		t.Fatalf("untrusted proxy client ip = %q", got)
+	}
+}
+
+func TestHealthReadyAndMetricsEndpoints(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	broker.cfg.Metrics.Enabled = true
+	broker.cfg.Metrics.Path = "/metrics"
+
+	for _, path := range []string{"/healthz", "/livez", "/readyz"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rr := httptest.NewRecorder()
+		broker.routes().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%s status = %d body=%s", path, rr.Code, rr.Body.String())
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rr := httptest.NewRecorder()
+	broker.routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "authbroker_http_requests_total") {
+		t.Fatalf("metrics body = %q", rr.Body.String())
+	}
+}
+
+func TestOAuthClientAuthenticationRateLimited(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	broker.tokenLimiter = newLoginRateLimiter(time.Minute, 1, time.Hour)
+	form := url.Values{"grant_type": {"client_credentials"}}
+
+	req1 := httptest.NewRequest(http.MethodPost, "/oauth2/token", strings.NewReader(form.Encode()))
+	req1.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req1.RemoteAddr = "192.0.2.50:1234"
+	req1.SetBasicAuth("demo-web", "wrong")
+	rr1 := httptest.NewRecorder()
+	broker.handleToken(rr1, req1)
+	if rr1.Code != http.StatusUnauthorized {
+		t.Fatalf("first bad auth status = %d", rr1.Code)
+	}
+
+	req2 := httptest.NewRequest(http.MethodPost, "/oauth2/token", strings.NewReader(form.Encode()))
+	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req2.RemoteAddr = "192.0.2.50:1234"
+	req2.SetBasicAuth("demo-web", "wrong")
+	rr2 := httptest.NewRecorder()
+	broker.handleToken(rr2, req2)
+	if rr2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second bad auth status = %d body=%s", rr2.Code, rr2.Body.String())
+	}
+}
+
+func TestTOTPEnrollVerifyRateLimited(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	broker.loginLimiter = newLoginRateLimiter(time.Minute, 1, time.Hour)
+	sid := "totp-session"
+	sess := Session{
+		UserID:    "alice",
+		ExpiresAt: time.Now().Add(time.Hour),
+		AuthTime:  time.Now(),
+		ReAuthAt:  time.Now(),
+		CSRFToken: "csrf",
+	}
+	if err := broker.store.PutSession(sid, sess); err != nil {
+		t.Fatalf("put session: %v", err)
+	}
+	if err := broker.store.SetPendingTOTP("alice", "JBSWY3DPEHPK3PXP"); err != nil {
+		t.Fatalf("set pending totp: %v", err)
+	}
+
+	for i, want := range []int{http.StatusUnauthorized, http.StatusTooManyRequests} {
+		req := httptest.NewRequest(http.MethodPost, "/mfa/totp/verify", strings.NewReader("otp=000000"))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.RemoteAddr = "192.0.2.60:1234"
+		addSessionCookie(req, sid)
+		rr := httptest.NewRecorder()
+		broker.handleTOTPEnrollVerify(rr, req)
+		if rr.Code != want {
+			t.Fatalf("attempt %d status = %d want %d body=%s", i+1, rr.Code, want, rr.Body.String())
+		}
+	}
+}
+
+func TestRefreshTokenReuseRevokesFamily(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	now := time.Now()
+	original := "refresh-original"
+	if err := broker.store.PutRefreshToken(hashSecret(original), RefreshToken{
+		UserID:    "alice",
+		ClientID:  "demo-web",
+		Scope:     "openid offline_access",
+		AuthTime:  now,
+		ExpiresAt: now.Add(time.Hour),
+		FamilyID:  "family-1",
+	}); err != nil {
+		t.Fatalf("seed refresh token: %v", err)
+	}
+
+	first := refreshTokenRequest(original)
+	firstRR := httptest.NewRecorder()
+	broker.handleToken(firstRR, first)
+	if firstRR.Code != http.StatusOK {
+		t.Fatalf("first refresh status = %d body=%s", firstRR.Code, firstRR.Body.String())
+	}
+	var firstBody map[string]any
+	if err := json.Unmarshal(firstRR.Body.Bytes(), &firstBody); err != nil {
+		t.Fatalf("decode first refresh: %v", err)
+	}
+	rotated, _ := firstBody["refresh_token"].(string)
+	if rotated == "" {
+		t.Fatal("first refresh did not return a rotated refresh token")
+	}
+
+	reuse := refreshTokenRequest(original)
+	reuseRR := httptest.NewRecorder()
+	broker.handleToken(reuseRR, reuse)
+	if reuseRR.Code != http.StatusBadRequest {
+		t.Fatalf("reuse status = %d body=%s", reuseRR.Code, reuseRR.Body.String())
+	}
+	if _, ok, err := broker.store.GetRefreshToken(hashSecret(rotated)); err != nil || ok {
+		t.Fatalf("rotated token active after family revoke: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := broker.store.GetConsumedRefreshToken(hashSecret(original)); err != nil || !ok {
+		t.Fatalf("consumed original missing: ok=%v err=%v", ok, err)
+	}
+}
+
+func refreshTokenRequest(refreshToken string) *http.Request {
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refreshToken},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/oauth2/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.RemoteAddr = "192.0.2.70:1234"
+	req.SetBasicAuth("demo-web", "demo-secret")
+	return req
+}
