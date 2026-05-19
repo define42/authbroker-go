@@ -272,16 +272,25 @@ func ldapAndFilter(filters ...string) string {
 	return "(&" + strings.Join(parts, "") + ")"
 }
 
+// mergeStrings concatenates the inputs and removes duplicates. Dedup is
+// case-insensitive to match ldapGroupIdentifiers — otherwise a direct
+// memberOf entry like `CN=admins,…` and a nested-search entry like
+// `CN=Admins,…` would both survive, and downstream group_mappings would
+// fire twice for what AD/OpenLDAP treat as the same group.
 func mergeStrings(values ...[]string) []string {
 	seen := map[string]bool{}
 	out := []string{}
 	for _, slice := range values {
 		for _, value := range slice {
 			value = strings.TrimSpace(value)
-			if value == "" || seen[value] {
+			if value == "" {
 				continue
 			}
-			seen[value] = true
+			key := strings.ToLower(value)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
 			out = append(out, value)
 		}
 	}

@@ -595,15 +595,14 @@ func TestHandleLogoutAllowedPostLogoutRedirect(t *testing.T) {
 		"post_logout_redirect_uri": {"http://app.example/"},
 		"state":                    {"xyz"},
 	}
+	// A GET without a session AND without id_token_hint is refused, so the
+	// broker cannot be turned into a low-friction redirector to any
+	// registered post_logout_redirect_uri with attacker-controlled state.
 	req := httptest.NewRequest(http.MethodGet, "/oauth2/logout?"+q.Encode(), nil)
 	rr := httptest.NewRecorder()
 	broker.handleLogout(rr, req)
-	if rr.Code != http.StatusFound {
-		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
-	}
-	loc := rr.Header().Get("Location")
-	if !strings.Contains(loc, "state=xyz") {
-		t.Fatalf("Location = %q", loc)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unauthenticated GET without id_token_hint, got %d body=%s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -919,6 +918,35 @@ func TestHandleLoginPostRateLimited(t *testing.T) {
 	}
 	if rr.Header().Get("Retry-After") == "" {
 		t.Fatal("expected Retry-After header")
+	}
+}
+
+func TestHandleLoginPostIPRateLimitsUsernameSpray(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	broker.authn = staticAuthenticator{err: errors.New("nope")}
+	broker.loginLimiter = newLoginRateLimiter(time.Minute, 2, time.Hour)
+
+	token, cookie := loginCSRF(t, broker)
+	for i, username := range []string{"alice", "bob", "charlie"} {
+		form := url.Values{
+			"username":   {username},
+			"password":   {"wrong"},
+			"csrf_token": {token},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.RemoteAddr = "198.51.100.9:1234"
+		req.AddCookie(cookie)
+		rr := httptest.NewRecorder()
+		broker.handleLoginPost(rr, req)
+
+		want := http.StatusUnauthorized
+		if i == 2 {
+			want = http.StatusTooManyRequests
+		}
+		if rr.Code != want {
+			t.Fatalf("attempt %d status = %d want %d body=%s", i+1, rr.Code, want, rr.Body.String())
+		}
 	}
 }
 

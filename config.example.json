@@ -30,7 +30,8 @@
 
   "metrics": {
     "enabled": false,
-    "path": "/metrics"
+    "path": "/metrics",
+    "bearer_token_sha256": ""
   },
 
   "ldap": {

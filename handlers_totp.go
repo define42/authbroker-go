@@ -7,7 +7,6 @@ import (
 	"crypto/subtle"
 	"encoding/base32"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -148,7 +147,7 @@ func readTOTPVerifyCode(r *http.Request) (string, error) {
 		var body struct {
 			OTP string `json:"otp"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err := decodeSingleJSON(r.Body, &body, false); err != nil {
 			return "", fmt.Errorf("bad json")
 		}
 		code := strings.TrimSpace(body.OTP)

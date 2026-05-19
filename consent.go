@@ -40,6 +40,18 @@ func (b *Broker) proceedAfterAuthn(w http.ResponseWriter, r *http.Request, ar Au
 		return b.issueCodeRedirect(w, r, ar, sess)
 	}
 
+	// The consent path persists a fresh AuthorizationRequest every time a
+	// browser hits /authorize for a consent-required client without an
+	// existing approval. handleAuthorize already rate-limits the
+	// unauthenticated branch via allowPreAuthWrite; mirror that here so an
+	// authenticated user (or a stolen session) can't fill the auth-request
+	// bucket by replaying /authorize. The limiter is keyed by IP plus the
+	// session subject so two legitimate concurrent users behind one NAT
+	// don't share a budget.
+	if !b.allowConsentWrite(w, r, sess) {
+		return nil
+	}
+
 	// Re-stash the AR so the consent endpoint can consume it on submit. The
 	// AR ID is unguessable (32 random bytes) so leaking it in a redirect URL
 	// does not expose other users' pending grants.
@@ -49,6 +61,25 @@ func (b *Broker) proceedAfterAuthn(w http.ResponseWriter, r *http.Request, ar Au
 	}
 	http.Redirect(w, r, "/consent?request_id="+url.QueryEscape(ar.ID), http.StatusFound)
 	return nil
+}
+
+// allowConsentWrite caps how often an authenticated session can re-enter the
+// consent flow. Each entry writes a new AuthorizationRequest, so without a
+// cap a logged-in user (or a stolen session) could spam /authorize and grow
+// the bbolt store. Reuses the preauth limiter so configuration stays in one
+// place. Returns true to proceed; false when a 429 has already been written.
+func (b *Broker) allowConsentWrite(w http.ResponseWriter, r *http.Request, sess Session) bool {
+	if b.preAuthLimiter == nil {
+		return true
+	}
+	key := "consent/ip:" + b.clientIP(r) + "/sub:" + sess.UserID
+	allowed, retry := b.preAuthLimiter.allowAndRecord(key)
+	if !allowed {
+		writeRetryAfter(w, retry)
+		http.Error(w, "too many requests; try again later", http.StatusTooManyRequests)
+		return false
+	}
+	return true
 }
 
 func (b *Broker) handleConsentGet(w http.ResponseWriter, r *http.Request) {

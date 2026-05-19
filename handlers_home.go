@@ -2,6 +2,8 @@ package main
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -80,10 +82,40 @@ func (b *Broker) handleReady(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (b *Broker) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+func (b *Broker) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if !b.metricsRequestAuthorized(r) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="metrics"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write([]byte(b.metrics.render()))
+}
+
+func (b *Broker) metricsRequestAuthorized(r *http.Request) bool {
+	expectedHex := strings.TrimSpace(b.cfg.Metrics.BearerSHA256)
+	if expectedHex == "" {
+		return true
+	}
+	expected, err := hex.DecodeString(expectedHex)
+	if err != nil || len(expected) != sha256.Size {
+		return false
+	}
+	bearer := bearerValue(r.Header.Get("Authorization"))
+	if bearer == "" {
+		return false
+	}
+	actual := sha256.Sum256([]byte(bearer))
+	return subtle.ConstantTimeCompare(expected, actual[:]) == 1
+}
+
+func bearerValue(authz string) string {
+	value := strings.TrimSpace(strings.TrimPrefix(authz, bearerPrefix))
+	if value != "" && value != authz {
+		return value
+	}
+	return ""
 }
 
 func (b *Broker) handleDiscovery(w http.ResponseWriter, _ *http.Request) {

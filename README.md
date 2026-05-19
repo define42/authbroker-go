@@ -418,7 +418,7 @@ await fetch('/webauthn/login/finish', {
 
 ## Production deployment
 
-For an internal Kubernetes deployment, set `"production": true` and run one broker replica with a ReadWriteOnce volume for `AUTHBROKER_DATA`. Production mode fails startup when unsafe settings are present: non-HTTPS issuer, insecure cookies, localhost or non-HTTPS redirects/WebAuthn origins, LDAP without LDAPS/StartTLS, `ldap.insecure_skip_verify`, missing admin groups, optional TOTP, missing PKCE, missing absolute session TTL, unbounded token/session TTLs, duplicate client IDs, or duplicate app-token IDs.
+For an internal Kubernetes deployment, set `"production": true` and run one broker replica with a ReadWriteOnce volume for `AUTHBROKER_DATA`. Production mode fails startup when unsafe settings are present: non-HTTPS issuer, insecure cookies, localhost or non-HTTPS redirects/WebAuthn origins, LDAP without LDAPS/StartTLS, `ldap.insecure_skip_verify`, missing admin groups, optional TOTP, missing PKCE, missing absolute session TTL, enabled metrics without `metrics.bearer_token_sha256`, unbounded token/session TTLs, duplicate client IDs, or duplicate app-token IDs.
 
 The Kubernetes starter manifest in `deploy/kubernetes/authbroker.yaml` uses a single-replica StatefulSet, non-root container security context, read-only root filesystem, RWO PVC, Service, TLS Ingress, NetworkPolicy, PodDisruptionBudget, `/livez` liveness, and `/readyz` readiness. Replace the example Secret, hostnames, LDAP settings, client hashes, image tag, ingress class assumptions, storage class, and network policy selectors before applying it.
 
@@ -438,7 +438,7 @@ Production operations still need deployment-specific work outside this repositor
 - encrypt Kubernetes Secrets, PVC snapshots, backups, and TLS trust material at the infrastructure layer
 - back up and restore-drill the full `AUTHBROKER_DATA` directory, including `data.db` and managed signing keys
 - forward and retain structured JSON request/audit logs; audit events include login, reauth, logout, TOTP enrollment, WebAuthn register/login, token issue/revoke/introspection, app-token issue, consent, admin mutations, and refresh-token reuse
-- scrape `/metrics` only when `metrics.enabled` is true; labels avoid usernames, tokens, raw groups, and client secrets
+- scrape `/metrics` only when `metrics.enabled` is true and clients send a bearer token whose SHA-256 hex digest matches `metrics.bearer_token_sha256`; labels avoid usernames, tokens, raw groups, and client secrets
 - define app-token issuance policy, per-app TTLs, client-secret rotation, signing-key rotation, alerting, and incident-response runbooks
 - validate directory-specific group mapping and lifecycle behavior before go-live
 - run OIDC and WebAuthn conformance testing for the relying-party/browser mix you support

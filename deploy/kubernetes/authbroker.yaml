@@ -40,7 +40,8 @@ stringData:
       },
       "metrics": {
         "enabled": true,
-        "path": "/metrics"
+        "path": "/metrics",
+        "bearer_token_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "ldap": {
         "url": "ldaps://dc01.example.com:636",

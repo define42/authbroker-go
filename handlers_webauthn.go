@@ -90,7 +90,7 @@ func (b *Broker) handleWebAuthnRegisterFinish(w http.ResponseWriter, r *http.Req
 	}
 	b.maybeExtendSession(w, r)
 	var req webauthnAttestationResponse
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeSingleJSON(r.Body, &req, true); err != nil {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
@@ -192,7 +192,7 @@ func (b *Broker) handleWebAuthnLoginBegin(w http.ResponseWriter, r *http.Request
 func (b *Broker) handleWebAuthnLoginFinish(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxWebAuthnBodyBytes)
 	var req webauthnAssertionResponse
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeSingleJSON(r.Body, &req, true); err != nil {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
@@ -259,7 +259,7 @@ func webAuthnLoginError(w http.ResponseWriter) {
 	http.Error(w, "invalid webauthn login", http.StatusBadRequest)
 }
 
-//nolint:gocognit,cyclop // WebAuthn validation is kept linear to match the protocol checks.
+//nolint:gocognit,cyclop,funlen // WebAuthn validation is kept linear to match the protocol checks.
 func (b *Broker) verifyWebAuthnAttestation(req webauthnAttestationResponse, expectedChallenge string) (WebAuthnCredential, error) {
 	rawID, err := decodeB64URL(req.RawID)
 	if err != nil || len(rawID) == 0 {
@@ -281,6 +281,14 @@ func (b *Broker) verifyWebAuthnAttestation(req webauthnAttestationResponse, expe
 	}
 	if !b.allowedOrigin(cd.Origin) {
 		return WebAuthnCredential{}, fmt.Errorf("origin not allowed")
+	}
+	// Reject ceremonies driven from a cross-origin browsing context. The
+	// broker's own pages set frame-ancestors 'none', but the WebAuthn flow is
+	// also exposed via reverse-proxied demos (e.g. the passkey demo on :8091).
+	// A registration produced inside a hostile iframe must not pass even when
+	// the proxied origin happens to match webauthn.origins.
+	if cd.CrossOrigin {
+		return WebAuthnCredential{}, fmt.Errorf("cross-origin clientData rejected")
 	}
 
 	attBytes, err := decodeB64URL(req.Response.AttestationObject)
@@ -331,6 +339,11 @@ func (b *Broker) verifyWebAuthnAssertion(req webauthnAssertionResponse, username
 	}
 	if !b.allowedOrigin(cd.Origin) {
 		return fmt.Errorf("origin not allowed")
+	}
+	// See verifyWebAuthnAttestation: cross-origin browsing contexts are
+	// rejected even when the proxied origin happens to be allow-listed.
+	if cd.CrossOrigin {
+		return fmt.Errorf("cross-origin clientData rejected")
 	}
 	rawID, err := decodeB64URL(req.RawID)
 	if err != nil || len(rawID) == 0 {

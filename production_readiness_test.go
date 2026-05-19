@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -114,6 +116,17 @@ func TestProductionConfigValidationFailures(t *testing.T) {
 	}
 }
 
+func TestProductionMetricsRequireBearerHash(t *testing.T) {
+	cfg := productionTestConfig()
+	cfg.Metrics.Enabled = true
+	cfg.Metrics.Path = "/metrics"
+	normalizeConfig(&cfg)
+	err := validateConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "metrics.bearer_token_sha256") {
+		t.Fatalf("validate error = %v, want metrics.bearer_token_sha256", err)
+	}
+}
+
 func TestDuplicateClientIDRejected(t *testing.T) {
 	cfg := productionTestConfig()
 	cfg.Production = false
@@ -170,6 +183,7 @@ func TestHealthReadyAndMetricsEndpoints(t *testing.T) {
 	broker := newLogoutTestBroker(t)
 	broker.cfg.Metrics.Enabled = true
 	broker.cfg.Metrics.Path = "/metrics"
+	broker.cfg.Metrics.BearerSHA256 = sha256Hex("probe")
 
 	for _, path := range []string{"/healthz", "/livez", "/readyz"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -183,12 +197,25 @@ func TestHealthReadyAndMetricsEndpoints(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rr := httptest.NewRecorder()
 	broker.routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated metrics status = %d", rr.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.Header.Set("Authorization", "Bearer probe")
+	rr = httptest.NewRecorder()
+	broker.routes().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("metrics status = %d", rr.Code)
 	}
 	if !strings.Contains(rr.Body.String(), "authbroker_http_requests_total") {
 		t.Fatalf("metrics body = %q", rr.Body.String())
 	}
+}
+
+func sha256Hex(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
 }
 
 func TestOAuthClientAuthenticationRateLimited(t *testing.T) {

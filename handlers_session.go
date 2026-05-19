@@ -40,7 +40,7 @@ func (b *Broker) handleLoginGet(w http.ResponseWriter, r *http.Request) {
 		"RequestID":   rid,
 		"ClientID":    clientID,
 		"TOTPHint":    b.cfg.MFA.TOTPRequired,
-		"CSRFToken":   b.anonymousCSRFToken(w, r),
+		"CSRFToken":   b.anonymousCSRFToken(w, r, true),
 	})
 }
 
@@ -61,8 +61,7 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	// AD/OpenLDAP are case-insensitive in practice; oscillating case used to
 	// surface as different audit user_id strings for the same account.
 	username := strings.ToLower(strings.TrimSpace(r.Form.Get("username")))
-	rateKey := b.loginRateKey(r, username)
-	if ok, retry := b.loginLimiter.allow(rateKey); !ok {
+	if ok, retry := b.allowCredentialLoginAttempt(r, username); !ok {
 		writeRetryAfter(w, retry)
 		b.auditEvent(r, auditEventLogin, auditOutcomeFailure,
 			slog.String("user_id", username),
@@ -91,7 +90,7 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	password := r.Form.Get("password")
 	profile, err := b.authn.Authenticate(r.Context(), username, password)
 	if err != nil {
-		b.loginLimiter.recordFailure(rateKey)
+		b.recordCredentialLoginFailure(r, username)
 		if oauthLogin {
 			if err := b.putAuthRequest(ar); err != nil {
 				log.Printf("restore auth request after login failure: %v", err)
@@ -113,7 +112,7 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	if b.needsTOTP(user) {
 		otp := strings.TrimSpace(r.Form.Get("otp"))
 		if user.TOTPSecretBase32 == "" {
-			b.loginLimiter.recordFailure(rateKey)
+			b.recordCredentialLoginFailure(r, user.Username)
 			if oauthLogin {
 				if err := b.putAuthRequest(ar); err != nil {
 					log.Printf("restore auth request after missing totp enrollment: %v", err)
@@ -127,7 +126,7 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !verifyTOTP(user.TOTPSecretBase32, otp, time.Now(), 1) {
-			b.loginLimiter.recordFailure(rateKey)
+			b.recordCredentialLoginFailure(r, user.Username)
 			if oauthLogin {
 				if err := b.putAuthRequest(ar); err != nil {
 					log.Printf("restore auth request after totp failure: %v", err)
@@ -142,7 +141,7 @@ func (b *Broker) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	b.loginLimiter.recordSuccess(rateKey)
+	b.recordCredentialLoginSuccess(r, user.Username)
 	amr := []string{amrPassword}
 	if b.needsTOTP(user) {
 		amr = append(amr, amrOTP, amrMFA)
@@ -252,8 +251,13 @@ func (b *Broker) handleLocalLogoutPost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *Broker) handleLogout(w http.ResponseWriter, r *http.Request) {
+	// Cap the request body for both methods. POST carries the form; GET
+	// should be empty but a hostile client can still send megabytes at a GET
+	// route, and Go would otherwise read them on r.Body access. ReadTimeout
+	// on the server limits the worst case, but the explicit cap is cheap
+	// defense in depth.
+	r.Body = http.MaxBytesReader(w, r.Body, maxLogoutBodyBytes)
 	if r.Method == http.MethodPost {
-		r.Body = http.MaxBytesReader(w, r.Body, maxLogoutBodyBytes)
 		if err := r.ParseForm(); err != nil {
 			http.Error(w, "bad form", http.StatusBadRequest)
 			return
@@ -276,19 +280,25 @@ func (b *Broker) handleLogout(w http.ResponseWriter, r *http.Request) {
 	// <a>/<img>/redirect-driven CSRF cannot drop the session in one round-trip.
 	// RP-initiated POSTs proceed directly, as in spec-compliant flows.
 	//
-	// GET without an active session still falls through to the
-	// handlePostLogoutRedirect path below. That path requires
-	// post_logout_redirect_uri to be in the client's registered allowlist, so
-	// it is NOT an open redirect — the worst an attacker can do via a
-	// crafted GET link is bounce a not-logged-in user to a URL the client's
-	// operator already approved, with the attacker's `state` value attached.
-	// Treated as acceptable: the registered URI is by definition trusted by
-	// the client, and `state` passthrough is the documented OAuth pattern.
-	if r.Method == http.MethodGet {
-		if sess, hasSession := b.validSession(r); hasSession {
-			b.renderRPLogoutConfirm(w, sess, idTokenHint, clientID, postLogoutRedirectURI, state)
-			return
-		}
+	// A GET without an active session AND without a valid id_token_hint is
+	// refused below when a post_logout_redirect_uri is supplied — otherwise
+	// the broker can be used as a low-friction redirector to any registered
+	// post_logout_redirect_uri with attacker-controlled state. Spec-
+	// compliant RP-initiated GETs always carry id_token_hint, so this only
+	// blocks crafted phishing links.
+	sess, hasSession := b.validSession(r)
+	if r.Method == http.MethodGet && hasSession {
+		b.renderRPLogoutConfirm(w, sess, idTokenHint, clientID, postLogoutRedirectURI, state)
+		return
+	}
+	if r.Method == http.MethodGet && !hasSession && idTokenHint == "" && postLogoutRedirectURI != "" {
+		http.Error(w, "logout requires id_token_hint or an active session", http.StatusBadRequest)
+		return
+	}
+
+	if postLogoutRedirectURI != "" && !b.validPostLogoutRedirect(clientID, postLogoutRedirectURI) {
+		http.Error(w, "invalid post_logout_redirect_uri", http.StatusBadRequest)
+		return
 	}
 
 	if postLogoutRedirectURI != "" {
@@ -332,8 +342,7 @@ func (b *Broker) renderRPLogoutConfirm(w http.ResponseWriter, sess Session, idTo
 }
 
 func (b *Broker) handlePostLogoutRedirect(w http.ResponseWriter, r *http.Request, clientID, redirectURI, state string) {
-	client, ok := b.lookupClient(clientID)
-	if !ok || !clientAllowsPostLogoutRedirect(client, redirectURI) {
+	if !b.validPostLogoutRedirect(clientID, redirectURI) {
 		http.Error(w, "invalid post_logout_redirect_uri", http.StatusBadRequest)
 		return
 	}
@@ -359,6 +368,11 @@ func (b *Broker) handlePostLogoutRedirect(w http.ResponseWriter, r *http.Request
 			slog.String("source", "rp_initiated"))
 	}
 	http.Redirect(w, r, u.String(), http.StatusFound)
+}
+
+func (b *Broker) validPostLogoutRedirect(clientID, redirectURI string) bool {
+	client, ok := b.lookupClient(clientID)
+	return ok && clientAllowsPostLogoutRedirect(client, redirectURI)
 }
 
 func (b *Broker) resolveLogoutClientID(w http.ResponseWriter, clientID, idTokenHint string) (string, bool) {
@@ -434,9 +448,18 @@ func (b *Broker) needsTOTP(user *StoredUser) bool {
 	return b.cfg.MFA.TOTPRequired || (user != nil && user.TOTPSecretBase32 != "")
 }
 
-func (b *Broker) anonymousCSRFToken(w http.ResponseWriter, r *http.Request) string {
-	if c, err := r.Cookie(csrfCookieName); err == nil && c.Value != "" {
-		return c.Value
+// anonymousCSRFToken issues (or reuses) the double-submit anonymous CSRF
+// cookie used by the login form. Callers that render a login page should
+// pass rotate=true so the cookie is replaced with a fresh value on every
+// GET — otherwise a single token would be reused for the full 24h MaxAge
+// and a passive observer of one form submission could replay it well past
+// the lifetime of the page that issued it. Multi-tab logins must re-GET
+// the form to pick up the latest cookie value.
+func (b *Broker) anonymousCSRFToken(w http.ResponseWriter, r *http.Request, rotate bool) string {
+	if !rotate {
+		if c, err := r.Cookie(csrfCookieName); err == nil && c.Value != "" {
+			return c.Value
+		}
 	}
 	token := randomB64(32)
 	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure is controlled by issuer/config for local HTTP demos and HTTPS deployments.
@@ -555,6 +578,13 @@ func sessionRecentlyReAuthenticated(sess Session) bool {
 // maybeExtendSession refreshes the broker session's expiry on activity once
 // more than half of the TTL has been consumed. The cookie is re-set so the
 // browser does not drop it at the original expiration.
+//
+// Like validSession, this also clears expired sessions from the store. It
+// does NOT signal that to the caller — handlers that need to react to the
+// expiry transition must call validSession themselves. Today the home page
+// chains maybeExtendSession + validSession (inside homeData); a race window
+// between the two reads can flip an authenticated render to "Signed out",
+// which is the correct user-visible outcome.
 func (b *Broker) maybeExtendSession(w http.ResponseWriter, r *http.Request) {
 	c, err := r.Cookie(sessionCookieName)
 	if err != nil || c.Value == "" {
@@ -695,15 +725,50 @@ func loginAuditClientID(ar AuthorizationRequest) string {
 	return "authbroker"
 }
 
-// loginRateKey scopes the limiter by client IP and (when known) the username
-// being attempted so a single hostile IP cannot brute one account by trying
-// many other accounts in parallel.
-func (b *Broker) loginRateKey(r *http.Request, username string) string {
-	ip := b.clientIP(r)
-	if username == "" {
-		return "ip:" + ip
+func (b *Broker) allowCredentialLoginAttempt(r *http.Request, username string) (bool, time.Duration) {
+	for _, key := range b.credentialLoginRateKeys(r, username) {
+		if ok, retry := b.loginLimiter.allow(key); !ok {
+			return false, retry
+		}
 	}
-	return "ip:" + ip + "/user:" + strings.ToLower(username)
+	return true, 0
+}
+
+func (b *Broker) recordCredentialLoginFailure(r *http.Request, username string) {
+	for _, key := range b.credentialLoginRateKeys(r, username) {
+		b.loginLimiter.recordFailure(key)
+	}
+}
+
+func (b *Broker) recordCredentialLoginSuccess(r *http.Request, username string) {
+	// A successful login clears only the user-specific bucket. The IP bucket
+	// intentionally keeps recent failures so one valid account cannot reset a
+	// credential-stuffing spray against many other usernames.
+	b.loginLimiter.recordSuccess(b.loginRateKey(r, username))
+}
+
+func (b *Broker) credentialLoginRateKeys(r *http.Request, username string) []string {
+	ipKey := b.loginIPRateKey(r)
+	userKey := b.loginRateKey(r, username)
+	if userKey == ipKey {
+		return []string{ipKey}
+	}
+	return []string{ipKey, userKey}
+}
+
+func (b *Broker) loginIPRateKey(r *http.Request) string {
+	return "ip:" + b.clientIP(r)
+}
+
+// loginRateKey scopes the user-specific limiter by client IP and (when known)
+// the username being attempted so a single hostile IP cannot brute one account
+// by trying many other accounts in parallel. Credential login also records
+// failures against loginIPRateKey so username spraying from one IP is capped.
+func (b *Broker) loginRateKey(r *http.Request, username string) string {
+	if username == "" {
+		return b.loginIPRateKey(r)
+	}
+	return b.loginIPRateKey(r) + "/user:" + strings.ToLower(username)
 }
 
 func writeRetryAfter(w http.ResponseWriter, d time.Duration) {

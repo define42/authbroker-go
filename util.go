@@ -5,11 +5,41 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
 )
+
+// decodeSingleJSON parses one JSON value from r into v and rejects any bytes
+// (other than whitespace) trailing the value. Without this check, a body like
+// `{"id":"…"}{"junk":"…"}` would decode the first object and silently drop
+// the rest — combined with MaxBytesReader the blast radius is small, but
+// rejecting the malformed shape removes a class of smuggling tricks.
+//
+// allowUnknown controls whether unknown JSON fields are accepted. Browser
+// WebAuthn payloads include vendor fields the broker doesn't model
+// (authenticatorAttachment, clientExtensionResults, transports), so those
+// endpoints pass true. Broker-controlled bodies (e.g. TOTP verify) pass false
+// to catch typos at the boundary.
+func decodeSingleJSON(r io.Reader, v any, allowUnknown bool) error {
+	dec := json.NewDecoder(r)
+	if !allowUnknown {
+		dec.DisallowUnknownFields()
+	}
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	var junk json.RawMessage
+	if err := dec.Decode(&junk); err == nil {
+		return fmt.Errorf("unexpected trailing data")
+	} else if !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
+}
 
 func randomB64(n int) string {
 	b := make([]byte, n)

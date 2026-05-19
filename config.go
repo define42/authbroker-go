@@ -119,6 +119,9 @@ type RateLimitConfig struct {
 type MetricsConfig struct {
 	Enabled bool   `json:"enabled,omitempty"`
 	Path    string `json:"path,omitempty"`
+	// BearerSHA256 is the SHA-256 hex digest of the bearer value required to
+	// scrape metrics. The plaintext token is never stored in config.
+	BearerSHA256 string `json:"bearer_token_sha256,omitempty"`
 }
 
 type SigningKeyConfig struct {
@@ -400,11 +403,24 @@ func validateConfigShape(cfg Config) error {
 	if err := validateTrustedProxyConfig(cfg); err != nil {
 		return err
 	}
-	if cfg.Metrics.Enabled && !validHTTPPath(cfg.Metrics.Path) {
-		return fmt.Errorf("metrics.path must be an absolute path")
+	if err := validateMetricsConfigShape(cfg.Metrics); err != nil {
+		return err
 	}
 	if cfg.SessionAbsoluteTTLHrs > 0 && cfg.SessionAbsoluteTTLHrs < cfg.SessionTTLHrs {
 		return fmt.Errorf("session_absolute_ttl_hours (%d) must be >= session_ttl_hours (%d)", cfg.SessionAbsoluteTTLHrs, cfg.SessionTTLHrs)
+	}
+	return nil
+}
+
+func validateMetricsConfigShape(metrics MetricsConfig) error {
+	if !metrics.Enabled {
+		return nil
+	}
+	if !validHTTPPath(metrics.Path) {
+		return fmt.Errorf("metrics.path must be an absolute path")
+	}
+	if strings.TrimSpace(metrics.BearerSHA256) != "" && !validSHA256Hex(metrics.BearerSHA256) {
+		return fmt.Errorf("metrics.bearer_token_sha256 must be a SHA-256 hex digest")
 	}
 	return nil
 }
@@ -446,6 +462,9 @@ func validateProductionBase(cfg Config) error {
 	}
 	if !cfg.MFA.TOTPRequired {
 		return fmt.Errorf("production requires mfa.totp_required=true")
+	}
+	if cfg.Metrics.Enabled && !validSHA256Hex(cfg.Metrics.BearerSHA256) {
+		return fmt.Errorf("production metrics requires metrics.bearer_token_sha256")
 	}
 	if !within(cfg.AccessTokenTTLMinutes, 1, 60) {
 		return fmt.Errorf("production access_token_ttl_minutes must be between 1 and 60")

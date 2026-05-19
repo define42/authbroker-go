@@ -553,6 +553,12 @@ func (b *Broker) handleRefreshTokenReuse(w http.ResponseWriter, r *http.Request,
 	tokenError(w, "invalid_grant", "invalid refresh_token")
 }
 
+// scopeSubset reports whether `requested` is a (non-strict) subset of
+// `granted` under case-sensitive comparison, per RFC 6749 §3.3. Both
+// arguments are expected to be the broker's own normalized scope strings
+// (validateAuthorizationScope / normalizeScopeTokens) so token casing is
+// already consistent. If a future caller starts persisting raw, unnormalized
+// scope strings, this becomes the place where the assumption breaks.
 func scopeSubset(requested, granted string) bool {
 	grantedSet := map[string]bool{}
 	for _, p := range strings.Fields(granted) {
@@ -980,16 +986,28 @@ func (b *Broker) introspectJWT(tok string, client Client) (map[string]any, bool)
 // (the common case for tokens issued to this client) or an aud claim match
 // (so a resource server with its own credentials can introspect app tokens
 // minted for its audience).
+//
+// Empty clientID is rejected up front: an authenticated caller should never
+// reach this code with "", but if it did (e.g. a future bypass past
+// lookupClient) an empty aud or client_id claim must not be allowed to match
+// as a wildcard.
 func introspectClientOwnsToken(claims map[string]any, clientID string) bool {
-	if cid, _ := claims["client_id"].(string); cid == clientID {
+	if clientID == "" {
+		return false
+	}
+	if cid, _ := claims["client_id"].(string); cid != "" && cid == clientID {
 		return true
 	}
 	switch aud := claims["aud"].(type) {
 	case string:
-		return aud == clientID
+		return aud != "" && aud == clientID
 	case []any:
 		for _, v := range aud {
-			if s, ok := v.(string); ok && s == clientID {
+			s, ok := v.(string)
+			if !ok || s == "" {
+				continue
+			}
+			if s == clientID {
 				return true
 			}
 		}
