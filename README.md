@@ -173,6 +173,8 @@ Members of any group listed in `admin_groups` (in config.json) gain access to `/
 
 When a client has `require_consent: true`, the broker prompts the user (`/consent`) before redirecting back with an authorization code. Approvals are stored per (user, client) and re-prompted only if the client later requests a scope the user has not yet approved. Admin-created clients default to consent-required; config-defined clients default to consent-skipped to preserve existing first-party behavior — set `require_consent: true` per client to opt in.
 
+Clients can also restrict OAuth scopes. `allowed_scopes` defaults to `openid profile email groups`; unsupported scopes are rejected at `/oauth2/authorize`. Refresh tokens are only issued for `offline_access` when the client has `"allow_offline_access": true`. The `client_credentials` grant has its own `client_credentials_scopes` list and rejects any non-empty scope not listed there.
+
 ## Signing keys and rotation
 
 When `signing_key_pem` and `signing_keys` are omitted, startup automatically manages RSA signing keys in `AUTHBROKER_DATA/signing-keys.json`. New JWTs are signed with the active key, and retained old keys remain in `/oauth2/jwks` so existing tokens can validate after rotation.
@@ -249,6 +251,9 @@ Groups are also configured per client. LDAP/AD may return a large `memberOf` lis
   "redirect_uris": ["http://localhost:3000/callback"],
   "post_logout_redirect_uris": ["http://localhost:3000/"],
   "require_pkce": true,
+  "allowed_scopes": ["openid", "profile", "email", "groups"],
+  "client_credentials_scopes": ["service"],
+  "allow_offline_access": false,
   "group_mappings": {
     "CN=Demo App Admins,OU=Groups,DC=example,DC=com": "demo-admin",
     "OU=Demo,DC=example,DC=com": "{cn}",

@@ -157,6 +157,9 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 		if _, exists := clientMap[c.ClientID]; exists {
 			return nil, fmt.Errorf("duplicate client_id %q", c.ClientID)
 		}
+		if err := normalizeClientScopePolicy(&c); err != nil {
+			return nil, fmt.Errorf("client %q: %w", c.ClientID, err)
+		}
 		groupMappings, err := normalizeClientGroupMappings(c.GroupMappings)
 		if err != nil {
 			return nil, fmt.Errorf("client %q: %w", c.ClientID, err)
@@ -173,6 +176,11 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 		if !validAppTokenID(tokenCfg.ID) {
 			return nil, fmt.Errorf("app token %q: id must be 1-%d chars of letters, digits, dot, underscore, or hyphen", tokenCfg.ID, maxAppTokenIDLen)
 		}
+		scope, err := normalizeAppTokenScope(tokenCfg.Scope)
+		if err != nil {
+			return nil, fmt.Errorf("app token %q: %w", tokenCfg.ID, err)
+		}
+		tokenCfg.Scope = scope
 		groupMappings, err := normalizeClientGroupMappings(tokenCfg.GroupMappings)
 		if err != nil {
 			return nil, fmt.Errorf("app token %q: %w", tokenCfg.ID, err)
@@ -251,6 +259,9 @@ func (b *Broker) reloadStoredRegistries() error {
 			// Config-defined entries always win — drop the shadowed stored copy.
 			continue
 		}
+		if err := normalizeClientScopePolicy(&c); err != nil {
+			return fmt.Errorf("stored client %q: %w", c.ClientID, err)
+		}
 		c.compiledMappings = compileGroupMappings(c.GroupMappings)
 		clientMap[c.ClientID] = c
 	}
@@ -259,6 +270,11 @@ func (b *Broker) reloadStoredRegistries() error {
 		if _, isConfig := b.appTokens[t.ID]; isConfig {
 			continue
 		}
+		scope, err := normalizeAppTokenScope(t.Scope)
+		if err != nil {
+			return fmt.Errorf("stored app token %q: %w", t.ID, err)
+		}
+		t.Scope = scope
 		t.compiledMappings = compileGroupMappings(t.GroupMappings)
 		tokenMap[t.ID] = t
 	}

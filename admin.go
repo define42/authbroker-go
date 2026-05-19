@@ -112,15 +112,24 @@ func (b *Broker) handleAdminClientsCreate(w http.ResponseWriter, r *http.Request
 		b.adminClientsFormRedirect(w, r, "production clients must require PKCE")
 		return
 	}
+	allowedScopes := splitScopeForm(r.Form.Get("allowed_scopes"))
+	clientCredentialsScopes := splitScopeForm(r.Form.Get("client_credentials_scopes"))
 
 	client := Client{
-		ClientID:               clientID,
-		RedirectURIs:           redirectURIs,
-		PostLogoutRedirectURIs: postLogoutRedirectURIs,
-		Public:                 r.Form.Get("public") == "on",
-		RequirePKCE:            r.Form.Get("require_pkce") == "on",
-		RequireConsent:         r.Form.Get("require_consent") == "on",
-		StoredAt:               time.Now(),
+		ClientID:                clientID,
+		RedirectURIs:            redirectURIs,
+		PostLogoutRedirectURIs:  postLogoutRedirectURIs,
+		Public:                  r.Form.Get("public") == "on",
+		RequirePKCE:             r.Form.Get("require_pkce") == "on",
+		AllowedScopes:           allowedScopes,
+		ClientCredentialsScopes: clientCredentialsScopes,
+		AllowOfflineAccess:      r.Form.Get("allow_offline_access") == "on",
+		RequireConsent:          r.Form.Get("require_consent") == "on",
+		StoredAt:                time.Now(),
+	}
+	if err := normalizeClientScopePolicy(&client); err != nil {
+		b.adminClientsFormRedirect(w, r, err.Error())
+		return
 	}
 	var secretPlain string
 	if !client.Public {
@@ -277,9 +286,10 @@ func (b *Broker) handleAdminAppTokensCreate(w http.ResponseWriter, r *http.Reque
 	if clientID == "" {
 		clientID = audience
 	}
-	scope := strings.TrimSpace(r.Form.Get("scope"))
-	if scope == "" {
-		scope = "openid profile email groups"
+	scope, err := parseAdminAppTokenScope(r.Form)
+	if err != nil {
+		b.adminAppTokensFormRedirect(w, r, err.Error())
+		return
 	}
 	tok := AppTokenConfig{
 		ID:              id,
@@ -348,12 +358,15 @@ func (b *Broker) handleAdminAppTokensDelete(w http.ResponseWriter, r *http.Reque
 // adminClientView is what the list template renders for each client. The
 // ReadOnly flag drives whether the delete button is shown.
 type adminClientView struct {
-	ClientID       string
-	RedirectURIs   []string
-	Public         bool
-	RequirePKCE    bool
-	RequireConsent bool
-	ReadOnly       bool
+	ClientID                string
+	RedirectURIs            []string
+	Public                  bool
+	RequirePKCE             bool
+	RequireConsent          bool
+	AllowedScopes           []string
+	ClientCredentialsScopes []string
+	AllowOfflineAccess      bool
+	ReadOnly                bool
 }
 
 func (b *Broker) adminClientViews() []adminClientView {
@@ -368,12 +381,15 @@ func (b *Broker) adminClientViews() []adminClientView {
 		c := merged[id]
 		_, configDefined := b.clients[id]
 		views = append(views, adminClientView{
-			ClientID:       c.ClientID,
-			RedirectURIs:   c.RedirectURIs,
-			Public:         c.Public,
-			RequirePKCE:    c.RequirePKCE,
-			RequireConsent: c.RequireConsent,
-			ReadOnly:       configDefined,
+			ClientID:                c.ClientID,
+			RedirectURIs:            c.RedirectURIs,
+			Public:                  c.Public,
+			RequirePKCE:             c.RequirePKCE,
+			RequireConsent:          c.RequireConsent,
+			AllowedScopes:           c.AllowedScopes,
+			ClientCredentialsScopes: c.ClientCredentialsScopes,
+			AllowOfflineAccess:      c.AllowOfflineAccess,
+			ReadOnly:                configDefined,
 		})
 	}
 	return views
@@ -446,6 +462,18 @@ func splitFormLines(in string) []string {
 		}
 	}
 	return out
+}
+
+func splitScopeForm(in string) []string {
+	return strings.Fields(in)
+}
+
+func parseAdminAppTokenScope(form url.Values) (string, error) {
+	scope := strings.TrimSpace(form.Get("scope"))
+	if scope == "" {
+		scope = strings.Join(defaultClientAllowedScopes, " ")
+	}
+	return normalizeAppTokenScope(scope)
 }
 
 func parseAdminTokenTTL(in string) (int, error) {

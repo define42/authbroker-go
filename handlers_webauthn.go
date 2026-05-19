@@ -156,7 +156,9 @@ func (b *Broker) handleWebAuthnLoginBegin(w http.ResponseWriter, r *http.Request
 	userID := ""
 	if user, ok := b.store.GetUser(req.Username); ok {
 		creds = user.WebAuthnCredentials
-		userID = user.Username
+		if len(creds) > 0 {
+			userID = user.Username
+		}
 	}
 	challenge := randomB64(32)
 	if err := b.store.PutWebAuthnLogin(challenge, ChallengeRecord{UserID: userID, Challenge: challenge, ExpiresAt: time.Now().Add(5 * time.Minute)}); err != nil {
@@ -222,7 +224,7 @@ func (b *Broker) handleWebAuthnLoginFinish(w http.ResponseWriter, r *http.Reques
 		b.auditEvent(r, auditEventWebAuthnLogin, auditOutcomeFailure,
 			slog.String("user_id", ch.UserID),
 			slog.String("reason", "challenge_expired"))
-		http.Error(w, "login challenge expired", http.StatusBadRequest)
+		webAuthnLoginError(w)
 		return
 	}
 	if err := b.verifyWebAuthnAssertion(req, ch.UserID, ch.Challenge, clientDataBytes, cd); err != nil {
@@ -230,7 +232,7 @@ func (b *Broker) handleWebAuthnLoginFinish(w http.ResponseWriter, r *http.Reques
 		b.auditEvent(r, auditEventWebAuthnLogin, auditOutcomeFailure,
 			slog.String("user_id", ch.UserID),
 			slog.String("reason", "invalid_assertion"))
-		http.Error(w, "invalid assertion: "+err.Error(), http.StatusBadRequest)
+		webAuthnLoginError(w)
 		return
 	}
 	b.loginLimiter.recordSuccess(rateKey)
@@ -244,6 +246,10 @@ func (b *Broker) handleWebAuthnLoginFinish(w http.ResponseWriter, r *http.Reques
 	b.auditEvent(r, auditEventWebAuthnLogin, auditOutcomeSuccess,
 		slog.String("user_id", ch.UserID))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "authenticated"})
+}
+
+func webAuthnLoginError(w http.ResponseWriter) {
+	http.Error(w, "invalid webauthn login", http.StatusBadRequest)
 }
 
 //nolint:gocognit,cyclop // WebAuthn validation is kept linear to match the protocol checks.

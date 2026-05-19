@@ -930,7 +930,9 @@ func newLogoutTestBroker(t *testing.T) *Broker {
 				PostLogoutRedirectURIs: []string{
 					"http://app.example/",
 				},
-				RequirePKCE: true,
+				RequirePKCE:             true,
+				AllowOfflineAccess:      true,
+				ClientCredentialsScopes: []string{"openid", "groups"},
 			},
 		},
 	}

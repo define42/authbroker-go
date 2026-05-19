@@ -603,6 +603,22 @@ func TestTokenClientCredentialsIssues(t *testing.T) {
 	}
 }
 
+func TestTokenClientCredentialsRejectsUnconfiguredScope(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	form := url.Values{"grant_type": {"client_credentials"}, "scope": {"admin"}}
+	req := httptest.NewRequest(http.MethodPost, "/oauth2/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth("demo-web", "demo-secret")
+	rr := httptest.NewRecorder()
+	broker.handleToken(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "invalid_scope") {
+		t.Fatalf("body = %q", rr.Body.String())
+	}
+}
+
 func TestTokenRefreshSuccess(t *testing.T) {
 	broker := newLogoutTestBroker(t)
 	now := time.Now()
@@ -1362,6 +1378,31 @@ func TestHandleWebAuthnLoginBeginNonExistingUser(t *testing.T) {
 	}
 }
 
+func TestWebAuthnLoginBeginUserWithoutCredentialsBindsNoUser(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	if _, err := broker.store.UpsertProfile(UserProfile{Subject: "alice"}); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/webauthn/login/begin", strings.NewReader(`{"username":"alice"}`))
+	rr := httptest.NewRecorder()
+	broker.handleWebAuthnLoginBegin(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		PublicKey struct {
+			Challenge string `json:"challenge"`
+		} `json:"publicKey"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	rec := broker.store.RuntimeSnapshot().WebAuthnLog[body.PublicKey.Challenge]
+	if rec.UserID != "" {
+		t.Fatalf("challenge bound to user %q, want anonymous", rec.UserID)
+	}
+}
+
 func TestHandleWebAuthnLoginFinishBadJSON(t *testing.T) {
 	broker := newLogoutTestBroker(t)
 	req := httptest.NewRequest(http.MethodPost, "/webauthn/login/finish", strings.NewReader("not json"))
@@ -1384,6 +1425,54 @@ func TestHandleWebAuthnLoginFinishExpiredChallenge(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
 	}
+}
+
+func TestWebAuthnLoginFinishUsesGenericFailure(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	if err := broker.store.AddWebAuthnCredential("alice", WebAuthnCredential{
+		IDBase64URL: base64.RawURLEncoding.EncodeToString([]byte("registered")),
+		Alg:         "ES256",
+	}); err != nil {
+		t.Fatalf("seed credential: %v", err)
+	}
+	if err := broker.store.PutWebAuthnLogin("anonymous-challenge", ChallengeRecord{
+		Challenge: "anonymous-challenge",
+		ExpiresAt: time.Now().Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("seed anonymous challenge: %v", err)
+	}
+	if err := broker.store.PutWebAuthnLogin("bound-challenge", ChallengeRecord{
+		UserID:    "alice",
+		Challenge: "bound-challenge",
+		ExpiresAt: time.Now().Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("seed bound challenge: %v", err)
+	}
+
+	anonRR := httptest.NewRecorder()
+	broker.handleWebAuthnLoginFinish(anonRR, httptest.NewRequest(http.MethodPost, "/webauthn/login/finish", strings.NewReader(webAuthnAssertionBody(t, "anonymous-challenge", "anything"))))
+	boundRR := httptest.NewRecorder()
+	broker.handleWebAuthnLoginFinish(boundRR, httptest.NewRequest(http.MethodPost, "/webauthn/login/finish", strings.NewReader(webAuthnAssertionBody(t, "bound-challenge", "not-registered"))))
+
+	if anonRR.Code != http.StatusBadRequest || boundRR.Code != http.StatusBadRequest {
+		t.Fatalf("statuses = %d/%d bodies=%q/%q", anonRR.Code, boundRR.Code, anonRR.Body.String(), boundRR.Body.String())
+	}
+	if anonRR.Body.String() != boundRR.Body.String() || !strings.Contains(anonRR.Body.String(), "invalid webauthn login") {
+		t.Fatalf("generic bodies differ: %q vs %q", anonRR.Body.String(), boundRR.Body.String())
+	}
+}
+
+func webAuthnAssertionBody(t *testing.T, challenge, rawID string) string {
+	t.Helper()
+	cd := webauthnClientData{Type: "webauthn.get", Challenge: challenge, Origin: "http://broker.example"}
+	cdBytes, err := json.Marshal(cd)
+	if err != nil {
+		t.Fatalf("marshal client data: %v", err)
+	}
+	return fmt.Sprintf(`{"rawId":"%s","response":{"clientDataJSON":"%s"}}`,
+		base64.RawURLEncoding.EncodeToString([]byte(rawID)),
+		base64.RawURLEncoding.EncodeToString(cdBytes),
+	)
 }
 
 func TestAllowedOrigin(t *testing.T) {

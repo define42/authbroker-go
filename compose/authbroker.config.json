@@ -58,6 +58,8 @@
       "post_logout_redirect_uris": ["http://localhost:8090/"],
       "public": false,
       "require_pkce": true,
+      "allowed_scopes": ["openid", "profile", "email", "groups"],
+      "allow_offline_access": false,
       "group_mappings": {
         "app_elk_team10_ingest": "elk-ingest",
         "OU=Demo,DC=glauth,DC=com": "{cn}"

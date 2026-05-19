@@ -14,7 +14,11 @@ import (
 	"time"
 )
 
-const brokerSessionCookieName = "broker_session"
+const (
+	brokerSessionCookieName = "broker_session"
+	brokerCSRFCookieName    = "broker_csrf"
+	csrfFormField           = "csrf_token"
+)
 
 type app struct {
 	listen            string
@@ -93,7 +97,13 @@ func (a *app) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 		"password": {r.Form.Get("password")},
 		"otp":      {r.Form.Get("otp")},
 	}
-	resp, body, err := a.forwardForm(r, http.MethodPost, "/login", form)
+	csrfToken, csrfCookie, err := a.loginCSRF(r)
+	if err != nil {
+		http.Redirect(w, r, "/?error="+url.QueryEscape(err.Error()), http.StatusFound)
+		return
+	}
+	form.Set(csrfFormField, csrfToken)
+	resp, body, err := a.forwardForm(r, http.MethodPost, "/login", form, csrfCookie)
 	if err != nil {
 		http.Redirect(w, r, "/?error="+url.QueryEscape(err.Error()), http.StatusFound)
 		return
@@ -108,7 +118,7 @@ func (a *app) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) handleLogout(w http.ResponseWriter, r *http.Request) {
-	resp, _, err := a.forwardForm(r, http.MethodPost, "/logout", nil)
+	resp, _, err := a.forwardForm(r, http.MethodPost, "/oauth2/logout", nil)
 	if err != nil {
 		clearBrokerCookie(w)
 		http.Redirect(w, r, "/?error="+url.QueryEscape(err.Error()), http.StatusFound)
@@ -120,7 +130,7 @@ func (a *app) handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
-func (a *app) forwardForm(r *http.Request, method, path string, form url.Values) (*http.Response, []byte, error) {
+func (a *app) forwardForm(r *http.Request, method, path string, form url.Values, extraCookies ...*http.Cookie) (*http.Response, []byte, error) {
 	body := bytes.NewBufferString("")
 	if form != nil {
 		body = bytes.NewBufferString(form.Encode())
@@ -134,6 +144,11 @@ func (a *app) forwardForm(r *http.Request, method, path string, form url.Values)
 	}
 	if cookie, ok := brokerSessionCookie(r); ok {
 		req.AddCookie(cookie)
+	}
+	for _, cookie := range extraCookies {
+		if cookie != nil {
+			req.AddCookie(cookie)
+		}
 	}
 	client := &http.Client{
 		Timeout: 10 * time.Second,
@@ -152,6 +167,33 @@ func (a *app) forwardForm(r *http.Request, method, path string, form url.Values)
 	}
 	resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	return resp, bodyBytes, nil
+}
+
+func (a *app) loginCSRF(r *http.Request) (string, *http.Cookie, error) {
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, a.brokerInternalURL+"/login", nil)
+	if err != nil {
+		return "", nil, err
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
+		return "", nil, &brokerError{message: "load login csrf", status: resp.StatusCode, body: string(body)}
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return "", nil, err
+	}
+	token := csrfTokenFromHTML(body)
+	cookie := responseCookie(resp, brokerCSRFCookieName)
+	if token == "" || cookie == nil {
+		return "", nil, &brokerError{message: "login csrf token missing", status: resp.StatusCode}
+	}
+	return token, cookie, nil
 }
 
 func (a *app) webauthnProxy() http.Handler {
@@ -198,6 +240,15 @@ func brokerSessionCookie(r *http.Request) (*http.Cookie, bool) {
 	return cookie, true
 }
 
+func responseCookie(resp *http.Response, name string) *http.Cookie {
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == name {
+			return cookie
+		}
+	}
+	return nil
+}
+
 func copySetCookie(w http.ResponseWriter, resp *http.Response) {
 	for _, cookie := range resp.Header.Values("Set-Cookie") {
 		w.Header().Add("Set-Cookie", cookie)
@@ -223,6 +274,29 @@ func env(name, fallback string) string {
 }
 
 var signedInPattern = regexp.MustCompile(`Signed in as <strong>([^<]+)</strong>`)
+var csrfTokenPattern = regexp.MustCompile(`<input[^>]*name="csrf_token"[^>]*value="([^"]*)"`)
+
+func csrfTokenFromHTML(body []byte) string {
+	matches := csrfTokenPattern.FindSubmatch(body)
+	if len(matches) != 2 {
+		return ""
+	}
+	return string(matches[1])
+}
+
+type brokerError struct {
+	message string
+	status  int
+	body    string
+}
+
+func (e *brokerError) Error() string {
+	body := strings.TrimSpace(e.body)
+	if body == "" {
+		return e.message
+	}
+	return e.message + ": status=" + http.StatusText(e.status) + " body=" + body
+}
 
 var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
 <html lang="en">

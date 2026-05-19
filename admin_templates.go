@@ -88,6 +88,9 @@ var adminHomeTemplate = template.Must(template.New("admin-home").Parse(`<!doctyp
                   <div><span class="meta-label">Public</span><span class="meta-value">{{if .Public}}yes{{else}}no{{end}}</span></div>
                   <div><span class="meta-label">PKCE</span><span class="meta-value">{{if .RequirePKCE}}required{{else}}optional{{end}}</span></div>
                   <div><span class="meta-label">Consent</span><span class="meta-value">{{if .RequireConsent}}required{{else}}skipped{{end}}</span></div>
+                  <div><span class="meta-label">Scopes</span><span class="meta-value">{{range $i, $scope := .AllowedScopes}}{{if $i}} {{end}}{{$scope}}{{else}}none{{end}}</span></div>
+                  <div><span class="meta-label">Offline access</span><span class="meta-value">{{if .AllowOfflineAccess}}allowed{{else}}disabled{{end}}</span></div>
+                  <div><span class="meta-label">Client credentials scopes</span><span class="meta-value">{{range $i, $scope := .ClientCredentialsScopes}}{{if $i}} {{end}}{{$scope}}{{else}}none{{end}}</span></div>
                   <div>
                     <span class="meta-label">Redirect URIs</span>
                     {{range .RedirectURIs}}<code class="meta-value">{{.}}</code>{{end}}
@@ -187,8 +190,17 @@ var adminClientFormTemplate = template.Must(template.New("admin-client-form").Pa
           <span>Post-logout redirect URIs (optional, one per line)</span>
           <textarea name="post_logout_redirect_uris" rows="2" class="token-output"></textarea>
         </label>
+        <label class="field">
+          <span>Allowed authorization scopes</span>
+          <input name="allowed_scopes" autocomplete="off" value="openid profile email groups">
+        </label>
+        <label class="field">
+          <span>Client credentials scopes</span>
+          <input name="client_credentials_scopes" autocomplete="off">
+        </label>
         <label class="checkbox"><input type="checkbox" name="public"> Public client (no client_secret)</label>
         <label class="checkbox"><input type="checkbox" name="require_pkce" checked> Require PKCE</label>
+        <label class="checkbox"><input type="checkbox" name="allow_offline_access"> Allow offline_access refresh tokens</label>
         <label class="checkbox"><input type="checkbox" name="require_consent" checked> Require consent screen</label>
         <div class="actions">
           <button type="submit">Create client</button>

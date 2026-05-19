@@ -995,6 +995,59 @@ func TestAuthorizePKCERequiredWhenClientFlagged(t *testing.T) {
 	}
 }
 
+func TestAuthorizeRejectsUnsupportedScope(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {"demo-web"},
+		"redirect_uri":          {"http://app.example/callback"},
+		"scope":                 {"openid admin"},
+		"state":                 {"st"},
+		"code_challenge":        {"abc"},
+		"code_challenge_method": {"S256"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/authorize?"+q.Encode(), nil)
+	rr := httptest.NewRecorder()
+	broker.handleAuthorize(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	loc := rr.Header().Get("Location")
+	if !strings.Contains(loc, "error=invalid_scope") {
+		t.Fatalf("Location = %q", loc)
+	}
+}
+
+func TestAuthorizeRejectsOfflineAccessWhenDisabled(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	client := broker.clients["demo-web"]
+	client.AllowOfflineAccess = false
+	client.AllowedScopes = []string{"openid"}
+	if err := normalizeClientScopePolicy(&client); err != nil {
+		t.Fatalf("normalize client: %v", err)
+	}
+	broker.clients["demo-web"] = client
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {"demo-web"},
+		"redirect_uri":          {"http://app.example/callback"},
+		"scope":                 {"openid offline_access"},
+		"state":                 {"st"},
+		"code_challenge":        {"abc"},
+		"code_challenge_method": {"S256"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/authorize?"+q.Encode(), nil)
+	rr := httptest.NewRecorder()
+	broker.handleAuthorize(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	loc := rr.Header().Get("Location")
+	if !strings.Contains(loc, "error=invalid_scope") {
+		t.Fatalf("Location = %q", loc)
+	}
+}
+
 func TestAuthorizeWithValidSessionIssuesCode(t *testing.T) {
 	broker := newLogoutTestBroker(t)
 	sid := "valid-sess"
@@ -1045,6 +1098,12 @@ func TestHandleWebAuthnLoginFinishRateLimited(t *testing.T) {
 
 	if _, err := broker.store.UpsertProfile(UserProfile{Subject: "alice"}); err != nil {
 		t.Fatalf("upsert: %v", err)
+	}
+	if err := broker.store.AddWebAuthnCredential("alice", WebAuthnCredential{
+		IDBase64URL: base64.RawURLEncoding.EncodeToString([]byte("id")),
+		Alg:         "ES256",
+	}); err != nil {
+		t.Fatalf("seed credential: %v", err)
 	}
 	challenge := beginLogin(t, broker, "alice")
 

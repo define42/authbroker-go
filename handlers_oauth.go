@@ -32,6 +32,11 @@ func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
 		return
 	}
+	scope, err := validateAuthorizationScope(client, q.Get("scope"))
+	if err != nil {
+		redirectOAuthError(w, r, redirectURI, q.Get("state"), "invalid_scope", err.Error())
+		return
+	}
 	method := q.Get("code_challenge_method")
 	challenge := q.Get("code_challenge")
 	if method == "" && challenge != "" {
@@ -45,7 +50,7 @@ func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		ID:                  randomB64(32),
 		ClientID:            client.ClientID,
 		RedirectURI:         redirectURI,
-		Scope:               q.Get("scope"),
+		Scope:               scope,
 		State:               q.Get("state"),
 		Nonce:               q.Get("nonce"),
 		CodeChallenge:       challenge,
@@ -326,7 +331,7 @@ func (b *Broker) tokenAuthorizationCode(w http.ResponseWriter, r *http.Request, 
 	// Per OIDC core, refresh tokens are issued only when the grant has the
 	// offline_access scope. Browsers can still re-establish tokens via a
 	// silent /oauth2/authorize using the SSO session cookie.
-	includeRefresh := scopeIncludes(ac.Scope, "offline_access")
+	includeRefresh := client.AllowOfflineAccess && scopeIncludes(ac.Scope, scopeOfflineAccess)
 	resp, err := b.issueUserTokens(ac.UserID, client.ClientID, ac.Scope, ac.Nonce, ac.AuthTime, ac.AMR, includeRefresh)
 	if err != nil {
 		tokenServerError(w, "issue tokens for authorization_code grant", err)
@@ -528,7 +533,15 @@ func (b *Broker) tokenClientCredentials(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	now := time.Now()
-	scope := r.Form.Get("scope")
+	scope, err := validateClientCredentialsScope(client, r.Form.Get("scope"))
+	if err != nil {
+		b.auditEvent(r, auditEventTokenIssue, auditOutcomeFailure,
+			slog.String("client_id", client.ClientID),
+			slog.String("grant_type", "client_credentials"),
+			slog.String("reason", "invalid_scope"))
+		tokenError(w, "invalid_scope", err.Error())
+		return
+	}
 	claims := map[string]any{
 		"iss":       b.cfg.Issuer,
 		"sub":       client.ClientID,

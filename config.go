@@ -141,13 +141,16 @@ type LDAPConfig struct {
 }
 
 type Client struct {
-	ClientID               string            `json:"client_id"`
-	ClientSecretSHA256     string            `json:"client_secret_sha256,omitempty"`
-	RedirectURIs           []string          `json:"redirect_uris"`
-	PostLogoutRedirectURIs []string          `json:"post_logout_redirect_uris,omitempty"`
-	Public                 bool              `json:"public"`
-	RequirePKCE            bool              `json:"require_pkce"`
-	GroupMappings          map[string]string `json:"group_mappings,omitempty"`
+	ClientID                string            `json:"client_id"`
+	ClientSecretSHA256      string            `json:"client_secret_sha256,omitempty"`
+	RedirectURIs            []string          `json:"redirect_uris"`
+	PostLogoutRedirectURIs  []string          `json:"post_logout_redirect_uris,omitempty"`
+	Public                  bool              `json:"public"`
+	RequirePKCE             bool              `json:"require_pkce"`
+	AllowedScopes           []string          `json:"allowed_scopes,omitempty"`
+	ClientCredentialsScopes []string          `json:"client_credentials_scopes,omitempty"`
+	AllowOfflineAccess      bool              `json:"allow_offline_access,omitempty"`
+	GroupMappings           map[string]string `json:"group_mappings,omitempty"`
 	// RequireConsent enables the per-user consent screen for this client.
 	// Off by default for backwards compatibility with config-defined first-
 	// party clients. Admin-created clients via /admin set it to true so
@@ -161,7 +164,9 @@ type Client struct {
 
 	// compiledMappings caches the parsed direct/scoped/regex mapping
 	// representation. Populated by NewBroker after normalizeClientGroupMappings.
-	compiledMappings *compiledGroupMappings
+	compiledMappings               *compiledGroupMappings
+	allowedScopeSet                map[string]bool
+	clientCredentialsAllowedScopes map[string]bool
 }
 
 type MFAConfig struct {
@@ -367,6 +372,9 @@ func validateConfigShape(cfg Config) error {
 			return fmt.Errorf("duplicate client_id %q", c.ClientID)
 		}
 		seenClients[c.ClientID] = true
+		if err := validateClientScopeConfig(c); err != nil {
+			return fmt.Errorf("client %q: %w", c.ClientID, err)
+		}
 	}
 	seenTokens := map[string]bool{}
 	for _, tokenCfg := range cfg.AppTokens {
