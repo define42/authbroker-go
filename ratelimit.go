@@ -64,6 +64,27 @@ func (l *loginRateLimiter) allow(key string) (bool, time.Duration) {
 	return true, 0
 }
 
+// allowAndRecord is the "every call counts" variant of allow: when the key
+// is not locked, it returns (true, 0) AND immediately records a failure so
+// the bucket fills under burst load even though the request itself did not
+// fail in the usual sense. Use this from preauth write paths (authorize,
+// webauthn login begin, login GET) where unauthenticated callers can
+// otherwise spam the underlying store without ever tripping the limiter.
+// Callers that DO have a notion of success/failure should keep using
+// allow() + recordFailure()/recordSuccess() so a legitimate login can
+// reset the bucket.
+func (l *loginRateLimiter) allowAndRecord(key string) (bool, time.Duration) {
+	if l == nil || key == "" {
+		return true, 0
+	}
+	allowed, retry := l.allow(key)
+	if !allowed {
+		return false, retry
+	}
+	l.recordFailure(key)
+	return true, 0
+}
+
 func (l *loginRateLimiter) recordFailure(key string) {
 	if l == nil || key == "" {
 		return
@@ -202,11 +223,16 @@ func (b *Broker) clientIP(r *http.Request) string {
 // the leftmost entry instead would be spoofable: most proxies append rather
 // than replace the header, so an attacker can prepend any value and have it
 // surface as the client IP.
+//
+// Entries may carry a port suffix (Caddy appends host:port for example).
+// parseIPEntry handles both bare IPs and host:port forms so a multi-hop chain
+// doesn't silently skip the legitimate proxy entry and fall through to the
+// leftmost parseable IP.
 func clientIPFromTrustedChain(value string, trusted trustedProxySet) string {
 	parts := strings.Split(value, ",")
 	for i := len(parts) - 1; i >= 0; i-- {
-		raw := strings.TrimSpace(parts[i])
-		if net.ParseIP(raw) == nil {
+		raw := parseIPEntry(parts[i])
+		if raw == "" {
 			continue
 		}
 		if trusted.containsString(raw) {
@@ -218,9 +244,28 @@ func clientIPFromTrustedChain(value string, trusted trustedProxySet) string {
 	// leftmost parseable entry — by XFF convention that is the original
 	// client, even though it ended up inside our trusted set.
 	for _, part := range parts {
-		ip := strings.TrimSpace(part)
-		if net.ParseIP(ip) != nil {
+		if ip := parseIPEntry(part); ip != "" {
 			return ip
+		}
+	}
+	return ""
+}
+
+// parseIPEntry accepts either a bare IP or a host:port form (with IPv6
+// addresses optionally bracketed) and returns the canonical IP literal, or ""
+// if the entry is not parseable.
+func parseIPEntry(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if ip := net.ParseIP(raw); ip != nil {
+		return raw
+	}
+	if host, _, err := net.SplitHostPort(raw); err == nil {
+		host = strings.Trim(strings.TrimSpace(host), "[]")
+		if ip := net.ParseIP(host); ip != nil {
+			return host
 		}
 	}
 	return ""

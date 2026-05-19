@@ -439,18 +439,10 @@ func (b *Broker) adminAppTokensFormRedirect(w http.ResponseWriter, r *http.Reque
 
 // validClientID applies the same character/length rules used for app-token
 // IDs. Reflected in URLs and JWT claims, so an explicit whitelist keeps the
-// HTML/CSP/audit pipeline boring.
+// HTML/CSP/audit pipeline boring. Delegates to validIdentifier so app tokens
+// and OAuth clients cannot drift on what characters are accepted.
 func validClientID(id string) bool {
-	if id == "" || len(id) > 64 {
-		return false
-	}
-	for _, r := range id {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
-			continue
-		}
-		return false
-	}
-	return true
+	return validIdentifier(id, maxClientIDLen)
 }
 
 func splitFormLines(in string) []string {

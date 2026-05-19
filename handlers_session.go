@@ -15,6 +15,14 @@ func (b *Broker) handleLoginGet(w http.ResponseWriter, r *http.Request) {
 	rid := r.URL.Query().Get("request_id")
 	clientID := "authbroker"
 	if rid != "" {
+		// Cap unauthenticated bbolt lookups per IP. The request_id space is
+		// 32 random bytes and effectively unguessable, but absent this cap a
+		// hostile client can hammer GetAuthRequest with random IDs and keep
+		// the read transaction loop busy. The limit is shared with the rest
+		// of the preauth surface (authorize, webauthn login begin).
+		if !b.allowPreAuthWrite(w, r, "login_get") {
+			return
+		}
 		ar, ok, err := b.store.GetAuthRequest(rid)
 		if err != nil {
 			http.Error(w, "store error", http.StatusInternalServerError)
@@ -267,6 +275,15 @@ func (b *Broker) handleLogout(w http.ResponseWriter, r *http.Request) {
 	// interstitial for GET requests carrying an active session so that
 	// <a>/<img>/redirect-driven CSRF cannot drop the session in one round-trip.
 	// RP-initiated POSTs proceed directly, as in spec-compliant flows.
+	//
+	// GET without an active session still falls through to the
+	// handlePostLogoutRedirect path below. That path requires
+	// post_logout_redirect_uri to be in the client's registered allowlist, so
+	// it is NOT an open redirect — the worst an attacker can do via a
+	// crafted GET link is bounce a not-logged-in user to a URL the client's
+	// operator already approved, with the attacker's `state` value attached.
+	// Treated as acceptable: the registered URI is by definition trusted by
+	// the client, and `state` passthrough is the documented OAuth pattern.
 	if r.Method == http.MethodGet {
 		if sess, hasSession := b.validSession(r); hasSession {
 			b.renderRPLogoutConfirm(w, sess, idTokenHint, clientID, postLogoutRedirectURI, state)
@@ -375,6 +392,14 @@ func (b *Broker) logoutClientIDFromIDTokenHint(idTokenHint string) (string, erro
 	// broker should accept previously valid (signature + iss) ID tokens even
 	// after exp has passed so that callers using long-lived stored tokens can
 	// still initiate logout.
+	//
+	// Note that verifyJWTWithOptions still consults the revoked-JTI bucket,
+	// so a token whose JTI has been explicitly revoked is unusable as a
+	// logout hint. This is intentional — revocation is a stronger statement
+	// than expiry, and treating a revoked token as a valid hint would
+	// re-introduce a window of confused-deputy attacks the revocation was
+	// meant to close. Callers without an id_token can omit the hint and
+	// supply client_id directly.
 	claims, err := b.verifyJWTWithOptions(idTokenHint, jwtVerifyOptions{ignoreExpiry: true})
 	if err != nil {
 		return "", err

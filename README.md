@@ -181,6 +181,8 @@ When `signing_key_pem` and `signing_keys` are omitted, startup automatically man
 
 Managed keys rotate every `signing_key_rotation_days` days, defaulting to 90. Retired keys are kept for `signing_key_retention_days`, defaulting to 30. Set either value to `-1` to disable automatic rotation or pruning, and run with `-rotate-key` to force a managed-key rotation on startup.
 
+Rotation is **restart-driven**: the broker evaluates the rotation cadence only at startup (and on `-rotate-key`). A broker process that runs uninterrupted for longer than `signing_key_rotation_days` will not rotate its key in flight — operators who require strict rotation cadence must schedule periodic restarts (a typical Kubernetes Deployment rolling update or systemd timer is sufficient).
+
 You can still generate a config-managed key yourself:
 
 ```bash

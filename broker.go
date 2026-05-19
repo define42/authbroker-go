@@ -149,6 +149,14 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 		return nil, err
 	}
 	if activeKey.privateKey == nil {
+		// A production broker that lands here would silently invalidate every
+		// token it ever issued at the next restart — refresh tokens still
+		// referencing the prior key would fail to verify. Fail loudly instead
+		// of warning, so the operator fixes signing_key_pem / AUTHBROKER_DATA
+		// before the first user authenticates.
+		if cfg.Production {
+			return nil, fmt.Errorf("production requires a persisted signing key: configure signing_key_pem or AUTHBROKER_DATA so prepareSigningKeys can persist a managed key")
+		}
 		activeKey.privateKey, err = rsa.GenerateKey(rand.Reader, 2048)
 		if err != nil {
 			return nil, err
@@ -406,22 +414,39 @@ func (b *Broker) startBackgroundSweeper(ctx context.Context, interval time.Durat
 	}
 }
 
-// maxAppTokenIDLen caps the app-token id length. The id is reflected in URL
-// paths, HTML, and JWT claims; HTML escaping and exact path matching make
-// this cap defensive insurance rather than a security boundary.
-const maxAppTokenIDLen = 64
+// maxAppTokenIDLen / maxClientIDLen cap the id length for app tokens and
+// OAuth clients respectively. Ids are reflected in URL paths, HTML, and JWT
+// claims; HTML escaping and exact path matching make this cap defensive
+// insurance rather than a security boundary. Both caps are 64.
+const (
+	maxAppTokenIDLen = 64
+	maxClientIDLen   = 64
+)
 
-func validAppTokenID(id string) bool {
-	if id == "" || len(id) > maxAppTokenIDLen {
+// validIdentifier is the shared `[A-Za-z0-9._-]{1,maxLen}` check used by
+// validAppTokenID and validClientID. The two callers used to carry
+// byte-for-byte duplicate loops; collapsing them keeps the allowed character
+// set in one place so a future ASCII-range change (e.g. adding ':') cannot
+// drift out of sync between app tokens and clients.
+func validIdentifier(id string, maxLen int) bool {
+	if id == "" || len(id) > maxLen {
 		return false
 	}
 	for _, r := range id {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
-			continue
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '.' || r == '_' || r == '-':
+		default:
+			return false
 		}
-		return false
 	}
 	return true
+}
+
+func validAppTokenID(id string) bool {
+	return validIdentifier(id, maxAppTokenIDLen)
 }
 
 func (b *Broker) routes() http.Handler {
@@ -429,6 +454,23 @@ func (b *Broker) routes() http.Handler {
 		b.cachedRoutes = b.buildRoutes()
 	})
 	return b.cachedRoutes
+}
+
+// dynamicRoutePatterns is the shared source of truth for routes that embed a
+// `{id}` path parameter. buildRoutes uses these patterns verbatim when
+// registering mux entries, and observability.metricPath normalizes incoming
+// concrete URLs against the same list — keeping the two in sync prevents the
+// Prometheus label space from exploding when a new dynamic route is added.
+//
+//nolint:gochecknoglobals,gosec // Static routing table; the AppToken field name triggers gosec G101 because it contains the substring "token", but the value is a URL pattern, not a credential.
+var dynamicRoutePatterns = struct {
+	AppToken            string
+	AdminClientDelete   string
+	AdminAppTokenDelete string
+}{
+	AppToken:            "/app-tokens/{id}",
+	AdminClientDelete:   "/admin/clients/{id}/delete",
+	AdminAppTokenDelete: "/admin/app-tokens/{id}/delete",
 }
 
 func (b *Broker) buildRoutes() http.Handler {
@@ -445,7 +487,7 @@ func (b *Broker) buildRoutes() http.Handler {
 	mux.HandleFunc("GET /logout", b.handleLocalLogoutGet)
 	mux.HandleFunc("POST /logout", b.handleLocalLogoutPost)
 	mux.HandleFunc("POST /reauth", b.handleReAuth)
-	mux.HandleFunc("POST /app-tokens/{id}", b.handleAppToken)
+	mux.HandleFunc("POST "+dynamicRoutePatterns.AppToken, b.handleAppToken)
 	mux.HandleFunc("POST /oauth2/token", b.handleToken)
 	mux.HandleFunc("GET /oauth2/userinfo", b.handleUserInfo)
 	mux.HandleFunc("POST /oauth2/userinfo", b.handleUserInfo)
@@ -464,10 +506,10 @@ func (b *Broker) buildRoutes() http.Handler {
 	mux.HandleFunc("GET /admin", b.handleAdminHome)
 	mux.HandleFunc("GET /admin/clients/new", b.handleAdminClientsNew)
 	mux.HandleFunc("POST /admin/clients", b.handleAdminClientsCreate)
-	mux.HandleFunc("POST /admin/clients/{id}/delete", b.handleAdminClientsDelete)
+	mux.HandleFunc("POST "+dynamicRoutePatterns.AdminClientDelete, b.handleAdminClientsDelete)
 	mux.HandleFunc("GET /admin/app-tokens/new", b.handleAdminAppTokensNew)
 	mux.HandleFunc("POST /admin/app-tokens", b.handleAdminAppTokensCreate)
-	mux.HandleFunc("POST /admin/app-tokens/{id}/delete", b.handleAdminAppTokensDelete)
+	mux.HandleFunc("POST "+dynamicRoutePatterns.AdminAppTokenDelete, b.handleAdminAppTokensDelete)
 	return b.observability(b.securityHeaders(mux))
 }
 

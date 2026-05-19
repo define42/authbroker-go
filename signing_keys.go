@@ -49,9 +49,29 @@ func buildSigningKeySet(cfg Config) (signingKey, map[string]*rsa.PublicKey, []an
 		}
 	}
 	if activeCount != 1 {
-		return signingKey{}, nil, nil, fmt.Errorf("exactly one signing key must be active")
+		return signingKey{}, nil, nil, signingKeySelectionError(activeFlags, activeCount, cfg.KeyID, len(keyConfigs))
 	}
 	return active, verifyKeys, publicJWKs, nil
+}
+
+// signingKeySelectionError produces an actionable message for the two distinct
+// "couldn't pick an active key" failure modes operators hit: too many active
+// flags set, or none set with no matching cfg.key_id. Falling back to a single
+// generic message ("exactly one signing key must be active") sends operators
+// hunting for an active flag when the real cause is often a typo in key_id.
+func signingKeySelectionError(activeFlags, activeCount int, cfgKeyID string, keyCount int) error {
+	if activeFlags > 1 {
+		return fmt.Errorf("signing_keys: %d entries have active=true; exactly one must be active", activeFlags)
+	}
+	if activeFlags == 0 && keyCount > 1 {
+		if strings.TrimSpace(cfgKeyID) == "" {
+			return fmt.Errorf("signing_keys: %d entries configured but none marked active=true; set active=true on the entry to use for signing, or set key_id at the top level", keyCount)
+		}
+		return fmt.Errorf("signing_keys: no entry matches key_id=%q and no signing_keys[*].active=true is set", cfgKeyID)
+	}
+	// activeCount == 0 with activeFlags == 1 (impossible under current branch)
+	// or any other arithmetic surprise — fall back to the generic phrasing.
+	return fmt.Errorf("exactly one signing key must be active (got %d)", activeCount)
 }
 
 func effectiveSigningKeyConfigs(cfg Config) []SigningKeyConfig {
@@ -149,6 +169,15 @@ const (
 	sourceStore
 )
 
+// prepareSigningKeys is the only caller of rotateAndPrune in the broker.
+// Signing-key rotation therefore fires exclusively at process start (or on
+// `-rotate-key`), NOT periodically — a broker running uninterrupted for
+// 200 days does not rotate its key, even if SigningKeyRotationDays is 90.
+// The sweeper does not touch signing keys to avoid the concurrency cost of
+// guarding b.activeKey / b.verifyKeys / b.publicJWKs at every signJWT and
+// verifyJWT call. Operators who require strict rotation cadence must
+// schedule periodic restarts (or send SIGTERM and let the orchestrator
+// relaunch).
 func prepareSigningKeys(cfg *Config, store *Store, dataDir string, forceRotate bool) error {
 	if strings.TrimSpace(cfg.SigningKeyPEM) != "" || len(cfg.SigningKeys) > 0 || store == nil {
 		return nil

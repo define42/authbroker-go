@@ -1,23 +1,67 @@
 package main
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 )
 
-func (b *Broker) handleStylesheet(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/css; charset=utf-8")
-	w.Header().Set("Cache-Control", "public, max-age=3600")
-	_, _ = w.Write([]byte(authbrokerCSS))
+// Strong ETags for the embedded static assets. Computed once at init from a
+// SHA-256 of the body — any rebuild that mutates authbrokerCSS / authbrokerJS
+// produces a new ETag, so the 1h Cache-Control window does not strand users
+// on stale bytes after a deploy.
+//
+//nolint:gochecknoglobals // Asset bodies are static; their hashes are too.
+var (
+	authbrokerCSSETag = computeAssetETag(authbrokerCSS)
+	authbrokerJSETag  = computeAssetETag(authbrokerJS)
+)
+
+func computeAssetETag(body string) string {
+	sum := sha256.Sum256([]byte(body))
+	return `"` + base64RawURL(sum[:]) + `"`
 }
 
-func (b *Broker) handleScript(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+func (b *Broker) handleStylesheet(w http.ResponseWriter, r *http.Request) {
+	serveStaticAsset(w, r, "text/css; charset=utf-8", authbrokerCSS, authbrokerCSSETag)
+}
+
+func (b *Broker) handleScript(w http.ResponseWriter, r *http.Request) {
+	serveStaticAsset(w, r, "application/javascript; charset=utf-8", authbrokerJS, authbrokerJSETag)
+}
+
+// serveStaticAsset writes one of the embedded CSS/JS strings with a strong
+// ETag (SHA-256 of the body, pre-computed at init time). The 3600s Cache-
+// Control + ETag combination lets browsers reuse the bytes for an hour but
+// pick up a new build the moment the operator rolls a binary update — the
+// ETag changes because the embedded string changed, and the conditional
+// If-None-Match path returns 304 only when the contents truly match.
+func serveStaticAsset(w http.ResponseWriter, r *http.Request, contentType, body, etag string) {
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Cache-Control", "public, max-age=3600")
-	_, _ = w.Write([]byte(authbrokerJS))
+	w.Header().Set("ETag", etag)
+	if match := r.Header.Get("If-None-Match"); match != "" && etagMatches(match, etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	_, _ = w.Write([]byte(body))
+}
+
+// etagMatches honors comma-separated If-None-Match values per RFC 7232 §3.2,
+// tolerating optional W/ weak markers and surrounding whitespace.
+func etagMatches(header, etag string) bool {
+	for _, candidate := range strings.Split(header, ",") {
+		candidate = strings.TrimSpace(candidate)
+		candidate = strings.TrimPrefix(candidate, "W/")
+		if candidate == "*" || candidate == etag {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *Broker) handleHealth(w http.ResponseWriter, _ *http.Request) {

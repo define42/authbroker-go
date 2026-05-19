@@ -182,25 +182,52 @@ func escapeMetricLabel(value string) string {
 
 // metricPath normalizes templated request paths so that one metric series is
 // emitted per route pattern (rather than per concrete URL with embedded IDs).
-//
-// MAINTENANCE: when adding a new route in (*Broker).buildRoutes that uses a
-// path parameter — e.g. `/foo/{id}` — add a matching case here. Otherwise
-// the metric label space will grow unbounded with one series per id, and
-// Prometheus scrapes will explode. net/http.ServeMux does not expose its
-// registered patterns, which is why this is a hand-maintained list.
+// The patterns come from dynamicRoutePatterns, so buildRoutes and the metric
+// label set move in lockstep — adding a new `/foo/{id}` route requires only
+// extending dynamicRoutePatterns; no second edit here is needed.
 func metricPath(path, metricsPath string) string {
-	switch {
-	case path == "":
+	if path == "" {
 		return "/"
-	case metricsPath != "" && path == metricsPath:
-		return metricsPath
-	case strings.HasPrefix(path, "/admin/clients/") && strings.HasSuffix(path, "/delete"):
-		return "/admin/clients/{id}/delete"
-	case strings.HasPrefix(path, "/admin/app-tokens/") && strings.HasSuffix(path, "/delete"):
-		return "/admin/app-tokens/{id}/delete"
-	case strings.HasPrefix(path, "/app-tokens/"):
-		return "/app-tokens/{id}"
-	default:
-		return path
 	}
+	if metricsPath != "" && path == metricsPath {
+		return metricsPath
+	}
+	for _, pattern := range dynamicRoutePatternList {
+		if matchDynamicPattern(pattern, path) {
+			return pattern
+		}
+	}
+	return path
+}
+
+// dynamicRoutePatternList enumerates the patterns metricPath should collapse.
+// Ordered so the most specific patterns are checked first — `/admin/foo/{id}/delete`
+// must win over a hypothetical `/admin/foo/{id}` if both existed.
+//
+//nolint:gochecknoglobals // Mirrors dynamicRoutePatterns; populated at init.
+var dynamicRoutePatternList = []string{
+	dynamicRoutePatterns.AdminClientDelete,
+	dynamicRoutePatterns.AdminAppTokenDelete,
+	dynamicRoutePatterns.AppToken,
+}
+
+// matchDynamicPattern reports whether path matches pattern, where pattern
+// contains exactly one `{id}` segment. The match is segment-aware: a request
+// for `/app-tokens/foo/bar` does NOT match `/app-tokens/{id}` even though the
+// prefix lines up.
+func matchDynamicPattern(pattern, path string) bool {
+	idx := strings.Index(pattern, "{id}")
+	if idx < 0 {
+		return pattern == path
+	}
+	prefix := pattern[:idx]
+	suffix := pattern[idx+len("{id}"):]
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return false
+	}
+	middle := path[len(prefix) : len(path)-len(suffix)]
+	if middle == "" || strings.Contains(middle, "/") {
+		return false
+	}
+	return true
 }

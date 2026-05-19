@@ -15,6 +15,17 @@ import (
 	"time"
 )
 
+// handleAuthorize trusts the request's Host header to be the canonical issuer
+// hostname. The broker does NOT compare r.Host against cfg.Issuer — it relies
+// on the upstream listener / reverse proxy to route only the configured
+// hostname(s) to this process. If you front the broker with a proxy that
+// terminates TLS and accepts arbitrary Host values, the cookie set on the
+// resulting response is host-bound (no Domain attribute), so the worst case
+// is cookies dropped on an unintended origin — but the OAuth code redirect
+// itself is safe because redirect_uri is exact-match against the registered
+// list. Production deployments MUST ensure the listener only answers for the
+// issuer hostname (or domain wildcard in the ACME config).
+//
 //nolint:funlen // Authorize validates the request, dispatches prompt handling, and routes to login/consent — splitting would obscure the linear flow.
 func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
@@ -89,22 +100,23 @@ func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 }
 
 // allowPreAuthWrite caps per-IP creation of unauthenticated pre-login state
-// (auth requests, WebAuthn login challenges). These writes happen before any
-// credential check and would otherwise let one client grow the bbolt store
-// without bound; the limiter bumps on every attempt so the bucket fills under
-// burst load even though the request itself never "fails" in the usual sense.
-// Returns true to proceed, false when a 429 has already been written.
+// (auth requests, WebAuthn login challenges, login GET lookups). These writes
+// happen before any credential check and would otherwise let one client grow
+// the bbolt store without bound; the limiter bumps on every attempt so the
+// bucket fills under burst load even though the request itself never "fails"
+// in the usual sense. Returns true to proceed, false when a 429 has already
+// been written.
 func (b *Broker) allowPreAuthWrite(w http.ResponseWriter, r *http.Request, scope string) bool {
 	if b.preAuthLimiter == nil {
 		return true
 	}
 	key := "preauth:" + scope + "/ip:" + b.clientIP(r)
-	if allowed, retry := b.preAuthLimiter.allow(key); !allowed {
+	allowed, retry := b.preAuthLimiter.allowAndRecord(key)
+	if !allowed {
 		writeRetryAfter(w, retry)
 		http.Error(w, "too many requests; try again later", http.StatusTooManyRequests)
 		return false
 	}
-	b.preAuthLimiter.recordFailure(key)
 	return true
 }
 
@@ -445,14 +457,27 @@ func (b *Broker) rejectExpiredOrMismatchedRefreshToken(w http.ResponseWriter, r 
 	if !time.Now().After(old.ExpiresAt) && old.ClientID == client.ClientID {
 		return false, nil
 	}
-	if _, err := b.store.DeleteRefreshToken(key); err != nil {
-		return false, err
+	// Only delete the active token when it is actually expired. A client
+	// mismatch by itself is treated as an audit-fail without mutating store
+	// state: deleting on mismatch would let a hostile (but credentialed)
+	// second client grief the legitimate holder by presenting their refresh
+	// token to the wrong /token endpoint and burning it.
+	expired := time.Now().After(old.ExpiresAt)
+	reason := "client_mismatch"
+	if expired {
+		if _, err := b.store.DeleteRefreshToken(key); err != nil {
+			return false, err
+		}
+		reason = "expired"
+		if old.ClientID != client.ClientID {
+			reason = "expired_and_client_mismatch"
+		}
 	}
 	b.auditEvent(r, auditEventTokenIssue, auditOutcomeFailure,
 		slog.String("client_id", client.ClientID),
 		slog.String("user_id", old.UserID),
 		slog.String("grant_type", "refresh_token"),
-		slog.String("reason", "expired_or_client_mismatch"))
+		slog.String("reason", reason))
 	tokenError(w, "invalid_grant", "invalid refresh_token")
 	return true, nil
 }
@@ -630,6 +655,11 @@ func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime
 		"expires_in":   b.cfg.AccessTokenTTLMinutes * 60,
 		"scope":        scope,
 	}
+	// Per OIDC Core §3.1.2.1, the `openid` scope is the marker that this is an
+	// OIDC request rather than a plain OAuth2 request — and only OIDC requests
+	// receive an id_token. Without this gate, a non-OIDC client asking for
+	// `profile email` alone would still get an id_token, which is a protocol
+	// violation and exposes user claims the caller never asked for.
 	if scopeIncludes(scope, scopeOpenID) {
 		atHashSum := sha256.Sum256([]byte(access))
 		idClaims := map[string]any{
@@ -761,7 +791,15 @@ func (b *Broker) mappedGroupsForClient(clientID string, user *StoredUser) []stri
 // Authorization: Bearer header takes precedence; for POST requests with a
 // form-encoded body, the `access_token` parameter is also accepted, as
 // required by OIDC Core §5.3.1.
+//
+// The body cap is applied unconditionally for POST regardless of which branch
+// reads the body. This is defensive: today the Authorization-header branch
+// never touches r.Body, but a future change that does (e.g. logging) cannot
+// accidentally pull an unbounded payload.
 func userInfoBearerToken(w http.ResponseWriter, r *http.Request) string {
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, maxUserInfoBodyBytes)
+	}
 	authz := r.Header.Get("Authorization")
 	token := strings.TrimSpace(strings.TrimPrefix(authz, bearerPrefix))
 	if token != "" && token != authz {
@@ -774,7 +812,6 @@ func userInfoBearerToken(w http.ResponseWriter, r *http.Request) string {
 	if ct != "application/x-www-form-urlencoded" {
 		return ""
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxUserInfoBodyBytes)
 	if err := r.ParseForm(); err != nil {
 		return ""
 	}
@@ -1011,15 +1048,26 @@ func (b *Broker) revokeJWT(tok string, client Client) error {
 	if err != nil {
 		return nil
 	}
-	aud, _ := claims["aud"].(string)
+	// Use clientIDFromTokenClaims so multi-audience tokens (azp present, or
+	// aud as a single-element array) resolve to the authoritative client
+	// rather than yielding "" and silently skipping the revoke.
+	owner := clientIDFromTokenClaims(claims)
 	jti, _ := claims["jti"].(string)
 	expUnix, ok := numberClaim(claims["exp"])
-	if aud != client.ClientID || jti == "" || !ok {
+	if owner != client.ClientID || jti == "" || !ok {
 		return nil
 	}
 	return b.store.PutRevokedJTI(jti, time.Unix(expUnix, 0).Add(jwtClockSkew))
 }
 
+// clientAllowsRedirect / clientAllowsPostLogoutRedirect intentionally compare
+// by exact byte-for-byte string equality, per OAuth 2.1 §4.1.2.2 ("Loopback
+// Interface Redirection" excepted, which this broker does not implement).
+// A trailing slash, an explicit `:443`, an added/dropped fragment, or any
+// percent-encoding difference will NOT match. Do NOT change this to a
+// url.Parse + structural compare — partial matches and host-only comparisons
+// have repeatedly been the source of redirect-URI bypass CVEs across OAuth
+// implementations. Operators must register the exact URI the client uses.
 func clientAllowsRedirect(c Client, redirectURI string) bool {
 	for _, allowed := range c.RedirectURIs {
 		if redirectURI == allowed {
