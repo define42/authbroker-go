@@ -92,7 +92,7 @@ func buildAttestedAuthData(rpID string, credID []byte, cosePub []byte) []byte {
 	rpHash := sha256.Sum256([]byte(rpID))
 	var buf []byte
 	buf = append(buf, rpHash[:]...)
-	buf = append(buf, 0x41)                // UP|AT
+	buf = append(buf, 0x45)                // UP|UV|AT
 	buf = append(buf, 0, 0, 0, 0)          // signCount = 0
 	buf = append(buf, make([]byte, 16)...) // AAGUID
 	credLen := make([]byte, 2)
@@ -251,7 +251,7 @@ func assertionAuthDataBytes(t *testing.T, rpID string, signCount uint32) []byte 
 	rpHash := sha256.Sum256([]byte(rpID))
 	buf := make([]byte, 0, 37)
 	buf = append(buf, rpHash[:]...)
-	buf = append(buf, 0x01) // UP only
+	buf = append(buf, 0x05) // UP|UV
 	cnt := make([]byte, 4)
 	binary.BigEndian.PutUint32(cnt, signCount)
 	buf = append(buf, cnt...)
@@ -268,13 +268,19 @@ func TestVerifyAssertionAuthDataErrors(t *testing.T) {
 	}
 	rpHash := sha256.Sum256([]byte("known"))
 	good := append([]byte{}, rpHash[:]...)
-	good = append(good, 0x01)
+	good = append(good, 0x05) // UP|UV
 	good = append(good, 0, 0, 0, 7)
 	if _, err := verifyAssertionAuthData(good, "different-rp"); err == nil {
 		t.Fatal("wrong rpID should fail")
 	}
 	if _, err := verifyAssertionAuthData(append(append([]byte{}, rpHash[:]...), make([]byte, 5)...), "known"); err == nil {
 		t.Fatal("missing UP flag should fail")
+	}
+	noUV := append([]byte{}, rpHash[:]...)
+	noUV = append(noUV, 0x01) // UP only, no UV
+	noUV = append(noUV, 0, 0, 0, 1)
+	if _, err := verifyAssertionAuthData(noUV, "known"); err == nil {
+		t.Fatal("missing UV flag should fail")
 	}
 	signCount, err := verifyAssertionAuthData(good, "known")
 	if err != nil || signCount != 7 {
@@ -343,9 +349,16 @@ func TestParseAttestedAuthDataAndCOSEKey(t *testing.T) {
 
 	// Missing UP flag.
 	noUP := append([]byte{}, authData...)
-	noUP[32] = 0x40
+	noUP[32] = 0x44 // UV|AT, no UP
 	if _, err := parseAttestedAuthData(noUP, "rp.example"); err == nil {
 		t.Fatal("missing UP flag should fail")
+	}
+
+	// Missing UV flag.
+	noUV := append([]byte{}, authData...)
+	noUV[32] = 0x41 // UP|AT, no UV
+	if _, err := parseAttestedAuthData(noUV, "rp.example"); err == nil {
+		t.Fatal("missing UV flag should fail")
 	}
 }
 

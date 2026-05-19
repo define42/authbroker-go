@@ -104,9 +104,10 @@ type Broker struct {
 	storedClients   map[string]Client
 	storedAppTokens map[string]AppTokenConfig
 
-	loginLimiter *loginRateLimiter
-	tokenLimiter *loginRateLimiter
-	proxies      trustedProxySet
+	loginLimiter   *loginRateLimiter
+	tokenLimiter   *loginRateLimiter
+	preAuthLimiter *loginRateLimiter
+	proxies        trustedProxySet
 
 	audit      *slog.Logger
 	requestLog *slog.Logger
@@ -214,6 +215,11 @@ func NewBroker(cfg Config, store *Store) (*Broker, error) {
 			time.Duration(cfg.RateLimit.TokenWindowSeconds)*time.Second,
 			cfg.RateLimit.TokenMaxAttempts,
 			time.Duration(cfg.RateLimit.TokenLockoutSeconds)*time.Second,
+		),
+		preAuthLimiter: newLoginRateLimiter(
+			time.Duration(cfg.RateLimit.PreAuthWindowSeconds)*time.Second,
+			cfg.RateLimit.PreAuthMaxAttempts,
+			time.Duration(cfg.RateLimit.PreAuthLockoutSeconds)*time.Second,
 		),
 		proxies:    proxies,
 		audit:      newAuditLogger(nil),
@@ -349,6 +355,8 @@ func (b *Broker) sweepExpired(now time.Time) {
 		log.Printf("persist runtime state after sweep: %v", err)
 	}
 	b.loginLimiter.sweep(now)
+	b.tokenLimiter.sweep(now)
+	b.preAuthLimiter.sweep(now)
 }
 
 // startBackgroundSweeper periodically calls sweepExpired until ctx is done.

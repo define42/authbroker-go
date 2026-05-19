@@ -190,14 +190,34 @@ func (b *Broker) clientIP(r *http.Request) string {
 	if b == nil || r == nil || b.proxies.empty() || !b.proxies.containsString(remote) {
 		return remote
 	}
-	if ip := clientIPFromHeader(r.Header.Get(b.cfg.ClientIPHeader)); ip != "" {
+	if ip := clientIPFromTrustedChain(r.Header.Get(b.cfg.ClientIPHeader), b.proxies); ip != "" {
 		return ip
 	}
 	return remote
 }
 
-func clientIPFromHeader(value string) string {
-	for _, part := range strings.Split(value, ",") {
+// clientIPFromTrustedChain returns the rightmost header entry that is NOT a
+// trusted proxy. Trusted hops appended to X-Forwarded-For are stripped from
+// the right, and the first untrusted entry left is the real client. Taking
+// the leftmost entry instead would be spoofable: most proxies append rather
+// than replace the header, so an attacker can prepend any value and have it
+// surface as the client IP.
+func clientIPFromTrustedChain(value string, trusted trustedProxySet) string {
+	parts := strings.Split(value, ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		raw := strings.TrimSpace(parts[i])
+		if net.ParseIP(raw) == nil {
+			continue
+		}
+		if trusted.containsString(raw) {
+			continue
+		}
+		return raw
+	}
+	// All header entries are trusted proxies (or unparseable). Surface the
+	// leftmost parseable entry — by XFF convention that is the original
+	// client, even though it ended up inside our trusted set.
+	for _, part := range parts {
 		ip := strings.TrimSpace(part)
 		if net.ParseIP(ip) != nil {
 			return ip

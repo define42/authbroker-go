@@ -139,6 +139,25 @@ func TestTrustedProxyClientIP(t *testing.T) {
 	if got := broker.clientIP(req); got != "192.0.2.20" {
 		t.Fatalf("untrusted proxy client ip = %q", got)
 	}
+
+	// Spoof attempt: attacker prepends a fake IP at the head of X-Forwarded-For.
+	// A typical proxy will append the observed client behind it, so we must
+	// walk right-to-left and return the rightmost untrusted IP rather than
+	// the leftmost (attacker-controlled) one.
+	spoof := httptest.NewRequest(http.MethodGet, "/", nil)
+	spoof.RemoteAddr = "10.2.3.4:12345"
+	spoof.Header.Set("X-Forwarded-For", "1.2.3.4, 198.51.100.5, 10.2.3.4")
+	if got := broker.clientIP(spoof); got != "198.51.100.5" {
+		t.Fatalf("spoofed XFF head client ip = %q, want %q", got, "198.51.100.5")
+	}
+
+	// All entries trusted: fall back to the leftmost parseable entry.
+	allTrusted := httptest.NewRequest(http.MethodGet, "/", nil)
+	allTrusted.RemoteAddr = "10.0.0.1:443"
+	allTrusted.Header.Set("X-Forwarded-For", "10.1.1.1, 10.0.0.1")
+	if got := broker.clientIP(allTrusted); got != "10.1.1.1" {
+		t.Fatalf("all-trusted client ip = %q, want %q", got, "10.1.1.1")
+	}
 }
 
 func TestHealthReadyAndMetricsEndpoints(t *testing.T) {
@@ -264,6 +283,61 @@ func TestRefreshTokenReuseRevokesFamily(t *testing.T) {
 	}
 	if _, ok, err := broker.store.GetConsumedRefreshToken(hashSecret(original)); err != nil || !ok {
 		t.Fatalf("consumed original missing: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestPreAuthRateLimitWebAuthnLoginBegin(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	broker.preAuthLimiter = newLoginRateLimiter(time.Minute, 1, time.Hour)
+
+	first := httptest.NewRequest(http.MethodPost, "/webauthn/login/begin", strings.NewReader(`{"username":"alice"}`))
+	first.RemoteAddr = "192.0.2.80:1234"
+	rr1 := httptest.NewRecorder()
+	broker.handleWebAuthnLoginBegin(rr1, first)
+	if rr1.Code != http.StatusOK {
+		t.Fatalf("first begin status = %d body=%s", rr1.Code, rr1.Body.String())
+	}
+
+	second := httptest.NewRequest(http.MethodPost, "/webauthn/login/begin", strings.NewReader(`{"username":"alice"}`))
+	second.RemoteAddr = "192.0.2.80:1234"
+	rr2 := httptest.NewRecorder()
+	broker.handleWebAuthnLoginBegin(rr2, second)
+	if rr2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second begin status = %d body=%s", rr2.Code, rr2.Body.String())
+	}
+	if rr2.Header().Get("Retry-After") == "" {
+		t.Fatalf("expected Retry-After header on 429")
+	}
+
+	// A different IP must not be affected by the first IP's lockout.
+	other := httptest.NewRequest(http.MethodPost, "/webauthn/login/begin", strings.NewReader(`{"username":"alice"}`))
+	other.RemoteAddr = "192.0.2.81:1234"
+	rr3 := httptest.NewRecorder()
+	broker.handleWebAuthnLoginBegin(rr3, other)
+	if rr3.Code != http.StatusOK {
+		t.Fatalf("other-IP begin status = %d body=%s", rr3.Code, rr3.Body.String())
+	}
+}
+
+func TestPreAuthRateLimitAuthorize(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	broker.preAuthLimiter = newLoginRateLimiter(time.Minute, 1, time.Hour)
+
+	target := "/oauth2/authorize?response_type=code&client_id=demo-web&redirect_uri=http%3A%2F%2Fapp.example%2Fcallback&scope=openid&state=s&code_challenge=abc&code_challenge_method=S256"
+	first := httptest.NewRequest(http.MethodGet, target, nil)
+	first.RemoteAddr = "192.0.2.90:1234"
+	rr1 := httptest.NewRecorder()
+	broker.handleAuthorize(rr1, first)
+	if rr1.Code != http.StatusFound {
+		t.Fatalf("first authorize status = %d body=%s", rr1.Code, rr1.Body.String())
+	}
+
+	second := httptest.NewRequest(http.MethodGet, target, nil)
+	second.RemoteAddr = "192.0.2.90:1234"
+	rr2 := httptest.NewRecorder()
+	broker.handleAuthorize(rr2, second)
+	if rr2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second authorize status = %d body=%s", rr2.Code, rr2.Body.String())
 	}
 }
 

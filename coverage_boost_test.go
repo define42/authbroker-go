@@ -749,7 +749,7 @@ func TestUserInfoSurfacesGroupsForOwningClient(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
-	tokens, err := broker.issueUserTokens("alice", "demo-web", "openid groups", "", time.Now(), nil, false)
+	tokens, err := broker.issueUserTokens("alice", "demo-web", "openid email groups", "", time.Now(), nil, false)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}

@@ -73,11 +73,34 @@ func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !b.allowPreAuthWrite(w, r, "authorize") {
+		return
+	}
 	if err := b.putAuthRequest(authReq); err != nil {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
 	http.Redirect(w, r, "/login?request_id="+url.QueryEscape(authReq.ID), http.StatusFound)
+}
+
+// allowPreAuthWrite caps per-IP creation of unauthenticated pre-login state
+// (auth requests, WebAuthn login challenges). These writes happen before any
+// credential check and would otherwise let one client grow the bbolt store
+// without bound; the limiter bumps on every attempt so the bucket fills under
+// burst load even though the request itself never "fails" in the usual sense.
+// Returns true to proceed, false when a 429 has already been written.
+func (b *Broker) allowPreAuthWrite(w http.ResponseWriter, r *http.Request, scope string) bool {
+	if b.preAuthLimiter == nil {
+		return true
+	}
+	key := "preauth:" + scope + "/ip:" + b.clientIP(r)
+	if allowed, retry := b.preAuthLimiter.allow(key); !allowed {
+		writeRetryAfter(w, retry)
+		http.Error(w, "too many requests; try again later", http.StatusTooManyRequests)
+		return false
+	}
+	b.preAuthLimiter.recordFailure(key)
+	return true
 }
 
 // checkPrompt implements OIDC Core §3.1.2.1 freshness handling for the
@@ -546,7 +569,7 @@ const (
 	amrMFA      = "mfa"
 )
 
-//nolint:gocognit,funlen // Access and ID token claims are intentionally assembled together.
+//nolint:funlen // Access and ID token claims are intentionally assembled together.
 func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime time.Time, amr []string, includeRefresh bool) (map[string]any, error) {
 	user, _ := b.store.GetUser(userID)
 	now := time.Now()
@@ -564,15 +587,7 @@ func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime
 		"preferred_username": userID,
 		"token_use":          "access",
 	}
-	if user != nil {
-		accessClaims["email"] = user.Email
-		accessClaims["name"] = displayName(user)
-		if scopeIncludes(scope, "groups") {
-			if groups := b.mappedGroupsForClient(clientID, user); len(groups) > 0 {
-				accessClaims["groups"] = groups
-			}
-		}
-	}
+	b.addScopedProfileClaims(accessClaims, user, scope, clientID)
 	access, err := b.signJWT(accessClaims)
 	if err != nil {
 		return nil, err
@@ -595,15 +610,7 @@ func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime
 	if nonce != "" {
 		idClaims["nonce"] = nonce
 	}
-	if user != nil {
-		idClaims["email"] = user.Email
-		idClaims["name"] = displayName(user)
-		if scopeIncludes(scope, "groups") {
-			if groups := b.mappedGroupsForClient(clientID, user); len(groups) > 0 {
-				idClaims["groups"] = groups
-			}
-		}
-	}
+	b.addScopedProfileClaims(idClaims, user, scope, clientID)
 	idToken, err := b.signJWT(idClaims)
 	if err != nil {
 		return nil, err
@@ -658,10 +665,14 @@ func (b *Broker) issueAppToken(sess Session, tokenCfg AppTokenConfig) (string, e
 		"token_use":          "access",
 	}
 	if user != nil {
-		claims["email"] = user.Email
-		claims["name"] = displayName(user)
-		if user.Email != "" {
-			claims["user_email"] = user.Email
+		if scopeIncludes(scope, "email") {
+			claims["email"] = user.Email
+			if user.Email != "" {
+				claims["user_email"] = user.Email
+			}
+		}
+		if scopeIncludes(scope, "profile") {
+			claims["name"] = displayName(user)
 		}
 		if scopeIncludes(scope, "groups") {
 			if groups := mappedAppTokenGroups(tokenCfg.compiledMappings, user.Groups); len(groups) > 0 {
@@ -670,6 +681,27 @@ func (b *Broker) issueAppToken(sess Session, tokenCfg AppTokenConfig) (string, e
 		}
 	}
 	return b.signJWT(claims)
+}
+
+// addScopedProfileClaims writes OIDC profile/email/groups claims into target,
+// each gated on the corresponding requested scope (OIDC Core §5.4). The
+// helper is shared by access tokens, ID tokens, and UserInfo so all three
+// surfaces honor the same consent decisions.
+func (b *Broker) addScopedProfileClaims(target map[string]any, user *StoredUser, scope, clientID string) {
+	if user == nil {
+		return
+	}
+	if scopeIncludes(scope, "email") {
+		target["email"] = user.Email
+	}
+	if scopeIncludes(scope, "profile") {
+		target["name"] = displayName(user)
+	}
+	if scopeIncludes(scope, "groups") {
+		if groups := b.mappedGroupsForClient(clientID, user); len(groups) > 0 {
+			target["groups"] = groups
+		}
+	}
 }
 
 func displayName(u *StoredUser) string {
@@ -745,15 +777,9 @@ func (b *Broker) handleUserInfo(w http.ResponseWriter, r *http.Request) {
 		"sub":                sub,
 		"preferred_username": sub,
 	}
-	if user != nil {
-		resp["email"] = user.Email
-		resp["name"] = displayName(user)
-		if scopeIncludes(scope, "groups") {
-			if groups := b.mappedGroupsForClient(clientID, user); len(groups) > 0 {
-				resp["groups"] = groups
-			}
-		}
-	}
+	// Mirror the scope gating used at token issuance so UserInfo can't be
+	// used to bypass an `openid`-only consent.
+	b.addScopedProfileClaims(resp, user, scope, clientID)
 	writeJSON(w, http.StatusOK, resp)
 }
 

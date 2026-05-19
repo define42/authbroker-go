@@ -61,7 +61,11 @@ func (b *Broker) handleWebAuthnRegisterBegin(w http.ResponseWriter, r *http.Requ
 			"attestation":        "none",
 			"excludeCredentials": creds,
 			"authenticatorSelection": map[string]any{
-				"userVerification": "preferred",
+				// userVerification:"required" makes the registered passkey
+				// a true multi-factor credential (possession + PIN/biometric),
+				// which is what handleWebAuthnLoginFinish relies on to set
+				// amrMFA without an additional TOTP step.
+				"userVerification": "required",
 			},
 		},
 	})
@@ -139,6 +143,9 @@ func (b *Broker) handleWebAuthnLoginBegin(w http.ResponseWriter, r *http.Request
 		http.Error(w, "username is required", http.StatusBadRequest)
 		return
 	}
+	if !b.allowPreAuthWrite(w, r, "webauthn_login_begin") {
+		return
+	}
 	// Always return a valid challenge with an allowCredentials list, even
 	// when the user does not exist or has no passkeys enrolled. This keeps
 	// /webauthn/login/begin from leaking whether an account is registered.
@@ -166,7 +173,9 @@ func (b *Broker) handleWebAuthnLoginBegin(w http.ResponseWriter, r *http.Request
 			"timeout":          60000,
 			"rpId":             b.cfg.WebAuthn.RPID,
 			"allowCredentials": allow,
-			"userVerification": "preferred",
+			// "required" so the authenticator MUST report UV; assertions
+			// without the UV flag are rejected in verifyAssertionAuthData.
+			"userVerification": "required",
 		},
 	})
 }
@@ -225,7 +234,10 @@ func (b *Broker) handleWebAuthnLoginFinish(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	b.loginLimiter.recordSuccess(rateKey)
-	if _, err := b.createSession(w, ch.UserID, true, []string{amrWebAuthn}); err != nil {
+	// UV was enforced in verifyAssertionAuthData, so this passkey login
+	// satisfies the broker's MFA policy on its own; emit amrMFA alongside
+	// amrWebAuthn so downstream consumers (and audit) see it as multi-factor.
+	if _, err := b.createSession(w, ch.UserID, true, []string{amrWebAuthn, amrMFA}); err != nil {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
@@ -418,6 +430,14 @@ type parsedAttestationData struct {
 	COSEPublicKey []byte
 }
 
+// WebAuthn authenticatorData flag bits (§6.1). UV is required by this broker
+// so that a successful passkey assertion can stand in for MFA.
+const (
+	authDataFlagUP byte = 0x01
+	authDataFlagUV byte = 0x04
+	authDataFlagAT byte = 0x40
+)
+
 func parseAttestedAuthData(data []byte, rpID string) (parsedAttestationData, error) {
 	if len(data) < 37 {
 		return parsedAttestationData{}, fmt.Errorf("authData too short")
@@ -427,10 +447,13 @@ func parseAttestedAuthData(data []byte, rpID string) (parsedAttestationData, err
 		return parsedAttestationData{}, fmt.Errorf("rpId hash mismatch")
 	}
 	flags := data[32]
-	if flags&0x01 == 0 {
+	if flags&authDataFlagUP == 0 {
 		return parsedAttestationData{}, fmt.Errorf("user presence flag missing")
 	}
-	if flags&0x40 == 0 {
+	if flags&authDataFlagUV == 0 {
+		return parsedAttestationData{}, fmt.Errorf("user verification flag missing")
+	}
+	if flags&authDataFlagAT == 0 {
 		return parsedAttestationData{}, fmt.Errorf("attested credential data flag missing")
 	}
 	signCount := binary.BigEndian.Uint32(data[33:37])
@@ -460,8 +483,11 @@ func verifyAssertionAuthData(data []byte, rpID string) (uint32, error) {
 		return 0, fmt.Errorf("rpId hash mismatch")
 	}
 	flags := data[32]
-	if flags&0x01 == 0 {
+	if flags&authDataFlagUP == 0 {
 		return 0, fmt.Errorf("user presence flag missing")
+	}
+	if flags&authDataFlagUV == 0 {
+		return 0, fmt.Errorf("user verification flag missing")
 	}
 	return binary.BigEndian.Uint32(data[33:37]), nil
 }

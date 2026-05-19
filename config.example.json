@@ -21,7 +21,10 @@
     "login_lockout_seconds": 900,
     "token_window_seconds": 300,
     "token_max_attempts": 20,
-    "token_lockout_seconds": 900
+    "token_lockout_seconds": 900,
+    "preauth_window_seconds": 60,
+    "preauth_max_attempts": 60,
+    "preauth_lockout_seconds": 60
   },
 
   "metrics": {

@@ -985,7 +985,7 @@ func TestUserInfoOnAccessToken(t *testing.T) {
 	if _, err := broker.store.UpsertProfile(UserProfile{Subject: "johndoe", Email: "j@e", Name: "John"}); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
-	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid", "", time.Now(), nil, false)
+	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "openid email", "", time.Now(), nil, false)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}

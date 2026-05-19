@@ -31,13 +31,16 @@ const (
 	defaultSigningKeyRotationDays  = 90
 	defaultSigningKeyRetentionDays = 30
 
-	defaultLoginRateWindowSeconds  = 5 * 60
-	defaultLoginRateMaxAttempts    = 10
-	defaultLoginRateLockoutSeconds = 15 * 60
-	defaultTokenRateWindowSeconds  = 5 * 60
-	defaultTokenRateMaxAttempts    = 20
-	defaultTokenRateLockoutSeconds = 15 * 60
-	defaultMetricsPath             = "/metrics"
+	defaultLoginRateWindowSeconds    = 5 * 60
+	defaultLoginRateMaxAttempts      = 10
+	defaultLoginRateLockoutSeconds   = 15 * 60
+	defaultTokenRateWindowSeconds    = 5 * 60
+	defaultTokenRateMaxAttempts      = 20
+	defaultTokenRateLockoutSeconds   = 15 * 60
+	defaultPreAuthRateWindowSeconds  = 60
+	defaultPreAuthRateMaxAttempts    = 60
+	defaultPreAuthRateLockoutSeconds = 60
+	defaultMetricsPath               = "/metrics"
 )
 
 // Body size limits applied via http.MaxBytesReader. Keep these generous enough
@@ -92,12 +95,15 @@ type Config struct {
 }
 
 type RateLimitConfig struct {
-	LoginWindowSeconds  int `json:"login_window_seconds,omitempty"`
-	LoginMaxAttempts    int `json:"login_max_attempts,omitempty"`
-	LoginLockoutSeconds int `json:"login_lockout_seconds,omitempty"`
-	TokenWindowSeconds  int `json:"token_window_seconds,omitempty"`
-	TokenMaxAttempts    int `json:"token_max_attempts,omitempty"`
-	TokenLockoutSeconds int `json:"token_lockout_seconds,omitempty"`
+	LoginWindowSeconds    int `json:"login_window_seconds,omitempty"`
+	LoginMaxAttempts      int `json:"login_max_attempts,omitempty"`
+	LoginLockoutSeconds   int `json:"login_lockout_seconds,omitempty"`
+	TokenWindowSeconds    int `json:"token_window_seconds,omitempty"`
+	TokenMaxAttempts      int `json:"token_max_attempts,omitempty"`
+	TokenLockoutSeconds   int `json:"token_lockout_seconds,omitempty"`
+	PreAuthWindowSeconds  int `json:"preauth_window_seconds,omitempty"`
+	PreAuthMaxAttempts    int `json:"preauth_max_attempts,omitempty"`
+	PreAuthLockoutSeconds int `json:"preauth_lockout_seconds,omitempty"`
 }
 
 type MetricsConfig struct {
@@ -298,6 +304,15 @@ func normalizeRateLimitConfig(cfg *RateLimitConfig) {
 	}
 	if cfg.TokenLockoutSeconds == 0 {
 		cfg.TokenLockoutSeconds = defaultTokenRateLockoutSeconds
+	}
+	if cfg.PreAuthWindowSeconds == 0 {
+		cfg.PreAuthWindowSeconds = defaultPreAuthRateWindowSeconds
+	}
+	if cfg.PreAuthMaxAttempts == 0 {
+		cfg.PreAuthMaxAttempts = defaultPreAuthRateMaxAttempts
+	}
+	if cfg.PreAuthLockoutSeconds == 0 {
+		cfg.PreAuthLockoutSeconds = defaultPreAuthRateLockoutSeconds
 	}
 }
 
