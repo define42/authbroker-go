@@ -200,7 +200,7 @@ func parseScopedGroupMapping(source, target string) (scopedGroupMapping, bool, e
 	target = strings.TrimSpace(target)
 	dn, err := ldap.ParseDN(source)
 	if err != nil {
-		if strings.Contains(source, "*") || groupMappingTargetHasPlaceholder(target) {
+		if strings.Contains(source, "*") || scopedGroupMappingTargetHasPlaceholder(target) {
 			return scopedGroupMapping{}, false, fmt.Errorf("invalid scoped group_mappings DN %q: %w", source, err)
 		}
 		return scopedGroupMapping{}, false, nil
@@ -215,7 +215,7 @@ func parseScopedGroupMapping(source, target string) (scopedGroupMapping, bool, e
 	if strings.Contains(source, "*") {
 		return scopedGroupMapping{}, false, fmt.Errorf("wildcard group_mappings source %q must use CN=*,<base_dn>", source)
 	}
-	if groupMappingTargetHasPlaceholder(target) && !firstRDNHasAttribute(dn, "cn") {
+	if scopedGroupMappingTargetHasPlaceholder(target) && !firstRDNHasAttribute(dn, "cn") {
 		return scopedGroupMapping{
 			Source: dn.String(),
 			Target: target,
@@ -265,7 +265,16 @@ func firstRDNAttribute(dn *ldap.DN, attrType string) (string, bool) {
 	return "", false
 }
 
-func groupMappingTargetHasPlaceholder(target string) bool {
+// scopedGroupMappingTargetHasPlaceholder reports whether a target template
+// contains one of the placeholders that renderGroupMappingTarget can substitute
+// for a scoped mapping (i.e. for non-regex paths through mappedGroups). It is
+// intentionally narrower than "any `{…}` token": regex-only placeholders such
+// as `{match}`, `{0}`, `{1}`, or named captures are NOT substituted on the
+// scoped/direct path, so accepting them here would silently emit literal
+// "{match}" text in claim values. parseScopedGroupMapping uses this to decide
+// whether a DN with a non-CN first RDN should be promoted to a scoped mapping;
+// keep the check aligned with renderGroupMappingTarget's substitution table.
+func scopedGroupMappingTargetHasPlaceholder(target string) bool {
 	return target == "*" || strings.Contains(target, "{cn}") || strings.Contains(target, "{group}") || strings.Contains(target, "{dn}")
 }
 

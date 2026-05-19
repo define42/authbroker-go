@@ -16,18 +16,26 @@ import (
 )
 
 // handleAuthorize trusts the request's Host header to be the canonical issuer
-// hostname. The broker does NOT compare r.Host against cfg.Issuer — it relies
-// on the upstream listener / reverse proxy to route only the configured
-// hostname(s) to this process. If you front the broker with a proxy that
-// terminates TLS and accepts arbitrary Host values, the cookie set on the
-// resulting response is host-bound (no Domain attribute), so the worst case
-// is cookies dropped on an unintended origin — but the OAuth code redirect
-// itself is safe because redirect_uri is exact-match against the registered
-// list. Production deployments MUST ensure the listener only answers for the
-// issuer hostname (or domain wildcard in the ACME config).
+// hostname in non-production deployments — it relies on the upstream listener
+// / reverse proxy to route only the configured hostname(s) to this process.
+// If you front the broker with a proxy that terminates TLS and accepts
+// arbitrary Host values, the cookie set on the resulting response is
+// host-bound (no Domain attribute), so the worst case is cookies dropped on
+// an unintended origin; the OAuth code redirect itself is safe because
+// redirect_uri is exact-match against the registered list.
 //
-//nolint:funlen // Authorize validates the request, dispatches prompt handling, and routes to login/consent — splitting would obscure the linear flow.
+// In production mode the handler additionally rejects requests whose Host
+// header does not match the configured issuer hostname. The check is cheap
+// defense in depth against misconfigured ingress — the per-listener routing
+// rule is still the primary guard, but a stray hostname now produces a 400
+// rather than silently serving on it.
+//
+//nolint:funlen,gocognit,cyclop // Authorize validates the request, dispatches prompt handling, and routes to login/consent — splitting would obscure the linear flow.
 func (b *Broker) handleAuthorize(w http.ResponseWriter, r *http.Request) {
+	if !b.requestHostMatchesIssuer(r) {
+		http.Error(w, "host not allowed", http.StatusBadRequest)
+		return
+	}
 	q := r.URL.Query()
 	if q.Get("response_type") != "code" {
 		http.Error(w, "unsupported response_type", http.StatusBadRequest)
@@ -519,9 +527,18 @@ func (b *Broker) newRefreshRotation(old RefreshToken, clientID, scope string) re
 		Generation: old.Generation + 1,
 	}
 	consumed := ConsumedRefreshToken{
-		UserID:    old.UserID,
-		ClientID:  clientID,
-		FamilyID:  familyID,
+		UserID:   old.UserID,
+		ClientID: clientID,
+		FamilyID: familyID,
+		// ExpiresAt mirrors the original token's expiry so SweepExpired drops
+		// the tombstone once the live token would have aged out anyway. A
+		// replay AFTER this point falls through to "unknown_refresh_token"
+		// rather than triggering family revocation — a deliberate trade-off:
+		// the alternative is keeping reuse tombstones around indefinitely
+		// (storage cost) or for an opaque "long enough" window (still finite,
+		// just less predictable). Operators who want a stronger audit signal
+		// for late replays should raise RefreshTokenTTLDays, which extends
+		// both the live window and the tombstone window together.
 		ExpiresAt: old.ExpiresAt,
 	}
 	return refreshRotation{plain: plain, key: hashSecret(plain), next: next, consumed: consumed}

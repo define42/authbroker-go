@@ -615,8 +615,15 @@ func within(v, minValue, maxValue int) bool {
 	return v >= minValue && v <= maxValue
 }
 
+// nonEmptyStrings returns a new slice containing the input's non-blank entries.
+// It does NOT alias the caller's backing array — earlier revisions used the
+// `values[:0]` trick, which silently overwrote positions in the caller's slice
+// (e.g. ["", "admin", "ops"] became ["admin", "ops", "ops"]) even though the
+// returned slice had the right length. Allocating a fresh slice is cheap here
+// (every caller passes a config list with a handful of entries) and avoids
+// surprising future callers that read the input after this function returns.
 func nonEmptyStrings(values []string) []string {
-	out := values[:0]
+	out := make([]string, 0, len(values))
 	for _, v := range values {
 		if strings.TrimSpace(v) != "" {
 			out = append(out, v)

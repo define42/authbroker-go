@@ -213,10 +213,21 @@ func (b *Broker) handleWebAuthnLoginFinish(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
-	// Rate-limit before the empty-UserID early exit so an attacker cannot
-	// time-distinguish "user exists" (runs the assertion verify) from "user
-	// doesn't exist" (short-circuits here) by spraying usernames at
-	// /webauthn/login/begin and submitting the resulting challenges.
+	// Rate-limit AFTER consume so a single per-key bucket covers every
+	// failure branch — the "challenge missing/expired/unbound" early exit
+	// below, plus the assertion-verify path further down. Without this,
+	// repeated submissions of the same invalid challenge would hit only the
+	// early exit and never charge the bucket.
+	//
+	// A small timing signal remains in the consume step itself: the store
+	// update runs before this check, so an attacker who can measure response
+	// times can still distinguish "challenge present" (consume succeeds and
+	// then the limiter check runs) from "challenge missing" (consume returns
+	// immediately and then the limiter check runs). The difference is one
+	// bbolt write vs. one read, which is dwarfed by HTTP/TLS jitter across a
+	// network. Closing it fully would require keying the limiter on the IP
+	// alone — at the cost of less granular per-user accounting — and is not
+	// worth the trade today.
 	rateKey := b.loginRateKey(r, ch.UserID)
 	if allowed, retry := b.loginLimiter.allow(rateKey); !allowed {
 		writeRetryAfter(w, retry)

@@ -201,14 +201,49 @@ func metricPath(path, metricsPath string) string {
 }
 
 // dynamicRoutePatternList enumerates the patterns metricPath should collapse.
-// Ordered so the most specific patterns are checked first — `/admin/foo/{id}/delete`
-// must win over a hypothetical `/admin/foo/{id}` if both existed.
+// It is auto-sorted by specificity at init (most segments first; ties broken
+// by literal-segment count) so adding a new `/foo/{id}` pattern to
+// dynamicRoutePatterns can never accidentally shadow a more specific
+// `/foo/{id}/bar` — earlier revisions relied on hand-ordering, which is easy
+// to get wrong when a new entry is added.
 //
-//nolint:gochecknoglobals // Mirrors dynamicRoutePatterns; populated at init.
-var dynamicRoutePatternList = []string{
+//nolint:gochecknoglobals // Mirrors dynamicRoutePatterns; sorted at init.
+var dynamicRoutePatternList = sortDynamicRoutePatterns([]string{
 	dynamicRoutePatterns.AdminClientDelete,
 	dynamicRoutePatterns.AdminAppTokenDelete,
 	dynamicRoutePatterns.AppToken,
+})
+
+// sortDynamicRoutePatterns orders patterns by total segment count desc, then
+// by literal-segment count desc (segments that don't contain a `{` are
+// considered literal), then lexicographically for deterministic output.
+func sortDynamicRoutePatterns(patterns []string) []string {
+	out := append([]string(nil), patterns...)
+	sort.Slice(out, func(i, j int) bool {
+		ti, li := routePatternSpecificity(out[i])
+		tj, lj := routePatternSpecificity(out[j])
+		if ti != tj {
+			return ti > tj
+		}
+		if li != lj {
+			return li > lj
+		}
+		return out[i] < out[j]
+	})
+	return out
+}
+
+func routePatternSpecificity(pattern string) (total, literal int) {
+	for _, seg := range strings.Split(pattern, "/") {
+		if seg == "" {
+			continue
+		}
+		total++
+		if !strings.Contains(seg, "{") {
+			literal++
+		}
+	}
+	return total, literal
 }
 
 // matchDynamicPattern reports whether path matches pattern, where pattern

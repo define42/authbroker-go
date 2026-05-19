@@ -398,6 +398,14 @@ func (b *Broker) sweepExpired(now time.Time) {
 // startBackgroundSweeper periodically calls sweepExpired until ctx is done.
 // It returns when the context is cancelled, letting the caller wait for the
 // sweeper to drain during graceful shutdown.
+//
+// The goroutine intentionally has no panic recovery. The sweeper is the only
+// reaper for the in-memory rate-limit maps (and the per-request bbolt
+// buckets); if it silently exited after a panic, those maps would grow
+// unbounded while the broker kept serving traffic. Letting the panic
+// propagate crashes the process so the orchestrator restarts it — the safer
+// failure mode in Go. Add a recover() here only if you also wire in a
+// supervisor that can re-launch the sweeper without restarting the broker.
 func (b *Broker) startBackgroundSweeper(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = time.Minute

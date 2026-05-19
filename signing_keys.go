@@ -370,8 +370,17 @@ func shouldRotateSigningKey(key managedSigningKey, rotationDays int, forceRotate
 	if rotationDays <= 0 {
 		return false
 	}
+	// `time.Unix(0, 0)` is 1970-01-01 UTC, not Go's zero time — `IsZero()`
+	// returns false for it, so a key with CreatedAt==0 (a hand-edited bbolt
+	// row, or a record written by a future schema migration that forgot to
+	// stamp the timestamp) would look ancient and rotate on every startup.
+	// Treat any non-positive CreatedAt as "unknown" and decline to rotate;
+	// the operator can run with `-rotate-key` if a forced rotation is needed.
+	if key.CreatedAt <= 0 {
+		return false
+	}
 	createdAt := time.Unix(key.CreatedAt, 0)
-	return !createdAt.IsZero() && !now.Before(createdAt.AddDate(0, 0, rotationDays))
+	return !now.Before(createdAt.AddDate(0, 0, rotationDays))
 }
 
 func (s *managedSigningKeySet) prune(retentionDays int, now time.Time) bool {

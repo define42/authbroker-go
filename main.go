@@ -165,6 +165,28 @@ func warnIfCookieInsecure(broker *Broker) {
 	log.Printf("WARNING: session cookies will be issued without the Secure attribute (issuer=%q, listen=%q). Set cookie_secure=true when terminating TLS at a proxy.", broker.cfg.Issuer, broker.cfg.Listen)
 }
 
+// requestHostMatchesIssuer reports whether r.Host's hostname matches the host
+// portion of cfg.Issuer. Always true in non-production mode and when the
+// issuer has no parseable hostname (e.g. a misconfigured "http://" issuer
+// during local development). In production the comparison is mandatory: it
+// defends /oauth2/authorize against ingress configurations that accidentally
+// route an unrelated hostname through to this process.
+func (b *Broker) requestHostMatchesIssuer(r *http.Request) bool {
+	if b == nil || r == nil || !b.cfg.Production {
+		return true
+	}
+	issuerHost, ok := urlHostname(b.cfg.Issuer)
+	if !ok {
+		return true
+	}
+	host := strings.TrimSpace(r.Host)
+	if splitHost, _, err := net.SplitHostPort(host); err == nil {
+		host = splitHost
+	}
+	host = strings.Trim(host, "[]")
+	return strings.EqualFold(host, issuerHost)
+}
+
 // listenIsLocalhostOnly reports whether addr binds exclusively to a loopback
 // interface (127.0.0.1, ::1, or "localhost"). An empty host (":8080") or a
 // wildcard host (0.0.0.0, ::) is treated as non-localhost.

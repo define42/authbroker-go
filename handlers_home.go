@@ -152,8 +152,8 @@ func (b *Broker) handleHome(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	b.maybeExtendSession(w, r)
-	data := b.homeData(r, nil)
+	sess, authenticated := b.maybeExtendSession(w, r)
+	data := b.homeData(sess, authenticated, nil)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = brokerHomeTemplate.Execute(w, data)
 }
@@ -175,13 +175,20 @@ type issuedAppTokenView struct {
 	Token string
 }
 
-func (b *Broker) homeData(r *http.Request, issued *issuedAppTokenView) map[string]any {
+// homeData renders the template payload for the broker's home page. The
+// session is supplied by the caller — handleHome obtains it from
+// maybeExtendSession, and handleAppToken passes the already-validated session
+// it used to authenticate the request. Threading the session through here
+// (rather than calling validSession a second time inside this helper) avoids
+// a race window where the background sweeper could delete the session
+// between the load-and-extend and the home-page render.
+func (b *Broker) homeData(sess Session, authenticated bool, issued *issuedAppTokenView) map[string]any {
 	data := map[string]any{
 		"DisplayName": b.cfg.DisplayName,
 		"Issuer":      b.cfg.Issuer,
 		"AppTokens":   b.appTokenViews(),
 	}
-	if sess, ok := b.validSession(r); ok {
+	if authenticated {
 		data["Authenticated"] = true
 		data["UserID"] = sess.UserID
 		data["ExpiresAt"] = sess.ExpiresAt.Format(time.RFC1123)
@@ -263,7 +270,13 @@ func (b *Broker) handleAppToken(w http.ResponseWriter, r *http.Request) {
 	if !b.requireRecentReAuth(w, sess) {
 		return
 	}
-	b.maybeExtendSession(w, r)
+	// Use the extended session's refreshed ExpiresAt for the home render when
+	// available; if maybeExtendSession lost a race with the sweeper, fall back
+	// to the session that was just validated and re-auth'd above so the page
+	// still renders the user's identity correctly.
+	if extended, extendOK := b.maybeExtendSession(w, r); extendOK {
+		sess = extended
+	}
 	tokenID := r.PathValue("id")
 	tokenCfg, ok := b.lookupAppToken(tokenID)
 	if !ok {
@@ -294,5 +307,5 @@ func (b *Broker) handleAppToken(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	_ = brokerHomeTemplate.Execute(w, b.homeData(r, issued))
+	_ = brokerHomeTemplate.Execute(w, b.homeData(sess, true, issued))
 }

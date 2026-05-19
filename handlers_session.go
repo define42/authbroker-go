@@ -505,12 +505,13 @@ func csrfTokenMatches(got, want string) bool {
 	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
+// cookieSecure delegates to cookieSecureForConfig so the same logic governs
+// runtime cookie issuance and config-time production validation. Earlier
+// revisions kept two near-identical copies; deduping prevents the two from
+// drifting if cookie semantics later grow new inputs (e.g. a runtime flag the
+// broker has but config validation doesn't).
 func (b *Broker) cookieSecure() bool {
-	secure := strings.HasPrefix(b.cfg.Issuer, "https://")
-	if b.cfg.CookieSecure != nil {
-		secure = *b.cfg.CookieSecure
-	}
-	return secure
+	return cookieSecureForConfig(b.cfg)
 }
 
 func (b *Broker) validSession(r *http.Request) (Session, bool) {
@@ -575,42 +576,55 @@ func sessionRecentlyReAuthenticated(sess Session) bool {
 	return time.Since(sess.ReAuthAt) <= reAuthValidity
 }
 
-// maybeExtendSession refreshes the broker session's expiry on activity once
-// more than half of the TTL has been consumed. The cookie is re-set so the
-// browser does not drop it at the original expiration.
+// maybeExtendSession loads the current session, lazily backfills the CSRF
+// token on legacy sessions, and refreshes the expiry on activity once more
+// than half of the TTL has been consumed (re-setting the cookie so the
+// browser does not drop it at the original expiration). It returns the
+// resulting (Session, true) so callers that also need to read the session
+// for rendering can use the same load — earlier revisions ran
+// maybeExtendSession and then validSession separately, which raced with the
+// background sweeper between the two reads. Expired sessions are cleared
+// from the store and reported as (Session{}, false).
 //
-// Like validSession, this also clears expired sessions from the store. It
-// does NOT signal that to the caller — handlers that need to react to the
-// expiry transition must call validSession themselves. Today the home page
-// chains maybeExtendSession + validSession (inside homeData); a race window
-// between the two reads can flip an authenticated render to "Signed out",
-// which is the correct user-visible outcome.
-func (b *Broker) maybeExtendSession(w http.ResponseWriter, r *http.Request) {
+// CSRF backfill duplicates the path in validSession; both call sites are
+// idempotent because EnsureSessionCSRF preserves the first writer's token,
+// so a request that hits both still observes a stable value.
+//
+//nolint:gocognit,cyclop // Combined load + CSRF backfill + extend keeps the home page from racing the sweeper between separate reads.
+func (b *Broker) maybeExtendSession(w http.ResponseWriter, r *http.Request) (Session, bool) {
 	c, err := r.Cookie(sessionCookieName)
 	if err != nil || c.Value == "" {
-		return
+		return Session{}, false
 	}
-	ttl := time.Duration(b.cfg.SessionTTLHrs) * time.Hour
-	if ttl <= 0 {
-		return
-	}
-	now := time.Now()
-	s, ok, err := b.store.GetSession(c.Value)
+	s, found, err := b.store.GetSession(c.Value)
 	if err != nil {
 		log.Printf("load session for extension: %v", err)
-		return
+		return Session{}, false
 	}
-	if !ok {
-		return
+	if !found {
+		return Session{}, false
 	}
+	now := time.Now()
 	if now.After(s.ExpiresAt) || (!s.AbsoluteExpiresAt.IsZero() && now.After(s.AbsoluteExpiresAt)) {
 		if err := b.store.DeleteSession(c.Value); err != nil {
 			log.Printf("delete expired session: %v", err)
 		}
-		return
+		return Session{}, false
 	}
-	if s.ExpiresAt.Sub(now) > ttl/2 {
-		return
+	if s.CSRFToken == "" {
+		migrated, ok, err := b.store.EnsureSessionCSRF(c.Value, func() string { return randomB64(32) })
+		if err != nil {
+			log.Printf("persist session csrf: %v", err)
+			return Session{}, false
+		}
+		if !ok {
+			return Session{}, false
+		}
+		s = migrated
+	}
+	ttl := time.Duration(b.cfg.SessionTTLHrs) * time.Hour
+	if ttl <= 0 || s.ExpiresAt.Sub(now) > ttl/2 {
+		return s, true
 	}
 	newExpiry := now.Add(ttl)
 	// The absolute ceiling, when set, clamps the sliding renewal. The session
@@ -622,7 +636,7 @@ func (b *Broker) maybeExtendSession(w http.ResponseWriter, r *http.Request) {
 	s.ExpiresAt = newExpiry
 	if err := b.store.PutSession(c.Value, s); err != nil {
 		log.Printf("persist extended session: %v", err)
-		return
+		return s, true
 	}
 
 	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure is controlled by issuer/config for local HTTP demos and HTTPS deployments.
@@ -634,6 +648,7 @@ func (b *Broker) maybeExtendSession(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		Expires:  newExpiry,
 	})
+	return s, true
 }
 
 func (b *Broker) clearSession(w http.ResponseWriter, r *http.Request) error {
