@@ -20,8 +20,14 @@ import (
 type Session struct {
 	UserID    string    `json:"user_id"`
 	ExpiresAt time.Time `json:"expires_at"`
-	AuthTime  time.Time `json:"auth_time"`
-	CSRFToken string    `json:"csrf_token,omitempty"`
+	// AbsoluteExpiresAt is the hard ceiling on session lifetime, stamped at
+	// createSession from cfg.SessionAbsoluteTTLHrs. Zero means "no absolute
+	// cap" (sliding TTL only). When set, validSession refuses to honor the
+	// session past this point even if maybeExtendSession would otherwise
+	// renew it.
+	AbsoluteExpiresAt time.Time `json:"absolute_expires_at,omitempty"`
+	AuthTime          time.Time `json:"auth_time"`
+	CSRFToken         string    `json:"csrf_token,omitempty"`
 	// ReAuthAt marks the most recent password (or factor) re-confirmation. The
 	// TOTP enroll and WebAuthn register endpoints require this to be set
 	// within reAuthValidity to mutate second-factor material.
@@ -112,6 +118,12 @@ type Broker struct {
 	audit      *slog.Logger
 	requestLog *slog.Logger
 	metrics    *metricsRegistry
+
+	// routesOnce ensures the mux is built once. routes() is called from
+	// newHTTPServer / newACMEServers today, but caching defends against
+	// future callers that wire it per-request.
+	routesOnce   sync.Once
+	cachedRoutes http.Handler
 }
 
 const (
@@ -413,6 +425,13 @@ func validAppTokenID(id string) bool {
 }
 
 func (b *Broker) routes() http.Handler {
+	b.routesOnce.Do(func() {
+		b.cachedRoutes = b.buildRoutes()
+	})
+	return b.cachedRoutes
+}
+
+func (b *Broker) buildRoutes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /assets/authbroker.css", b.handleStylesheet)
 	mux.HandleFunc("GET /assets/authbroker.js", b.handleScript)

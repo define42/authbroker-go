@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -933,19 +934,11 @@ func (s *Store) DeleteConsentsForClient(clientID string) error {
 }
 
 func sortClientsByID(clients []Client) {
-	for i := 1; i < len(clients); i++ {
-		for j := i; j > 0 && clients[j-1].ClientID > clients[j].ClientID; j-- {
-			clients[j-1], clients[j] = clients[j], clients[j-1]
-		}
-	}
+	sort.Slice(clients, func(i, j int) bool { return clients[i].ClientID < clients[j].ClientID })
 }
 
 func sortAppTokensByID(tokens []AppTokenConfig) {
-	for i := 1; i < len(tokens); i++ {
-		for j := i; j > 0 && tokens[j-1].ID > tokens[j].ID; j-- {
-			tokens[j-1], tokens[j] = tokens[j], tokens[j-1]
-		}
-	}
+	sort.Slice(tokens, func(i, j int) bool { return tokens[i].ID < tokens[j].ID })
 }
 
 // -- Internal helpers ------------------------------------------------------

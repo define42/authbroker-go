@@ -294,6 +294,7 @@ var adminAppTokenFormTemplate = template.Must(template.New("admin-app-token-form
         <label class="field">
           <span>Audience (optional, defaults to ID)</span>
           <input name="audience" autocomplete="off">
+          <small class="muted">A confidential OAuth client whose <code>client_id</code> equals this audience may call <code>/oauth2/introspect</code> on tokens minted from this profile, even if it never received the token directly. Pick the audience that names the intended resource server.</small>
         </label>
         <label class="field">
           <span>Client ID (optional, defaults to audience)</span>

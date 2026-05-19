@@ -288,6 +288,7 @@ func clientSecretMatches(client Client, secret string) bool {
 	return subtle.ConstantTimeCompare(expected, actual[:]) == 1
 }
 
+//nolint:funlen // The audit attributes for the burned-but-mismatched code path inflate this past 60 lines but stay linear.
 func (b *Broker) tokenAuthorizationCode(w http.ResponseWriter, r *http.Request, client Client) {
 	code := r.Form.Get("code")
 	redirectURI := r.Form.Get("redirect_uri")
@@ -308,10 +309,27 @@ func (b *Broker) tokenAuthorizationCode(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	if ac.ClientID != client.ClientID || ac.RedirectURI != redirectURI {
+		// The code is consumed (RFC 6749 §4.1.2 — codes MUST be invalidated on
+		// any redemption attempt) so a legitimate client that fat-fingers
+		// redirect_uri will see this once per code. Surface the two distinct
+		// mismatch dimensions so operators can debug a misconfigured client
+		// without correlating across audit lines.
+		mismatch := "redirect_uri"
+		if ac.ClientID != client.ClientID {
+			mismatch = "client_id"
+			if ac.RedirectURI != redirectURI {
+				mismatch = "client_id_and_redirect_uri"
+			}
+		}
 		b.auditEvent(r, auditEventTokenIssue, auditOutcomeFailure,
 			slog.String("client_id", client.ClientID),
+			slog.String("user_id", ac.UserID),
 			slog.String("grant_type", "authorization_code"),
-			slog.String("reason", "client_or_redirect_mismatch"))
+			slog.String("reason", "client_or_redirect_mismatch"),
+			slog.String("mismatch", mismatch),
+			slog.String("expected_client_id", ac.ClientID),
+			slog.String("expected_redirect_uri", ac.RedirectURI),
+			slog.String("presented_redirect_uri", redirectURI))
 		tokenError(w, "invalid_grant", "client or redirect_uri mismatch")
 		return
 	}
@@ -841,6 +859,12 @@ func (b *Broker) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 // introspectToken returns the active introspection response for tok when it
 // belongs to client. token_type_hint just reorders the lookup attempts; when
 // the hint is wrong or absent we still try the other shape, per RFC 7662 §2.1.
+//
+// Without a hint we try JWT first because verifyJWT is the cheap rejection
+// path for opaque (refresh) tokens — it fails on the first malformed segment
+// before any store lookup. Most non-refresh tokens reach this endpoint as
+// JWTs, so JWT-first short-circuits the common case; refresh-token
+// introspection still works via the fall-through to introspectRefreshToken.
 func (b *Broker) introspectToken(tok, hint string, client Client) (map[string]any, bool) {
 	tryRefreshFirst := hint == "refresh_token"
 	if tryRefreshFirst {
@@ -1028,7 +1052,7 @@ func redirectOAuthError(w http.ResponseWriter, r *http.Request, redirectURI, sta
 		q.Set("state", state)
 	}
 	u.RawQuery = q.Encode()
-	http.Redirect(w, r, u.String(), http.StatusFound) //nolint:gosec // redirect URI was validated against the registered client redirect_uris.
+	http.Redirect(w, r, u.String(), http.StatusFound) //nolint:gosec // redirectURI was already verified by clientAllowsRedirect against the registered redirect_uris (exact string match), so it cannot be attacker-controlled.
 }
 
 func tokenError(w http.ResponseWriter, code, desc string) {

@@ -224,7 +224,7 @@ func migrateLegacySigningKeyFile(dataDir string) (managedSigningKeySet, bool, er
 		return managedSigningKeySet{}, false, nil
 	}
 	path := filepath.Join(dataDir, defaultKeysPath)
-	b, err := os.ReadFile(path) //nolint:gosec // key path is derived from operator-supplied data directory.
+	b, err := readOperatorFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return managedSigningKeySet{}, false, nil

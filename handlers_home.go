@@ -60,8 +60,9 @@ func (b *Broker) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 		"id_token_signing_alg_values_supported": []string{"RS256"},
 		"token_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post", "none"},
 		"scopes_supported":                      []string{"openid", "profile", "email", "groups", "offline_access"},
-		"claims_supported":                      []string{"sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "preferred_username", "email", "name", "groups"},
+		"claims_supported":                      []string{"sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "preferred_username", "email", "name", "groups", "azp", "amr"},
 		"code_challenge_methods_supported":      []string{"S256"},
+		"response_modes_supported":              []string{"query"},
 	})
 }
 

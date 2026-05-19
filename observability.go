@@ -180,6 +180,14 @@ func escapeMetricLabel(value string) string {
 	return strings.ReplaceAll(value, `"`, `\"`)
 }
 
+// metricPath normalizes templated request paths so that one metric series is
+// emitted per route pattern (rather than per concrete URL with embedded IDs).
+//
+// MAINTENANCE: when adding a new route in (*Broker).buildRoutes that uses a
+// path parameter — e.g. `/foo/{id}` — add a matching case here. Otherwise
+// the metric label space will grow unbounded with one series per id, and
+// Prometheus scrapes will explode. net/http.ServeMux does not expose its
+// registered patterns, which is why this is a hand-maintained list.
 func metricPath(path, metricsPath string) string {
 	switch {
 	case path == "":

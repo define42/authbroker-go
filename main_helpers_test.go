@@ -1,14 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
 	"flag"
 	"io"
-	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -84,18 +82,6 @@ func TestRedirectToHTTPSBadHost(t *testing.T) {
 	handler(rr, req)
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d", rr.Code)
-	}
-}
-
-func TestDumpRoutesEmitsLog(t *testing.T) {
-	buf := &bytes.Buffer{}
-	old := log.Writer()
-	log.SetOutput(buf)
-	defer log.SetOutput(old)
-
-	dumpRoutes()
-	if !strings.Contains(buf.String(), "/oauth2/token") {
-		t.Fatalf("dumpRoutes output missing route: %q", buf.String())
 	}
 }
 

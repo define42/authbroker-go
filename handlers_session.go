@@ -470,7 +470,8 @@ func (b *Broker) validSession(r *http.Request) (Session, bool) {
 	if !ok {
 		return Session{}, false
 	}
-	if time.Now().After(s.ExpiresAt) {
+	now := time.Now()
+	if now.After(s.ExpiresAt) || (!s.AbsoluteExpiresAt.IsZero() && now.After(s.AbsoluteExpiresAt)) {
 		if err := b.store.DeleteSession(c.Value); err != nil {
 			log.Printf("delete expired session: %v", err)
 		}
@@ -539,7 +540,7 @@ func (b *Broker) maybeExtendSession(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if now.After(s.ExpiresAt) {
+	if now.After(s.ExpiresAt) || (!s.AbsoluteExpiresAt.IsZero() && now.After(s.AbsoluteExpiresAt)) {
 		if err := b.store.DeleteSession(c.Value); err != nil {
 			log.Printf("delete expired session: %v", err)
 		}
@@ -548,12 +549,18 @@ func (b *Broker) maybeExtendSession(w http.ResponseWriter, r *http.Request) {
 	if s.ExpiresAt.Sub(now) > ttl/2 {
 		return
 	}
-	s.ExpiresAt = now.Add(ttl)
+	newExpiry := now.Add(ttl)
+	// The absolute ceiling, when set, clamps the sliding renewal. The session
+	// can be extended right up to the ceiling but not past it; once we reach
+	// the ceiling validSession will refuse to honor the cookie.
+	if !s.AbsoluteExpiresAt.IsZero() && newExpiry.After(s.AbsoluteExpiresAt) {
+		newExpiry = s.AbsoluteExpiresAt
+	}
+	s.ExpiresAt = newExpiry
 	if err := b.store.PutSession(c.Value, s); err != nil {
 		log.Printf("persist extended session: %v", err)
 		return
 	}
-	newExpiry := s.ExpiresAt
 
 	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure is controlled by issuer/config for local HTTP demos and HTTPS deployments.
 		Name:     sessionCookieName,
@@ -594,6 +601,9 @@ func (b *Broker) createSession(w http.ResponseWriter, userID string, freshlyAuth
 	sid := randomB64(32)
 	now := time.Now()
 	sess := Session{UserID: userID, ExpiresAt: now.Add(time.Duration(b.cfg.SessionTTLHrs) * time.Hour), AuthTime: now, CSRFToken: randomB64(32), AMR: amr}
+	if b.cfg.SessionAbsoluteTTLHrs > 0 {
+		sess.AbsoluteExpiresAt = now.Add(time.Duration(b.cfg.SessionAbsoluteTTLHrs) * time.Hour)
+	}
 	if freshlyAuthenticated {
 		sess.ReAuthAt = now
 	}

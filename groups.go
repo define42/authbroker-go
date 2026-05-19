@@ -283,7 +283,10 @@ func renderGroupMappingTarget(target, groupName, groupDN string) string {
 }
 
 func renderRegexGroupMappingTarget(mapping regexGroupMapping, groupName, groupDN string, matches []string) string {
-	mapped := renderGroupMappingTarget(mapping.Target, groupName, groupDN)
+	// Apply regex-capture substitutions BEFORE the {cn}/{group}/{dn}
+	// placeholders, in a single pass. Otherwise a regex capture containing a
+	// literal "{1}" or "{cn}" could be re-substituted by the later pass and
+	// produce attacker-influenced output for operator-controlled patterns.
 	replacements := []string{}
 	if len(matches) > 0 {
 		replacements = append(replacements, "{match}", matches[0], "{0}", matches[0])
@@ -297,10 +300,11 @@ func renderRegexGroupMappingTarget(mapping regexGroupMapping, groupName, groupDN
 			replacements = append(replacements, "{"+names[i]+"}", matches[i])
 		}
 	}
+	target := mapping.Target
 	if len(replacements) > 0 {
-		mapped = strings.NewReplacer(replacements...).Replace(mapped)
+		target = strings.NewReplacer(replacements...).Replace(target)
 	}
-	return strings.TrimSpace(mapped)
+	return renderGroupMappingTarget(target, groupName, groupDN)
 }
 
 func scopeIncludes(scope, wanted string) bool {

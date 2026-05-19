@@ -160,6 +160,14 @@ func readTOTPVerifyCode(r *http.Request) (string, error) {
 }
 
 // TOTP, RFC 6238 style, HMAC-SHA1/6 digits/30 sec.
+//
+// The inner comparison is constant-time, but the early return on first match
+// makes total runtime depend on which window slot matched. With a window of 1
+// (the only caller, both at login and at enroll-verify) this leaks at most
+// log2(3) ≈ 1.6 bits per probe, which is harmless across a network and
+// dominated by HTTP/TLS jitter. If the window is ever widened materially,
+// change this to scan the full window and `subtle.ConstantTimeSelect` the
+// match result.
 func verifyTOTP(secretBase32, code string, now time.Time, window int) bool {
 	code = strings.TrimSpace(code)
 	if len(code) != 6 {

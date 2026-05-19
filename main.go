@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -93,8 +92,6 @@ func run(opts cliOptions) error {
 	ctx, cleanup := startSignalSweeper(broker)
 	defer cleanup()
 
-	dumpRoutes()
-
 	if broker.cfg.ACME.Enabled && len(broker.cfg.ACME.Domains) > 0 {
 		return runACME(ctx, broker, dataDir, cleanup)
 	}
@@ -130,6 +127,12 @@ func newConfiguredBroker(opts cliOptions) (*Broker, string, error) {
 	dataDir, err := resolveDataDir(opts.dataPath)
 	if err != nil {
 		return nil, "", fmt.Errorf("resolve data path: %w", err)
+	}
+	// ACME needs persistent storage for its account key and certificates. If
+	// the operator left both -data and acme.storage_path empty, fail here
+	// rather than partway through runACME after listeners are coming up.
+	if cfg.ACME.Enabled && strings.TrimSpace(cfg.ACME.StoragePath) == "" && dataDir == "" {
+		return nil, "", fmt.Errorf("acme.enabled requires either acme.storage_path or a data directory (-data / AUTHBROKER_DATA)")
 	}
 	store, err := NewStore(filepath.Join(dataDir, defaultDataFile))
 	if err != nil {
@@ -456,41 +459,4 @@ func waitForServerStop(ctx context.Context, srv *http.Server, broker *Broker) (b
 		return false, nil
 	}
 	return true, nil
-}
-
-func dumpRoutes() {
-	routes := []string{
-		"/",
-		"/healthz",
-		"/livez",
-		"/readyz",
-		"/login",
-		"/logout",
-		"/reauth",
-		"/consent",
-		"/app-tokens/{id}",
-		"/admin",
-		"/admin/clients",
-		"/admin/clients/new",
-		"/admin/clients/{id}/delete",
-		"/admin/app-tokens",
-		"/admin/app-tokens/new",
-		"/admin/app-tokens/{id}/delete",
-		"/.well-known/openid-configuration",
-		"/oauth2/authorize",
-		"/oauth2/token",
-		"/oauth2/jwks",
-		"/oauth2/userinfo",
-		"/oauth2/revoke",
-		"/oauth2/introspect",
-		"/oauth2/logout",
-		"/mfa/totp/enroll",
-		"/mfa/totp/verify",
-		"/webauthn/register/begin",
-		"/webauthn/register/finish",
-		"/webauthn/login/begin",
-		"/webauthn/login/finish",
-	}
-	sort.Strings(routes)
-	log.Printf("endpoints: %s", strings.Join(routes, ", "))
 }

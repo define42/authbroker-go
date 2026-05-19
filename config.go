@@ -91,7 +91,17 @@ type Config struct {
 	IDTokenTTLMinutes     int `json:"id_token_ttl_minutes"`
 	RefreshTokenTTLDays   int `json:"refresh_token_ttl_days"`
 	AuthCodeTTLSeconds    int `json:"auth_code_ttl_seconds"`
-	SessionTTLHrs         int `json:"session_ttl_hours"`
+	// SessionTTLHrs is the sliding (idle) session TTL — every authenticated
+	// request resets the cookie expiry up to this many hours from now.
+	SessionTTLHrs int `json:"session_ttl_hours"`
+	// SessionAbsoluteTTLHrs caps total session lifetime regardless of
+	// activity. When set, createSession stamps Session.AbsoluteExpiresAt and
+	// validSession rejects the session past that point — even if
+	// maybeExtendSession would otherwise extend it. Zero (the default) keeps
+	// the legacy behavior of "idle TTL only" for backwards compatibility;
+	// compliance regimes that require re-authentication on a fixed cadence
+	// should set this to a multiple of SessionTTLHrs.
+	SessionAbsoluteTTLHrs int `json:"session_absolute_ttl_hours,omitempty"`
 }
 
 type RateLimitConfig struct {
@@ -362,6 +372,7 @@ func validateConfig(cfg Config) error {
 	return validateProductionClients(cfg)
 }
 
+//nolint:gocognit // Shape validation enumerates the small fixed set of cross-field constraints linearly.
 func validateConfigShape(cfg Config) error {
 	seenClients := map[string]bool{}
 	for _, c := range cfg.Clients {
@@ -391,6 +402,9 @@ func validateConfigShape(cfg Config) error {
 	}
 	if cfg.Metrics.Enabled && !validHTTPPath(cfg.Metrics.Path) {
 		return fmt.Errorf("metrics.path must be an absolute path")
+	}
+	if cfg.SessionAbsoluteTTLHrs > 0 && cfg.SessionAbsoluteTTLHrs < cfg.SessionTTLHrs {
+		return fmt.Errorf("session_absolute_ttl_hours (%d) must be >= session_ttl_hours (%d)", cfg.SessionAbsoluteTTLHrs, cfg.SessionTTLHrs)
 	}
 	return nil
 }
@@ -588,7 +602,7 @@ func nonEmptyStrings(values []string) []string {
 
 func loadConfig(path string) (Config, error) {
 	var cfg Config
-	b, err := os.ReadFile(path) //nolint:gosec // config path is supplied by the local operator.
+	b, err := readOperatorFile(path)
 	if err != nil {
 		return cfg, err
 	}
