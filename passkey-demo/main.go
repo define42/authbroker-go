@@ -33,6 +33,7 @@ type pageData struct {
 	PublicBaseURL string
 	SignedIn      bool
 	UserID        string
+	CSRFToken     string
 	HasCookie     bool
 	Error         string
 }
@@ -71,13 +72,14 @@ func main() {
 }
 
 func (a *app) handleIndex(w http.ResponseWriter, r *http.Request) {
-	userID, signedIn := a.currentBrokerSession(r)
+	userID, csrfToken, signedIn := a.currentBrokerSession(r)
 	_, hasCookie := brokerSessionCookie(r)
 	data := pageData{
 		BrokerURL:     a.brokerPublicURL,
 		PublicBaseURL: a.publicBaseURL,
 		SignedIn:      signedIn,
 		UserID:        userID,
+		CSRFToken:     csrfToken,
 		HasCookie:     hasCookie,
 		Error:         r.URL.Query().Get("error"),
 	}
@@ -208,28 +210,28 @@ func (a *app) webauthnProxy() http.Handler {
 	return proxy
 }
 
-func (a *app) currentBrokerSession(r *http.Request) (string, bool) {
+func (a *app) currentBrokerSession(r *http.Request) (string, string, bool) {
 	cookie, ok := brokerSessionCookie(r)
 	if !ok {
-		return "", false
+		return "", "", false
 	}
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, a.brokerInternalURL+"/", nil)
 	if err != nil {
-		return "", false
+		return "", "", false
 	}
 	req.AddCookie(cookie)
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", false
+		return "", "", false
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	matches := signedInPattern.FindSubmatch(body)
 	if len(matches) != 2 {
-		return "", false
+		return "", "", false
 	}
-	return string(matches[1]), true
+	return string(matches[1]), csrfTokenFromHTML(body), true
 }
 
 func brokerSessionCookie(r *http.Request) (*http.Cookie, bool) {
@@ -303,6 +305,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  {{if .CSRFToken}}<meta name="broker-csrf-token" content="{{.CSRFToken}}">{{end}}
   <title>Passkey Demo</title>
   <style>
     body { font-family: system-ui, sans-serif; margin: 0; background: #f5f7fb; color: #16202a; }
@@ -366,6 +369,8 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
   </main>
 <script>
 const message = document.getElementById('message');
+const csrfMeta = document.querySelector('meta[name="broker-csrf-token"]');
+const brokerCSRFToken = csrfMeta ? csrfMeta.content : '';
 function setMessage(text) { message.textContent = text; }
 function b64urlToBuf(s) {
   s = s.replace(/-/g, '+').replace(/_/g, '/');
@@ -382,9 +387,12 @@ function bufToB64url(buf) {
   return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 async function postJSON(path, body) {
+  const headers = {};
+  if (body) headers['Content-Type'] = 'application/json';
+  if (brokerCSRFToken) headers['X-CSRF-Token'] = brokerCSRFToken;
   const res = await fetch(path, {
     method: 'POST',
-    headers: body ? {'Content-Type': 'application/json'} : {},
+    headers,
     body: body ? JSON.stringify(body) : undefined,
     credentials: 'same-origin'
   });

@@ -117,11 +117,17 @@ func validateAuthorizationScope(client Client, raw string) (string, error) {
 }
 
 func validateClientCredentialsScope(client Client, raw string) (string, error) {
+	allowed := clientCredentialsScopeSet(client)
+	if len(allowed) == 0 {
+		return "", fmt.Errorf("client_credentials is not enabled for this client")
+	}
 	scopes, err := parseScopeString(raw)
 	if err != nil {
 		return "", err
 	}
-	allowed := clientCredentialsScopeSet(client)
+	if len(scopes) == 0 {
+		return "", fmt.Errorf("scope is required for client_credentials")
+	}
 	for _, scope := range scopes {
 		if !allowed[scope] {
 			return "", fmt.Errorf("scope %q is not allowed for client_credentials", scope)

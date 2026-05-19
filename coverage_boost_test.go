@@ -659,6 +659,11 @@ func TestHandleWebAuthnRegisterFinishExpiredChallenge(t *testing.T) {
 	bodyBytes, _ := json.Marshal(body)
 	req := httptest.NewRequest(http.MethodPost, "/webauthn/register/finish", strings.NewReader(string(bodyBytes)))
 	addSessionCookie(req, sid)
+	sess, ok, err := broker.store.GetSession(sid)
+	if err != nil || !ok {
+		t.Fatalf("load session: ok=%v err=%v", ok, err)
+	}
+	addSessionCSRF(req, sess)
 	rr := httptest.NewRecorder()
 	broker.handleWebAuthnRegisterFinish(rr, req)
 	if rr.Code != http.StatusBadRequest {
@@ -791,16 +796,18 @@ func TestMappedGroupsForClientNilUser(t *testing.T) {
 func TestHandleTOTPEnrollIssuesSecret(t *testing.T) {
 	broker := newLogoutTestBroker(t)
 	sid := "enroll-ok"
-	if err := broker.store.PutSession(sid, Session{
+	sess := Session{
 		UserID:    "alice",
 		CSRFToken: "tok",
 		ReAuthAt:  time.Now(),
 		ExpiresAt: time.Now().Add(time.Hour),
-	}); err != nil {
+	}
+	if err := broker.store.PutSession(sid, sess); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/mfa/totp/enroll", nil)
 	addSessionCookie(req, sid)
+	addSessionCSRF(req, sess)
 	rr := httptest.NewRecorder()
 	broker.handleTOTPEnroll(rr, req)
 	if rr.Code != http.StatusOK {
@@ -1152,6 +1159,11 @@ func TestHandleWebAuthnRegisterFinishRejectsBadAttestation(t *testing.T) {
 	bodyBytes, _ := json.Marshal(body)
 	req := httptest.NewRequest(http.MethodPost, "/webauthn/register/finish", strings.NewReader(string(bodyBytes)))
 	addSessionCookie(req, sid)
+	sess, ok, err := broker.store.GetSession(sid)
+	if err != nil || !ok {
+		t.Fatalf("load session: ok=%v err=%v", ok, err)
+	}
+	addSessionCSRF(req, sess)
 	rr := httptest.NewRecorder()
 	broker.handleWebAuthnRegisterFinish(rr, req)
 	if rr.Code != http.StatusBadRequest {

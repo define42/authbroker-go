@@ -30,6 +30,9 @@ func (b *Broker) handleTOTPEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxTOTPEnrollBodyBytes)
+	if !verifyFormSessionCSRF(w, r, sess) {
+		return
+	}
 	// Re-auth required: a stolen session must not be able to silently swap
 	// the TOTP secret.
 	if !b.requireRecentReAuth(w, sess) {
@@ -68,6 +71,8 @@ func (b *Broker) handleTOTPEnroll(w http.ResponseWriter, r *http.Request) {
 // they prove they can produce a valid code from it. Accepts either an
 // application/x-www-form-urlencoded body (otp=...) or a JSON body
 // ({"otp":"..."}). A 410 Gone is returned if no pending secret is staged.
+//
+//nolint:funlen // Enrollment verification keeps CSRF, re-auth, rate-limit, pending-secret, and commit checks in protocol order.
 func (b *Broker) handleTOTPEnrollVerify(w http.ResponseWriter, r *http.Request) {
 	sess, ok := b.validSession(r)
 	if !ok {
@@ -75,6 +80,9 @@ func (b *Broker) handleTOTPEnrollVerify(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxTOTPVerifyBodyBytes)
+	if !verifyFormSessionCSRF(w, r, sess) {
+		return
+	}
 	if !b.requireRecentReAuth(w, sess) {
 		return
 	}
@@ -157,6 +165,24 @@ func readTOTPVerifyCode(r *http.Request) (string, error) {
 		return "", fmt.Errorf("missing otp")
 	}
 	return code, nil
+}
+
+func formURLEncoded(r *http.Request) bool {
+	ct := r.Header.Get("Content-Type")
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	return strings.TrimSpace(ct) == "application/x-www-form-urlencoded"
+}
+
+func verifyFormSessionCSRF(w http.ResponseWriter, r *http.Request, sess Session) bool {
+	if formURLEncoded(r) {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "bad form", http.StatusBadRequest)
+			return false
+		}
+	}
+	return requireSessionCSRF(w, r, sess)
 }
 
 // TOTP, RFC 6238 style, HMAC-SHA1/6 digits/30 sec.

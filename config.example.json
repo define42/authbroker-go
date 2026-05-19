@@ -13,6 +13,7 @@
   "refresh_token_ttl_days": 14,
   "auth_code_ttl_seconds": 120,
   "session_ttl_hours": 8,
+  "session_absolute_ttl_hours": 24,
   "admin_groups": ["administrators"],
 
   "rate_limit": {

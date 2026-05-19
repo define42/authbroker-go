@@ -624,35 +624,36 @@ func (b *Broker) issueUserTokens(userID, clientID, scope, nonce string, authTime
 		return nil, err
 	}
 
-	atHashSum := sha256.Sum256([]byte(access))
-	idClaims := map[string]any{
-		"iss":                b.cfg.Issuer,
-		"sub":                userID,
-		"aud":                clientID,
-		"iat":                now.Unix(),
-		"exp":                now.Add(time.Duration(b.cfg.IDTokenTTLMinutes) * time.Minute).Unix(),
-		"auth_time":          authTime.Unix(),
-		"preferred_username": userID,
-		"at_hash":            base64RawURL(atHashSum[:sha256.Size/2]),
-	}
-	if len(amr) > 0 {
-		idClaims["amr"] = amr
-	}
-	if nonce != "" {
-		idClaims["nonce"] = nonce
-	}
-	b.addScopedProfileClaims(idClaims, user, scope, clientID)
-	idToken, err := b.signJWT(idClaims)
-	if err != nil {
-		return nil, err
-	}
-
 	resp := map[string]any{
 		"access_token": access,
-		"id_token":     idToken,
 		"token_type":   "Bearer",
 		"expires_in":   b.cfg.AccessTokenTTLMinutes * 60,
 		"scope":        scope,
+	}
+	if scopeIncludes(scope, scopeOpenID) {
+		atHashSum := sha256.Sum256([]byte(access))
+		idClaims := map[string]any{
+			"iss":                b.cfg.Issuer,
+			"sub":                userID,
+			"aud":                clientID,
+			"iat":                now.Unix(),
+			"exp":                now.Add(time.Duration(b.cfg.IDTokenTTLMinutes) * time.Minute).Unix(),
+			"auth_time":          authTime.Unix(),
+			"preferred_username": userID,
+			"at_hash":            base64RawURL(atHashSum[:sha256.Size/2]),
+		}
+		if len(amr) > 0 {
+			idClaims["amr"] = amr
+		}
+		if nonce != "" {
+			idClaims["nonce"] = nonce
+		}
+		b.addScopedProfileClaims(idClaims, user, scope, clientID)
+		idToken, err := b.signJWT(idClaims)
+		if err != nil {
+			return nil, err
+		}
+		resp["id_token"] = idToken
 	}
 	if includeRefresh {
 		rt := randomB64(32)

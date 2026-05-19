@@ -129,6 +129,11 @@ func beginRegistration(t *testing.T, broker *Broker, sid string) string {
 	t.Helper()
 	beginReq := httptest.NewRequest(http.MethodPost, "/webauthn/register/begin", nil)
 	addSessionCookie(beginReq, sid)
+	sess, ok, err := broker.store.GetSession(sid)
+	if err != nil || !ok {
+		t.Fatalf("load session: ok=%v err=%v", ok, err)
+	}
+	addSessionCSRF(beginReq, sess)
 	beginRR := httptest.NewRecorder()
 	broker.handleWebAuthnRegisterBegin(beginRR, beginReq)
 	if beginRR.Code != http.StatusOK {
@@ -186,6 +191,11 @@ func registerSyntheticCredential(t *testing.T, broker *Broker, sid string) (*ecd
 	bodyBytes, _ := json.Marshal(body)
 	req := httptest.NewRequest(http.MethodPost, "/webauthn/register/finish", strings.NewReader(string(bodyBytes)))
 	addSessionCookie(req, sid)
+	sess, ok, err := broker.store.GetSession(sid)
+	if err != nil || !ok {
+		t.Fatalf("load session: ok=%v err=%v", ok, err)
+	}
+	addSessionCSRF(req, sess)
 	rr := httptest.NewRecorder()
 	broker.handleWebAuthnRegisterFinish(rr, req)
 	if rr.Code != http.StatusOK {

@@ -442,6 +442,14 @@ func verifySessionCSRF(r *http.Request, sess Session) bool {
 	return csrfTokenMatches(token, sess.CSRFToken)
 }
 
+func requireSessionCSRF(w http.ResponseWriter, r *http.Request, sess Session) bool {
+	if verifySessionCSRF(r, sess) {
+		return true
+	}
+	http.Error(w, "invalid csrf token", http.StatusForbidden)
+	return false
+}
+
 func csrfTokenMatches(got, want string) bool {
 	if got == "" || want == "" {
 		return false

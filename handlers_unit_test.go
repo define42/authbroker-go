@@ -19,6 +19,10 @@ func addSessionCookie(req *http.Request, sid string) {
 	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sid}) //nolint:gosec // Test attaches a synthetic session cookie.
 }
 
+func addSessionCSRF(req *http.Request, sess Session) {
+	req.Header.Set(csrfHeaderName, sess.CSRFToken)
+}
+
 func TestHandleStylesheetAndScript(t *testing.T) {
 	broker := newLogoutTestBroker(t)
 
@@ -500,6 +504,20 @@ func TestIssueUserTokensOmitsAMRWhenEmpty(t *testing.T) {
 	}
 }
 
+func TestIssueUserTokensOmitsIDTokenWithoutOpenIDScope(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	tokens, err := broker.issueUserTokens("johndoe", "demo-web", "profile email", "", time.Now(), nil, false)
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	if _, present := tokens["id_token"]; present {
+		t.Fatalf("id_token should be absent without openid scope: %#v", tokens)
+	}
+	if _, present := tokens["access_token"]; !present {
+		t.Fatalf("access_token should still be issued: %#v", tokens)
+	}
+}
+
 // TestUserInfoAcceptsPOSTWithBearerHeader checks the §5.3 requirement that
 // /oauth2/userinfo accepts POST with the access token in the Authorization
 // header.
@@ -615,6 +633,42 @@ func TestTokenClientCredentialsRejectsUnconfiguredScope(t *testing.T) {
 		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
 	}
 	if !strings.Contains(rr.Body.String(), "invalid_scope") {
+		t.Fatalf("body = %q", rr.Body.String())
+	}
+}
+
+func TestTokenClientCredentialsRequiresConfiguredScopes(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	client := broker.clients["demo-web"]
+	client.ClientCredentialsScopes = nil
+	client.clientCredentialsAllowedScopes = nil
+	broker.clients["demo-web"] = client
+	form := url.Values{"grant_type": {"client_credentials"}, "scope": {"openid"}}
+	req := httptest.NewRequest(http.MethodPost, "/oauth2/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth("demo-web", "demo-secret")
+	rr := httptest.NewRecorder()
+	broker.handleToken(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "client_credentials is not enabled") {
+		t.Fatalf("body = %q", rr.Body.String())
+	}
+}
+
+func TestTokenClientCredentialsRequiresRequestedScope(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	form := url.Values{"grant_type": {"client_credentials"}}
+	req := httptest.NewRequest(http.MethodPost, "/oauth2/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth("demo-web", "demo-secret")
+	rr := httptest.NewRecorder()
+	broker.handleToken(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "scope is required") {
 		t.Fatalf("body = %q", rr.Body.String())
 	}
 }
@@ -1264,7 +1318,24 @@ func TestHandleTOTPEnrollRequiresAuth(t *testing.T) {
 
 func TestHandleTOTPEnrollRequiresReAuth(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	_, _ = broker.createSession(httptest.NewRecorder(), "alice", false, nil)
+	sess, _ := broker.createSession(httptest.NewRecorder(), "alice", false, nil)
+	var sid string
+	for id := range broker.store.RuntimeSnapshot().Sessions {
+		sid = id
+	}
+	req := httptest.NewRequest(http.MethodPost, "/mfa/totp/enroll", nil)
+	addSessionCookie(req, sid)
+	addSessionCSRF(req, sess)
+	rr := httptest.NewRecorder()
+	broker.handleTOTPEnroll(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandleTOTPEnrollRequiresCSRF(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true, nil)
 	var sid string
 	for id := range broker.store.RuntimeSnapshot().Sessions {
 		sid = id
@@ -1280,13 +1351,14 @@ func TestHandleTOTPEnrollRequiresReAuth(t *testing.T) {
 
 func TestHandleTOTPEnrollSuccess(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true, nil)
+	sess, _ := broker.createSession(httptest.NewRecorder(), "alice", true, nil)
 	var sid string
 	for id := range broker.store.RuntimeSnapshot().Sessions {
 		sid = id
 	}
 	req := httptest.NewRequest(http.MethodPost, "/mfa/totp/enroll", nil)
 	addSessionCookie(req, sid)
+	addSessionCSRF(req, sess)
 	rr := httptest.NewRecorder()
 	broker.handleTOTPEnroll(rr, req)
 	if rr.Code != http.StatusOK {
@@ -1318,7 +1390,7 @@ func TestHandleWebAuthnRegisterBeginRequiresAuth(t *testing.T) {
 	}
 }
 
-func TestHandleWebAuthnRegisterBeginSuccess(t *testing.T) {
+func TestHandleWebAuthnRegisterBeginRequiresCSRF(t *testing.T) {
 	broker := newLogoutTestBroker(t)
 	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true, nil)
 	var sid string
@@ -1327,6 +1399,23 @@ func TestHandleWebAuthnRegisterBeginSuccess(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodPost, "/webauthn/register/begin", nil)
 	addSessionCookie(req, sid)
+	rr := httptest.NewRecorder()
+	broker.handleWebAuthnRegisterBegin(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandleWebAuthnRegisterBeginSuccess(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	sess, _ := broker.createSession(httptest.NewRecorder(), "alice", true, nil)
+	var sid string
+	for id := range broker.store.RuntimeSnapshot().Sessions {
+		sid = id
+	}
+	req := httptest.NewRequest(http.MethodPost, "/webauthn/register/begin", nil)
+	addSessionCookie(req, sid)
+	addSessionCSRF(req, sess)
 	rr := httptest.NewRecorder()
 	broker.handleWebAuthnRegisterBegin(rr, req)
 	if rr.Code != http.StatusOK {
@@ -1344,16 +1433,33 @@ func TestHandleWebAuthnRegisterBeginSuccess(t *testing.T) {
 
 func TestHandleWebAuthnRegisterFinishBadJSON(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true, nil)
+	sess, _ := broker.createSession(httptest.NewRecorder(), "alice", true, nil)
 	var sid string
 	for id := range broker.store.RuntimeSnapshot().Sessions {
 		sid = id
 	}
 	req := httptest.NewRequest(http.MethodPost, "/webauthn/register/finish", strings.NewReader("not json"))
 	addSessionCookie(req, sid)
+	addSessionCSRF(req, sess)
 	rr := httptest.NewRecorder()
 	broker.handleWebAuthnRegisterFinish(rr, req)
 	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandleWebAuthnRegisterFinishRequiresCSRF(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true, nil)
+	var sid string
+	for id := range broker.store.RuntimeSnapshot().Sessions {
+		sid = id
+	}
+	req := httptest.NewRequest(http.MethodPost, "/webauthn/register/finish", strings.NewReader("{}"))
+	addSessionCookie(req, sid)
+	rr := httptest.NewRecorder()
+	broker.handleWebAuthnRegisterFinish(rr, req)
+	if rr.Code != http.StatusForbidden {
 		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
 	}
 }
@@ -1856,7 +1962,7 @@ func TestRedirectOAuthErrorEscapesCRLFInState(t *testing.T) {
 
 func TestHandleTOTPEnrollVerifyCommitsPendingSecret(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true, nil)
+	sess, _ := broker.createSession(httptest.NewRecorder(), "alice", true, nil)
 	var sid string
 	for id := range broker.store.RuntimeSnapshot().Sessions {
 		sid = id
@@ -1864,6 +1970,7 @@ func TestHandleTOTPEnrollVerifyCommitsPendingSecret(t *testing.T) {
 
 	enrollReq := httptest.NewRequest(http.MethodPost, "/mfa/totp/enroll", nil)
 	addSessionCookie(enrollReq, sid)
+	addSessionCSRF(enrollReq, sess)
 	enrollRR := httptest.NewRecorder()
 	broker.handleTOTPEnroll(enrollRR, enrollReq)
 	if enrollRR.Code != http.StatusOK {
@@ -1891,6 +1998,7 @@ func TestHandleTOTPEnrollVerifyCommitsPendingSecret(t *testing.T) {
 	verifyReq := httptest.NewRequest(http.MethodPost, "/mfa/totp/verify", strings.NewReader(form.Encode()))
 	verifyReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	addSessionCookie(verifyReq, sid)
+	addSessionCSRF(verifyReq, sess)
 	verifyRR := httptest.NewRecorder()
 	broker.handleTOTPEnrollVerify(verifyRR, verifyReq)
 	if verifyRR.Code != http.StatusNoContent {
@@ -1908,7 +2016,7 @@ func TestHandleTOTPEnrollVerifyCommitsPendingSecret(t *testing.T) {
 
 func TestHandleTOTPEnrollVerifyRejectsBadCode(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true, nil)
+	sess, _ := broker.createSession(httptest.NewRecorder(), "alice", true, nil)
 	var sid string
 	for id := range broker.store.RuntimeSnapshot().Sessions {
 		sid = id
@@ -1920,6 +2028,7 @@ func TestHandleTOTPEnrollVerifyRejectsBadCode(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/mfa/totp/verify", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	addSessionCookie(req, sid)
+	addSessionCSRF(req, sess)
 	rr := httptest.NewRecorder()
 	broker.handleTOTPEnrollVerify(rr, req)
 	if rr.Code != http.StatusUnauthorized {
@@ -1936,7 +2045,7 @@ func TestHandleTOTPEnrollVerifyRejectsBadCode(t *testing.T) {
 
 func TestHandleTOTPEnrollVerifyWithoutPendingReturnsGone(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true, nil)
+	sess, _ := broker.createSession(httptest.NewRecorder(), "alice", true, nil)
 	var sid string
 	for id := range broker.store.RuntimeSnapshot().Sessions {
 		sid = id
@@ -1945,6 +2054,7 @@ func TestHandleTOTPEnrollVerifyWithoutPendingReturnsGone(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/mfa/totp/verify", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	addSessionCookie(req, sid)
+	addSessionCSRF(req, sess)
 	rr := httptest.NewRecorder()
 	broker.handleTOTPEnrollVerify(rr, req)
 	if rr.Code != http.StatusGone {
@@ -1954,7 +2064,7 @@ func TestHandleTOTPEnrollVerifyWithoutPendingReturnsGone(t *testing.T) {
 
 func TestHandleTOTPEnrollVerifyAcceptsJSONBody(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true, nil)
+	sess, _ := broker.createSession(httptest.NewRecorder(), "alice", true, nil)
 	var sid string
 	for id := range broker.store.RuntimeSnapshot().Sessions {
 		sid = id
@@ -1968,6 +2078,7 @@ func TestHandleTOTPEnrollVerifyAcceptsJSONBody(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/mfa/totp/verify", strings.NewReader(bodyJSON))
 	req.Header.Set("Content-Type", "application/json")
 	addSessionCookie(req, sid)
+	addSessionCSRF(req, sess)
 	rr := httptest.NewRecorder()
 	broker.handleTOTPEnrollVerify(rr, req)
 	if rr.Code != http.StatusNoContent {
@@ -1981,7 +2092,26 @@ func TestHandleTOTPEnrollVerifyAcceptsJSONBody(t *testing.T) {
 
 func TestHandleTOTPEnrollVerifyRequiresReAuth(t *testing.T) {
 	broker := newLogoutTestBroker(t)
-	_, _ = broker.createSession(httptest.NewRecorder(), "alice", false, nil)
+	sess, _ := broker.createSession(httptest.NewRecorder(), "alice", false, nil)
+	var sid string
+	for id := range broker.store.RuntimeSnapshot().Sessions {
+		sid = id
+	}
+	form := url.Values{"otp": {"123456"}}
+	req := httptest.NewRequest(http.MethodPost, "/mfa/totp/verify", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	addSessionCookie(req, sid)
+	addSessionCSRF(req, sess)
+	rr := httptest.NewRecorder()
+	broker.handleTOTPEnrollVerify(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandleTOTPEnrollVerifyRequiresCSRF(t *testing.T) {
+	broker := newLogoutTestBroker(t)
+	_, _ = broker.createSession(httptest.NewRecorder(), "alice", true, nil)
 	var sid string
 	for id := range broker.store.RuntimeSnapshot().Sessions {
 		sid = id

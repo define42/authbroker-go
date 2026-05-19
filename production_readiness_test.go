@@ -22,6 +22,7 @@ func productionTestConfig() Config {
 		RefreshTokenTTLDays:   14,
 		AuthCodeTTLSeconds:    120,
 		SessionTTLHrs:         8,
+		SessionAbsoluteTTLHrs: 24,
 		LDAP: LDAPConfig{
 			URL:            "ldaps://dc01.example.com:636",
 			BaseDN:         "dc=example,dc=com",
@@ -77,6 +78,11 @@ func TestProductionConfigValidationFailures(t *testing.T) {
 			name: "totp optional",
 			edit: func(cfg *Config) { cfg.MFA.TOTPRequired = false },
 			want: "totp_required",
+		},
+		{
+			name: "absolute session ttl missing",
+			edit: func(cfg *Config) { cfg.SessionAbsoluteTTLHrs = 0 },
+			want: "session_absolute_ttl_hours",
 		},
 		{
 			name: "ldap insecure skip verify",
@@ -234,6 +240,7 @@ func TestTOTPEnrollVerifyRateLimited(t *testing.T) {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.RemoteAddr = "192.0.2.60:1234"
 		addSessionCookie(req, sid)
+		addSessionCSRF(req, sess)
 		rr := httptest.NewRecorder()
 		broker.handleTOTPEnrollVerify(rr, req)
 		if rr.Code != want {

@@ -324,10 +324,11 @@ For TLS to an LDAP server backed by an internal CA, set `ca_cert_path` to a PEM 
 
 ## TOTP MFA
 
-After login, enroll TOTP using the session cookie:
+After login, enroll TOTP using the session cookie and the session CSRF token from the broker page:
 
 ```bash
-curl -X POST -b cookies.txt -c cookies.txt http://localhost:8080/mfa/totp/enroll
+CSRF=$(curl -s -b cookies.txt http://localhost:8080/ | sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p' | head -n1)
+curl -X POST -b cookies.txt -c cookies.txt -H "X-CSRF-Token: $CSRF" http://localhost:8080/mfa/totp/enroll
 ```
 
 The response contains an `otpauth_uri` that can be added to an authenticator app. Once a user has a TOTP secret, the login form requires a code.
@@ -338,8 +339,8 @@ The Docker Compose passkey demo at <http://localhost:8091> is the easiest way to
 
 The server exposes JSON endpoints:
 
-- `POST /webauthn/register/begin` — requires an existing broker session
-- `POST /webauthn/register/finish`
+- `POST /webauthn/register/begin` — requires an existing broker session and `X-CSRF-Token`
+- `POST /webauthn/register/finish` — requires the same session CSRF token
 - `POST /webauthn/login/begin` — body: `{ "username": "ingestuser" }`
 - `POST /webauthn/login/finish` — sets the broker session cookie
 
@@ -361,14 +362,18 @@ function bufToB64url(buf) {
 Registration outline:
 
 ```js
-const opts = await fetch('/webauthn/register/begin', {method: 'POST'}).then(r => r.json());
+const csrfToken = document.querySelector('meta[name="broker-csrf-token"]').content;
+const opts = await fetch('/webauthn/register/begin', {
+  method: 'POST',
+  headers: {'X-CSRF-Token': csrfToken}
+}).then(r => r.json());
 opts.publicKey.challenge = b64urlToBuf(opts.publicKey.challenge);
 opts.publicKey.user.id = b64urlToBuf(opts.publicKey.user.id);
 opts.publicKey.excludeCredentials = (opts.publicKey.excludeCredentials || []).map(c => ({...c, id: b64urlToBuf(c.id)}));
 const cred = await navigator.credentials.create(opts);
 await fetch('/webauthn/register/finish', {
   method: 'POST',
-  headers: {'Content-Type': 'application/json'},
+  headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken},
   body: JSON.stringify({
     id: cred.id,
     rawId: bufToB64url(cred.rawId),
@@ -411,7 +416,7 @@ await fetch('/webauthn/login/finish', {
 
 ## Production deployment
 
-For an internal Kubernetes deployment, set `"production": true` and run one broker replica with a ReadWriteOnce volume for `AUTHBROKER_DATA`. Production mode fails startup when unsafe settings are present: non-HTTPS issuer, insecure cookies, localhost or non-HTTPS redirects/WebAuthn origins, LDAP without LDAPS/StartTLS, `ldap.insecure_skip_verify`, missing admin groups, optional TOTP, missing PKCE, unbounded token/session TTLs, duplicate client IDs, or duplicate app-token IDs.
+For an internal Kubernetes deployment, set `"production": true` and run one broker replica with a ReadWriteOnce volume for `AUTHBROKER_DATA`. Production mode fails startup when unsafe settings are present: non-HTTPS issuer, insecure cookies, localhost or non-HTTPS redirects/WebAuthn origins, LDAP without LDAPS/StartTLS, `ldap.insecure_skip_verify`, missing admin groups, optional TOTP, missing PKCE, missing absolute session TTL, unbounded token/session TTLs, duplicate client IDs, or duplicate app-token IDs.
 
 The Kubernetes starter manifest in `deploy/kubernetes/authbroker.yaml` uses a single-replica StatefulSet, non-root container security context, read-only root filesystem, RWO PVC, Service, TLS Ingress, NetworkPolicy, PodDisruptionBudget, `/livez` liveness, and `/readyz` readiness. Replace the example Secret, hostnames, LDAP settings, client hashes, image tag, ingress class assumptions, storage class, and network policy selectors before applying it.
 

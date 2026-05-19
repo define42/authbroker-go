@@ -22,6 +22,9 @@ func (b *Broker) handleWebAuthnRegisterBegin(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxWebAuthnBodyBytes)
+	if !requireSessionCSRF(w, r, sess) {
+		return
+	}
 	// Re-auth required: a stolen session must not be able to silently add a
 	// new passkey to the account.
 	if !b.requireRecentReAuth(w, sess) {
@@ -71,6 +74,7 @@ func (b *Broker) handleWebAuthnRegisterBegin(w http.ResponseWriter, r *http.Requ
 	})
 }
 
+//nolint:funlen // Registration finish is a linear WebAuthn ceremony: session, CSRF, challenge, attestation, and persistence.
 func (b *Broker) handleWebAuthnRegisterFinish(w http.ResponseWriter, r *http.Request) {
 	sess, ok := b.validSession(r)
 	if !ok {
@@ -78,6 +82,9 @@ func (b *Broker) handleWebAuthnRegisterFinish(w http.ResponseWriter, r *http.Req
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxWebAuthnBodyBytes)
+	if !requireSessionCSRF(w, r, sess) {
+		return
+	}
 	if !b.requireRecentReAuth(w, sess) {
 		return
 	}

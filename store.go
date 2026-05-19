@@ -152,15 +152,9 @@ func (s *Store) UpsertProfile(p UserProfile) (*StoredUser, error) {
 		if u == nil {
 			u = &StoredUser{Username: p.Subject}
 		}
-		if p.Email != "" {
-			u.Email = p.Email
-		}
-		if p.Name != "" {
-			u.Name = p.Name
-		}
-		if p.Groups != nil {
-			u.Groups = append([]string(nil), p.Groups...)
-		}
+		u.Email = p.Email
+		u.Name = p.Name
+		u.Groups = append([]string(nil), p.Groups...)
 		if err := putJSON(b, []byte(p.Subject), u); err != nil {
 			return err
 		}

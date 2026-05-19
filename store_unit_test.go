@@ -260,17 +260,22 @@ func TestCloseHandlesNil(t *testing.T) {
 	}
 }
 
-func TestStoreUpsertProfileMerges(t *testing.T) {
+func TestStoreUpsertProfileRefreshesDirectoryFields(t *testing.T) {
 	store := newTestStore(t)
-	if _, err := store.UpsertProfile(UserProfile{Subject: "p", Email: "p@e", Name: "P"}); err != nil {
+	if _, err := store.UpsertProfile(UserProfile{Subject: "p", Email: "p@e", Name: "P", Groups: []string{"old"}}); err != nil {
 		t.Fatalf("first upsert: %v", err)
 	}
-	// Empty email/name should not erase existing values.
-	if _, err := store.UpsertProfile(UserProfile{Subject: "p", Groups: []string{"g"}}); err != nil {
+	if err := store.SetTOTP("p", "SECRET"); err != nil {
+		t.Fatalf("set totp: %v", err)
+	}
+	if _, err := store.UpsertProfile(UserProfile{Subject: "p"}); err != nil {
 		t.Fatalf("merge upsert: %v", err)
 	}
 	user, _ := store.GetUser("p")
-	if user.Email != "p@e" || user.Name != "P" || len(user.Groups) != 1 {
-		t.Fatalf("merged user = %#v", user)
+	if user.Email != "" || user.Name != "" || len(user.Groups) != 0 {
+		t.Fatalf("directory fields were not refreshed: %#v", user)
+	}
+	if user.TOTPSecretBase32 != "SECRET" {
+		t.Fatalf("totp secret should be preserved, got %#v", user)
 	}
 }

@@ -462,6 +462,12 @@ func validateProductionBase(cfg Config) error {
 	if !within(cfg.SessionTTLHrs, 1, 24) {
 		return fmt.Errorf("production session_ttl_hours must be between 1 and 24")
 	}
+	if cfg.SessionAbsoluteTTLHrs <= 0 {
+		return fmt.Errorf("production requires session_absolute_ttl_hours to cap total session lifetime")
+	}
+	if !within(cfg.SessionAbsoluteTTLHrs, cfg.SessionTTLHrs, 168) {
+		return fmt.Errorf("production session_absolute_ttl_hours must be between session_ttl_hours and 168")
+	}
 	return validateProductionWebAuthn(cfg.WebAuthn)
 }
 
