@@ -1,0 +1,36 @@
+name: Dependabot auto-merge
+
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    name: Enable auto-merge
+    runs-on: ubuntu-latest
+    # Only act on PRs opened by Dependabot itself, and never in forks.
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.repository == 'define42/authbroker-go'
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+      # Enabling auto-merge does NOT merge immediately: GitHub merges the PR
+      # only once every required status check on main (test, lint, ...) has
+      # passed. Major version bumps are excluded — they can change behavior
+      # in ways the test suite may not cover, so they stay open for a human
+      # to review and merge.
+      - name: Enable auto-merge for patch/minor updates
+        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
