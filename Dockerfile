@@ -8,7 +8,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/authbroker .
 
-FROM alpine:3.22
+FROM alpine:3.24
 
 RUN adduser -D -H -u 10001 appuser
 WORKDIR /app
