@@ -9,6 +9,9 @@ on:
     # Weekly run on Mondays at 07:23 UTC to surface new advisories that
     # may affect a tagged release even when no code changes land.
     - cron: '23 7 * * 1'
+  # Allows the go-version-bump workflow (and humans) to start a run on a
+  # branch whose push came from GITHUB_TOKEN and so triggered no workflows.
+  workflow_dispatch:
 
 permissions:
   contents: read

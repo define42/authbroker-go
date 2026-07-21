@@ -1,0 +1,86 @@
+name: Go version bump
+
+# Dependabot cannot bump the `go` directive in go.mod to a new Go release
+# (dependabot-core#13520), so this workflow does it: once a week it compares
+# go.mod against the latest stable Go and, if newer, opens a PR that updates
+# go.mod and the Dockerfile's golang build image together. The PR is set to
+# auto-merge, so it lands only after all required checks on main pass.
+
+on:
+  schedule:
+    # Weekly on Mondays at 07:41 UTC, after the govulncheck/CodeQL runs.
+    - cron: '41 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  bump:
+    name: Bump Go to latest stable
+    runs-on: ubuntu-latest
+    # Never run on schedule in forks.
+    if: github.repository == 'define42/authbroker-go'
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go (latest stable)
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+
+      - name: Compare go.mod against latest stable Go
+        id: version
+        run: |
+          latest="$(go env GOVERSION | sed 's/^go//')"
+          current="$(go mod edit -json | jq -r '.Go')"
+          echo "latest=$latest"   >> "$GITHUB_OUTPUT"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "Latest stable Go: $latest — go.mod: $current"
+
+      - name: Update go.mod and Dockerfile
+        if: steps.version.outputs.latest != steps.version.outputs.current
+        env:
+          LATEST: ${{ steps.version.outputs.latest }}
+        run: |
+          go mod edit -go="$LATEST"
+          go mod tidy
+          sed -i -E "s|^FROM golang:[0-9]+(\.[0-9]+)*-alpine|FROM golang:${LATEST}-alpine|" Dockerfile
+
+      - name: Open auto-merging pull request
+        if: steps.version.outputs.latest != steps.version.outputs.current
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LATEST: ${{ steps.version.outputs.latest }}
+        run: |
+          branch="auto/go-$LATEST"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add go.mod go.sum Dockerfile
+          git commit -m "build: update Go to $LATEST"
+          git push -f -u origin "$branch"
+
+          if [ -z "$(gh pr list --head "$branch" --state open --json number --jq '.[].number')" ]; then
+            gh pr create \
+              --title "build: update Go to $LATEST" \
+              --body "Updates the \`go\` directive in go.mod and the golang build image in the Dockerfile to Go $LATEST. Opened automatically by the go-version-bump workflow; merges automatically once all required checks pass."
+          fi
+
+          # Pushes made with GITHUB_TOKEN do not trigger push/pull_request
+          # workflows (GitHub's recursion guard), so start the CI workflows
+          # explicitly; their check runs attach to the branch head commit and
+          # count toward the PR's required status checks.
+          for wf in test.yml lint.yml govulncheck.yml codeql.yml; do
+            gh workflow run "$wf" --ref "$branch"
+          done
+
+          gh pr merge --auto --squash "$branch"
