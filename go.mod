@@ -3,7 +3,7 @@ module github.com/define42/authbroker-go
 go 1.26.3
 
 require (
-	github.com/caddyserver/certmagic v0.25.3
+	github.com/caddyserver/certmagic v0.25.4
 	github.com/go-ldap/ldap/v3 v3.4.14
 	go.etcd.io/bbolt v1.4.3
 )

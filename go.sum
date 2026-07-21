@@ -4,8 +4,8 @@ github.com/Azure/go-ntlmssp v0.1.1 h1:l+FM/EEMb0U9QZE7mKNEDw5Mu3mFiaa2GKOoTSsNDP
 github.com/Azure/go-ntlmssp v0.1.1/go.mod h1:NYqdhxd/8aAct/s4qSYZEerdPuH1liG2/X9DiVTbhpk=
 github.com/alexbrainman/sspi v0.0.0-20250919150558-7d374ff0d59e h1:4dAU9FXIyQktpoUAgOJK3OTFc/xug0PCXYCqU0FgDKI=
 github.com/alexbrainman/sspi v0.0.0-20250919150558-7d374ff0d59e/go.mod h1:cEWa1LVoE5KvSD9ONXsZrj0z6KqySlCCNKHlLzbqAt4=
-github.com/caddyserver/certmagic v0.25.3 h1:mGf5ba8F7xA4c5jfDZZbK2buY1VEkbnwpMDixaju94A=
-github.com/caddyserver/certmagic v0.25.3/go.mod h1:YVs43D5+H/Dckt4bTga1KSO/xYfFBfVZainGDywYPAA=
+github.com/caddyserver/certmagic v0.25.4 h1:8eIXh0HC3MsGnNo8One+BCxMGTbe5zb/oz+2KsxBFQg=
+github.com/caddyserver/certmagic v0.25.4/go.mod h1:YVs43D5+H/Dckt4bTga1KSO/xYfFBfVZainGDywYPAA=
 github.com/caddyserver/zerossl v0.1.5 h1:dkvOjBAEEtY6LIGAHei7sw2UgqSD6TrWweXpV7lvEvE=
 github.com/caddyserver/zerossl v0.1.5/go.mod h1:CxA0acn7oEGO6//4rtrRjYgEoa4MFw/XofZnrYwGqG4=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
