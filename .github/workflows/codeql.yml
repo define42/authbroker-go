@@ -8,6 +8,9 @@ on:
   schedule:
     # Weekly run on Mondays at 06:17 UTC to catch newly published rules.
     - cron: '17 6 * * 1'
+  # Allows the go-version-bump workflow (and humans) to start a run on a
+  # branch whose push came from GITHUB_TOKEN and so triggered no workflows.
+  workflow_dispatch:
 
 permissions:
   contents: read

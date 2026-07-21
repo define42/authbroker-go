@@ -13,6 +13,22 @@ updates:
       prefix: "deps"
       include: "scope"
 
+  # Keep Docker base images up to date: the golang build image and the
+  # alpine runtime image in the Dockerfile. Note Dependabot cannot bump the
+  # `go` directive in go.mod (dependabot-core#13520); the go-version-bump
+  # workflow covers that.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "docker"
+      include: "scope"
+
   # Keep GitHub Actions versions up to date (security-sensitive: workflow
   # actions run with repository credentials).
   - package-ecosystem: "github-actions"
